@@ -6,4 +6,6 @@ test {
 	_ = @import("core/document.zig");
 	_ = @import("core/parser_md.zig");
 	_ = @import("core/xml.zig");
+	_ = @import("core/zip.zig");
+	_ = @import("core/parser_docx.zig");
 }
