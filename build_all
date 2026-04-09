@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Cross-compile docscan for all 5 supported targets.
+# Native build uses nix build (sandboxed).
+# Cross builds use nix develop -c zig build -Dtarget=... (Zig's own sysroot).
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+TARGETS=(
+	"native"
+	"x86_64-linux-musl"
+	"aarch64-linux-musl"
+	"x86_64-windows"
+	"aarch64-windows"
+)
+
+failed=0
+
+for tgt in "${TARGETS[@]}"; do
+	if [ "$tgt" = "native" ]; then
+		printf 'Building native (via nix build)...\n'
+		if nix build --print-build-logs; then
+			mkdir -p zig-out/bin
+			cp -f result/bin/docscan zig-out/bin/docscan
+			printf '\033[32mPASS\033[0m native\n'
+		else
+			printf '\033[31mFAIL\033[0m native\n' >&2
+			failed=$((failed + 1))
+		fi
+	else
+		printf 'Cross-compiling for %s...\n' "$tgt"
+		outdir="zig-out/cross/$tgt"
+		mkdir -p "$outdir"
+		if nix develop -c zig build "-Dtarget=$tgt" -Doptimize=ReleaseFast --color off -p "$outdir"; then
+			printf '\033[32mPASS\033[0m %s\n' "$tgt"
+		else
+			printf '\033[31mFAIL\033[0m %s\n' "$tgt" >&2
+			failed=$((failed + 1))
+		fi
+	fi
+done
+
+if [ "$failed" -eq 0 ]; then
+	printf '\n\033[32mAll %d targets built successfully.\033[0m\n' "${#TARGETS[@]}"
+else
+	printf '\n\033[31m%d/%d target(s) failed.\033[0m\n' "$failed" "${#TARGETS[@]}" >&2
+fi
+
+exit "$failed"

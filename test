@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Master test runner for docscan.
+# Runs unit tests + CLI tests + MCP tests. Returns accumulated error count.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+failed=0
+
+run_suite() {
+	local name="$1"
+	shift
+	printf 'Running %s tests...\n' "$name"
+	if "$@"; then
+		printf '\033[32mPASS\033[0m %s\n' "$name"
+	else
+		printf '\033[31mFAIL\033[0m %s\n' "$name" >&2
+		failed=$((failed + 1))
+	fi
+}
+
+# Zig unit tests via Nix (sandboxed)
+run_suite "unit" nix build ".#checks.$(nix eval --impure --raw --expr 'builtins.currentSystem').test" --print-build-logs
+
+# CLI tests (when they exist)
+if [ -x tests/cli/test-cli ]; then
+	run_suite "cli" nix develop -c tests/cli/test-cli
+fi
+
+# MCP tests (when they exist)
+if [ -x tests/mcp/test-mcp ]; then
+	run_suite "mcp" nix develop -c tests/mcp/test-mcp
+fi
+
+if [ "$failed" -eq 0 ]; then
+	printf '\n\033[32mAll test suites passed.\033[0m\n'
+else
+	printf '\n\033[31m%d test suite(s) failed.\033[0m\n' "$failed" >&2
+fi
+
+exit "$failed"

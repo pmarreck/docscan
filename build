@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Build docscan via Nix (sandboxed, deterministic).
+# Usage: ./build [--test] [--debug]
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+mode="default"
+for arg in "$@"; do
+	case "$arg" in
+		--test)
+			mode="test"
+			;;
+		--debug)
+			mode="debug"
+			;;
+		-h|--help)
+			echo "Usage: ./build [--test] [--debug]"
+			echo "  --test   Run unit tests via Nix"
+			echo "  --debug  Build with Debug optimization"
+			echo "  (default) Build ReleaseFast via nix build"
+			exit 0
+			;;
+		*)
+			echo "Unknown argument: $arg" >&2
+			echo "Usage: ./build [--test] [--debug]" >&2
+			exit 1
+			;;
+	esac
+done
+
+case "$mode" in
+	test)
+		echo "Running tests via Nix..."
+		nix build ".#checks.$(nix eval --impure --raw --expr 'builtins.currentSystem').test" --print-build-logs
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			printf '\033[32mAll tests passed.\033[0m\n'
+		else
+			printf '\033[31mTests failed.\033[0m\n' >&2
+		fi
+		exit $rc
+		;;
+	debug)
+		echo "Building debug via nix develop..."
+		nix develop -c zig build -Doptimize=Debug --color off
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			printf '\033[32mDebug build complete.\033[0m\n'
+		fi
+		exit $rc
+		;;
+	default)
+		echo "Building via Nix..."
+		nix build --print-build-logs
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			mkdir -p zig-out/bin
+			cp -f result/bin/docscan zig-out/bin/docscan
+			printf '\033[32mBuild complete: zig-out/bin/docscan\033[0m\n'
+		else
+			printf '\033[31mBuild failed.\033[0m\n' >&2
+		fi
+		exit $rc
+		;;
+esac

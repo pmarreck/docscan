@@ -1,0 +1,20 @@
+.{
+	.name = .docscan,
+	.version = "0.1.0",
+	.minimum_zig_version = "0.15.2",
+	.paths = .{
+		"build.zig",
+		"build.zig.zon",
+		"src",
+		"ffi",
+		"cli",
+	},
+	.dependencies = .{
+		// sqlite-vec provides both sqlite3 and vec extension
+		.sqlite_vec = .{
+			.url = "git+https://github.com/pmarreck/sqlite-vec.git#742ac1607d5490c71758c9fde80820387391910d",
+			.hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0OvwBACYsEQvfmbSw0sUHuXhcwD5PgjGyslHXU2q",
+		},
+	},
+	.fingerprint = 0x20526b286e1fcb24,
+}

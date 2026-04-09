@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Benchmark runner for docscan.
+# Requires ReleaseFast build — errors out if DEBUG BUILD is detected.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+BIN="zig-out/bin/docscan"
+
+# Ensure we have a build
+if [ ! -f "$BIN" ]; then
+	echo "No binary found at $BIN — run ./build first." >&2
+	exit 1
+fi
+
+# Reject debug builds
+if "$BIN" --about 2>&1 | grep -q "DEBUG BUILD"; then
+	printf '\033[31mERROR: Debug build detected. Benchmarks require ReleaseFast.\033[0m\n' >&2
+	printf 'Run: ./build\n' >&2
+	exit 1
+fi
+
+RESULTS_LOG="benchmarks/results.log"
+mkdir -p benchmarks
+
+echo "Benchmark suite not yet implemented."
+echo "Future benchmarks will log to $RESULTS_LOG"
+echo "Benchmark tooling: hyperfine (available in devShell)"
