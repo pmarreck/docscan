@@ -1259,7 +1259,22 @@ static int cmd_search(const char* db_path_arg, const char* query,
 		return 1;
 	}
 
-	docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+	/* Detect embedding dimension from existing DB config */
+	int search_dim = DEFAULT_EMBEDDING_DIM;
+	{
+		docscan_db* tmp_db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+		if (tmp_db) {
+			char* dim_str = docscan_config_get(tmp_db, "embedding_dim", err_buf, sizeof(err_buf));
+			if (dim_str) {
+				int d = atoi(dim_str);
+				if (d > 0) search_dim = d;
+				docscan_free(dim_str);
+			}
+			docscan_close(tmp_db);
+		}
+	}
+
+	docscan_db* db = docscan_open(db_path, (uint32_t)search_dim, err_buf, sizeof(err_buf));
 	if (!db) {
 		err_msg("failed to open database: %s", err_buf);
 		free(db_path);
@@ -1472,15 +1487,25 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		return 1;
 	}
 
-	/* Check embedding server availability */
+	/* Check embedding server availability and detect dimension */
 	int have_embedder = embedding_server_available();
+	int embedding_dim = DEFAULT_EMBEDDING_DIM;
 	if (!have_embedder) {
 		warn_msg("Embedding server is not running at %s", g_embedding_url);
 		warn_msg("Documents will be indexed without embeddings (text search only).");
+	} else {
+		/* Probe the embedding server to detect actual dimension */
+		int probe_dim = 0;
+		char* probe_texts[] = { "dimension probe" };
+		float* probe = embed_texts(model, probe_texts, 1, &probe_dim);
+		if (probe && probe_dim > 0) {
+			embedding_dim = probe_dim;
+			free(probe);
+		}
 	}
 
 	/* Open/create database */
-	docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+	docscan_db* db = docscan_open(db_path, (uint32_t)embedding_dim, err_buf, sizeof(err_buf));
 	if (!db) {
 		err_msg("failed to open database: %s", err_buf);
 		free(db_path);
@@ -2176,15 +2201,29 @@ static int cmd_mcp_serve(const char* db_path_arg, const char* model) {
 		return 1;
 	}
 
-	docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM,
-	                               err_buf, sizeof(err_buf));
+	/* Detect dimension from existing DB, or probe embedding server */
+	int mcp_dim = DEFAULT_EMBEDDING_DIM;
+	{
+		docscan_db* tmp = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+		if (tmp) {
+			char* dim_str = docscan_config_get(tmp, "embedding_dim", err_buf, sizeof(err_buf));
+			if (dim_str) {
+				int d = atoi(dim_str);
+				if (d > 0) mcp_dim = d;
+				docscan_free(dim_str);
+			}
+			docscan_close(tmp);
+		}
+	}
+
+	docscan_db* db = docscan_open(db_path, (uint32_t)mcp_dim, err_buf, sizeof(err_buf));
 	if (!db) {
 		fprintf(stderr, "mcp-serve: failed to open database: %s\n", err_buf);
 		free(db_path);
 		return 1;
 	}
 
-	fprintf(stderr, "docscan MCP server running (db: %s)\n", db_path);
+	fprintf(stderr, "docscan MCP server running (db: %s, dim: %d)\n", db_path, mcp_dim);
 
 	/* 1 MiB line buffer — MCP messages can be large */
 	size_t line_cap = 1024 * 1024;
