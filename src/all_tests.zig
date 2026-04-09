@@ -8,4 +8,6 @@ test {
 	_ = @import("core/xml.zig");
 	_ = @import("core/zip.zig");
 	_ = @import("core/parser_docx.zig");
+	_ = @import("core/pdf_objects.zig");
+	_ = @import("core/parser_pdf.zig");
 }
