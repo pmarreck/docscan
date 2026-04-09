@@ -30,7 +30,13 @@
   - **JSON extraction** — Minimal parsers for Ollama embedding responses and chunk text extraction.
   - **Directory walker** — Recursive `opendir`/`readdir` with format filtering (.md, .docx, .pdf, .doc) and noise directory skipping.
   - **Progress bar** — Terminal-aware progress with rate/ETA display on stderr.
-  - **Commands**: `index <path>`, `update [path]`, `search <query>`, `status`, `config [key] [value]`, `mcp-serve` (stub).
+  - **Commands**: `index <path>`, `update [path]`, `search <query>`, `status`, `config [key] [value]`, `mcp-serve`.
+  - **MCP server** (`cmd_mcp_serve`) — JSON-RPC 2.0 over newline-delimited stdin/stdout. Implements:
+    - Protocol: `initialize`, `tools/list`, `tools/call`, `ping`, `notifications/initialized`
+    - Tools: `docscan_search`, `docscan_status`, `docscan_read_chunk`, `docscan_list_docs`, `docscan_config`, `docscan_index`, `docscan_update`
+    - JSON helpers: `mcp_json_get_string`, `mcp_json_get_int`, `mcp_json_has_key`, `mcp_json_get_params`, `mcp_json_get_arguments`
+    - Response helpers: `mcp_write_result_text`, `mcp_write_raw_result`, `mcp_write_error`
+    - Supports integer and string request ids; graceful error handling for malformed input and unknown methods/tools
   - **Flags**: `--help`, `--about`, `--json`, `--limit`, `--exact`, `--similar`, `--model`, `--db`, `--no-color`, `--no-progress`, `--simple`, `--lang`.
   - **Environment**: `DOCSCAN_MODEL`, `DOCSCAN_DB`, `DOCSCAN_LANG`.
 

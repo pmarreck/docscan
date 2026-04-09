@@ -1456,11 +1456,714 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 	return (errors > 0 && indexed == 0) ? 1 : 0;
 }
 
-/* ── Command: mcp-serve (stub) ──────────────────────────────────────── */
+/* ── Command: mcp-serve — JSON-RPC 2.0 / MCP over stdio ────────────── */
 
-static int cmd_mcp_serve(void) {
-	err_msg("MCP server not yet implemented");
-	return 1;
+/*
+ * Minimal JSON extraction helpers.
+ * These are NOT general-purpose JSON parsers — they handle the specific
+ * shapes that MCP clients send (flat objects, no nested keys with the
+ * same name, no arrays-of-objects as values for extracted keys).
+ */
+
+/* Extract a string value for "key" from a JSON object. Writes into buf,
+ * returns buf on success, NULL if not found. Handles \" escapes. */
+static const char* mcp_json_get_string(const char* json, const char* key,
+                                        char* buf, size_t buf_len)
+{
+	if (!json || !key || !buf || buf_len == 0) return NULL;
+
+	/* Build search pattern: "key" */
+	char pattern[256];
+	int plen = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+	if (plen <= 0 || (size_t)plen >= sizeof(pattern)) return NULL;
+
+	const char* p = strstr(json, pattern);
+	if (!p) return NULL;
+	p += plen;
+
+	/* Skip whitespace and colon */
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+	if (*p != ':') return NULL;
+	p++;
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+
+	if (*p == 'n' && strncmp(p, "null", 4) == 0) return NULL;
+	if (*p != '"') return NULL;
+	p++; /* past opening quote */
+
+	size_t i = 0;
+	while (*p && *p != '"' && i + 1 < buf_len) {
+		if (*p == '\\' && *(p + 1)) {
+			p++;
+			switch (*p) {
+				case 'n': buf[i++] = '\n'; break;
+				case 'r': buf[i++] = '\r'; break;
+				case 't': buf[i++] = '\t'; break;
+				case '"': buf[i++] = '"';  break;
+				case '\\': buf[i++] = '\\'; break;
+				case '/': buf[i++] = '/';  break;
+				default: buf[i++] = *p;    break;
+			}
+		} else {
+			buf[i++] = *p;
+		}
+		p++;
+	}
+	buf[i] = '\0';
+	return buf;
+}
+
+/* Extract an integer value for "key" from a JSON object.
+ * Returns default_val if not found. */
+static int mcp_json_get_int(const char* json, const char* key, int default_val) {
+	if (!json || !key) return default_val;
+
+	char pattern[256];
+	int plen = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+	if (plen <= 0 || (size_t)plen >= sizeof(pattern)) return default_val;
+
+	const char* p = strstr(json, pattern);
+	if (!p) return default_val;
+	p += plen;
+
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+	if (*p != ':') return default_val;
+	p++;
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+
+	if (*p == '"') {
+		/* Quoted number: "123" — parse the integer inside */
+		p++;
+		return atoi(p);
+	}
+	if (*p == '-' || (*p >= '0' && *p <= '9')) {
+		return atoi(p);
+	}
+	return default_val;
+}
+
+/* Check whether a key exists and its value is absent/null (for distinguishing
+ * "key omitted" from "key present with value"). */
+static int mcp_json_has_key(const char* json, const char* key) {
+	if (!json || !key) return 0;
+	char pattern[256];
+	snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+	return strstr(json, pattern) != NULL;
+}
+
+/* Extract the "params" sub-object from a JSON-RPC request.
+ * Returns pointer into the original string at the opening '{' of params,
+ * or NULL if not found. */
+static const char* mcp_json_get_params(const char* json) {
+	const char* p = strstr(json, "\"params\"");
+	if (!p) return NULL;
+	p += 8;
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+	if (*p != ':') return NULL;
+	p++;
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+	if (*p == '{') return p;
+	return NULL;
+}
+
+/* Extract the "arguments" sub-object from within params.
+ * Returns pointer to opening '{', or NULL. */
+static const char* mcp_json_get_arguments(const char* params) {
+	const char* p = strstr(params, "\"arguments\"");
+	if (!p) return NULL;
+	p += 11;
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+	if (*p != ':') return NULL;
+	p++;
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+	if (*p == '{') return p;
+	return NULL;
+}
+
+/* ── MCP response helpers ───────────────────────────────────────────── */
+
+/* Write a JSON-RPC success response wrapping MCP content.
+ * The text is JSON-escaped before embedding. */
+static void mcp_write_result_text(const char* id_str, const char* text) {
+	/* Escape the text for embedding in JSON string */
+	size_t text_len = text ? strlen(text) : 0;
+	size_t esc_cap = text_len * 6 + 16; /* worst case: every char becomes \uXXXX */
+	char* escaped = malloc(esc_cap);
+	if (!escaped) return;
+
+	size_t j = 0;
+	for (size_t i = 0; i < text_len && j + 7 < esc_cap; i++) {
+		switch (text[i]) {
+			case '"':  escaped[j++] = '\\'; escaped[j++] = '"'; break;
+			case '\\': escaped[j++] = '\\'; escaped[j++] = '\\'; break;
+			case '\n': escaped[j++] = '\\'; escaped[j++] = 'n'; break;
+			case '\r': escaped[j++] = '\\'; escaped[j++] = 'r'; break;
+			case '\t': escaped[j++] = '\\'; escaped[j++] = 't'; break;
+			default:
+				if ((unsigned char)text[i] < 0x20) {
+					j += (size_t)snprintf(escaped + j, esc_cap - j,
+					                       "\\u%04x", (unsigned char)text[i]);
+				} else {
+					escaped[j++] = text[i];
+				}
+				break;
+		}
+	}
+	escaped[j] = '\0';
+
+	printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":"
+	       "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\n",
+	       id_str, escaped);
+	fflush(stdout);
+	free(escaped);
+}
+
+/* Write a raw JSON result (already valid JSON, e.g. from FFI). */
+static void mcp_write_result_raw(const char* id_str, const char* raw_json) {
+	/* Embed the raw JSON as the text content (escaped) */
+	mcp_write_result_text(id_str, raw_json);
+}
+
+/* Write a JSON-RPC success response with a raw result object (not MCP content). */
+static void mcp_write_raw_result(const char* id_str, const char* result_json) {
+	/* Strip any embedded newlines from result_json to keep response on one line */
+	size_t len = strlen(result_json);
+	char* clean = malloc(len + 1);
+	if (!clean) return;
+	size_t j = 0;
+	for (size_t i = 0; i < len; i++) {
+		if (result_json[i] == '\n' || result_json[i] == '\r') {
+			clean[j++] = ' ';
+		} else {
+			clean[j++] = result_json[i];
+		}
+	}
+	clean[j] = '\0';
+
+	printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}\n", id_str, clean);
+	fflush(stdout);
+	free(clean);
+}
+
+/* Write a JSON-RPC error response. */
+static void mcp_write_error(const char* id_str, int code, const char* message) {
+	/* Escape the message */
+	size_t mlen = message ? strlen(message) : 0;
+	size_t esc_cap = mlen * 6 + 16;
+	char* escaped = malloc(esc_cap);
+	if (!escaped) return;
+
+	size_t j = 0;
+	for (size_t i = 0; i < mlen && j + 7 < esc_cap; i++) {
+		switch (message[i]) {
+			case '"':  escaped[j++] = '\\'; escaped[j++] = '"'; break;
+			case '\\': escaped[j++] = '\\'; escaped[j++] = '\\'; break;
+			case '\n': escaped[j++] = '\\'; escaped[j++] = 'n'; break;
+			case '\r': escaped[j++] = '\\'; escaped[j++] = 'r'; break;
+			default:   escaped[j++] = message[i]; break;
+		}
+	}
+	escaped[j] = '\0';
+
+	printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":\"%s\"}}\n",
+	       id_str, code, escaped);
+	fflush(stdout);
+	free(escaped);
+}
+
+/* ── MCP tool definitions ───────────────────────────────────────────── */
+
+#define MCP_TOOLS_JSON \
+	"[" \
+	"{" \
+		"\"name\":\"docscan_search\"," \
+		"\"description\":\"Search indexed documents using hybrid vector+lexical, exact, or similar mode\"," \
+		"\"inputSchema\":{" \
+			"\"type\":\"object\"," \
+			"\"properties\":{" \
+				"\"query\":{\"type\":\"string\",\"description\":\"Search query text\"}," \
+				"\"mode\":{\"type\":\"string\",\"enum\":[\"hybrid\",\"exact\",\"similar\"],\"default\":\"hybrid\"}," \
+				"\"limit\":{\"type\":\"integer\",\"default\":10}," \
+				"\"format_filter\":{\"type\":\"string\",\"description\":\"Filter by format (md, docx, pdf, doc)\"}" \
+			"}," \
+			"\"required\":[\"query\"]" \
+		"}" \
+	"}," \
+	"{" \
+		"\"name\":\"docscan_status\"," \
+		"\"description\":\"Show index statistics (document count, chunk count, last indexed)\"," \
+		"\"inputSchema\":{\"type\":\"object\",\"properties\":{}}" \
+	"}," \
+	"{" \
+		"\"name\":\"docscan_read_chunk\"," \
+		"\"description\":\"Retrieve full text of a specific chunk by ID\"," \
+		"\"inputSchema\":{" \
+			"\"type\":\"object\"," \
+			"\"properties\":{" \
+				"\"chunk_id\":{\"type\":\"integer\",\"description\":\"Chunk ID from search results\"}" \
+			"}," \
+			"\"required\":[\"chunk_id\"]" \
+		"}" \
+	"}," \
+	"{" \
+		"\"name\":\"docscan_list_docs\"," \
+		"\"description\":\"List all indexed documents\"," \
+		"\"inputSchema\":{\"type\":\"object\",\"properties\":{}}" \
+	"}," \
+	"{" \
+		"\"name\":\"docscan_config\"," \
+		"\"description\":\"Get or set configuration values\"," \
+		"\"inputSchema\":{" \
+			"\"type\":\"object\"," \
+			"\"properties\":{" \
+				"\"key\":{\"type\":\"string\",\"description\":\"Config key\"}," \
+				"\"value\":{\"type\":\"string\",\"description\":\"Value to set (omit to get)\"}" \
+			"}," \
+			"\"required\":[\"key\"]" \
+		"}" \
+	"}," \
+	"{" \
+		"\"name\":\"docscan_index\"," \
+		"\"description\":\"Index a file or directory\"," \
+		"\"inputSchema\":{" \
+			"\"type\":\"object\"," \
+			"\"properties\":{" \
+				"\"path\":{\"type\":\"string\",\"description\":\"Path to file or directory to index\"}" \
+			"}," \
+			"\"required\":[\"path\"]" \
+		"}" \
+	"}," \
+	"{" \
+		"\"name\":\"docscan_update\"," \
+		"\"description\":\"Re-index changed files\"," \
+		"\"inputSchema\":{" \
+			"\"type\":\"object\"," \
+			"\"properties\":{" \
+				"\"path\":{\"type\":\"string\",\"description\":\"Path to check for updates\"}" \
+			"}" \
+		"}" \
+	"}" \
+	"]"
+
+/* ── MCP tool handlers ──────────────────────────────────────────────── */
+
+static void mcp_handle_search(docscan_db* db, const char* model,
+                               const char* args, const char* id_str)
+{
+	char err_buf[ERR_BUF_LEN];
+	char query_buf[4096];
+	char mode_buf[32];
+	char filter_buf[64];
+
+	const char* query = mcp_json_get_string(args, "query", query_buf, sizeof(query_buf));
+	if (!query || !query[0]) {
+		mcp_write_error(id_str, -32602, "Missing required parameter: query");
+		return;
+	}
+
+	const char* mode = mcp_json_get_string(args, "mode", mode_buf, sizeof(mode_buf));
+	if (!mode || !mode[0]) mode = "hybrid";
+
+	int limit = mcp_json_get_int(args, "limit", DEFAULT_LIMIT);
+	if (limit <= 0) limit = DEFAULT_LIMIT;
+
+	const char* filter = mcp_json_get_string(args, "format_filter",
+	                                          filter_buf, sizeof(filter_buf));
+
+	/* Embed query for non-exact modes */
+	float* query_emb = NULL;
+	int emb_dim = 0;
+
+	if (strcmp(mode, "exact") != 0) {
+		if (ollama_is_available(OLLAMA_HOST, OLLAMA_PORT)) {
+			char* texts[1];
+			texts[0] = (char*)query;
+			query_emb = ollama_embed(model, OLLAMA_HOST, OLLAMA_PORT,
+			                          texts, 1, &emb_dim);
+		}
+		if (!query_emb && strcmp(mode, "similar") == 0) {
+			mcp_write_error(id_str, -32603,
+				"Ollama not available (needed for vector search). "
+				"Start it with: ollama serve");
+			return;
+		}
+		if (!query_emb) {
+			/* Hybrid fallback to exact */
+			mode = "exact";
+		}
+	}
+
+	char* results = docscan_search(db, query, query_emb, (uint32_t)emb_dim,
+	                                mode, (uint32_t)limit,
+	                                (filter && filter[0]) ? filter : NULL,
+	                                err_buf, sizeof(err_buf));
+	free(query_emb);
+
+	if (!results) {
+		mcp_write_error(id_str, -32603, err_buf);
+		return;
+	}
+
+	mcp_write_result_raw(id_str, results);
+	docscan_free(results);
+}
+
+static void mcp_handle_status(docscan_db* db, const char* id_str) {
+	char err_buf[ERR_BUF_LEN];
+	char* status = docscan_status(db, err_buf, sizeof(err_buf));
+	if (!status) {
+		mcp_write_error(id_str, -32603, err_buf);
+		return;
+	}
+	mcp_write_result_raw(id_str, status);
+	docscan_free(status);
+}
+
+static void mcp_handle_read_chunk(docscan_db* db, const char* args,
+                                   const char* id_str)
+{
+	char err_buf[ERR_BUF_LEN];
+	int chunk_id = mcp_json_get_int(args, "chunk_id", -1);
+	if (chunk_id < 0) {
+		mcp_write_error(id_str, -32602, "Missing required parameter: chunk_id");
+		return;
+	}
+
+	char* chunk = docscan_read_chunk(db, (int64_t)chunk_id, err_buf, sizeof(err_buf));
+	if (!chunk) {
+		mcp_write_error(id_str, -32603, err_buf);
+		return;
+	}
+	mcp_write_result_raw(id_str, chunk);
+	docscan_free(chunk);
+}
+
+static void mcp_handle_list_docs(docscan_db* db, const char* id_str) {
+	char err_buf[ERR_BUF_LEN];
+	/* List docs via status — the FFI doesn't have a dedicated list_docs yet.
+	 * Return status info which includes document count. */
+	char* status = docscan_status(db, err_buf, sizeof(err_buf));
+	if (!status) {
+		mcp_write_error(id_str, -32603, err_buf);
+		return;
+	}
+	mcp_write_result_raw(id_str, status);
+	docscan_free(status);
+}
+
+static void mcp_handle_config(docscan_db* db, const char* args,
+                               const char* id_str)
+{
+	char err_buf[ERR_BUF_LEN];
+	char key_buf[256];
+	char val_buf[4096];
+
+	const char* key = mcp_json_get_string(args, "key", key_buf, sizeof(key_buf));
+	if (!key || !key[0]) {
+		mcp_write_error(id_str, -32602, "Missing required parameter: key");
+		return;
+	}
+
+	/* Check if value is present (set) vs absent (get) */
+	if (mcp_json_has_key(args, "value")) {
+		const char* value = mcp_json_get_string(args, "value",
+		                                         val_buf, sizeof(val_buf));
+		if (!value) value = "";
+		int rc = docscan_config_set(db, key, value, err_buf, sizeof(err_buf));
+		if (rc != 0) {
+			mcp_write_error(id_str, -32603, err_buf);
+			return;
+		}
+		mcp_write_result_text(id_str, "ok");
+	} else {
+		char* val = docscan_config_get(db, key, err_buf, sizeof(err_buf));
+		if (!val) {
+			char msg[512];
+			snprintf(msg, sizeof(msg), "Key not found: %s", key);
+			mcp_write_result_text(id_str, msg);
+			return;
+		}
+		mcp_write_result_text(id_str, val);
+		docscan_free(val);
+	}
+}
+
+static void mcp_handle_index(docscan_db* db, const char* model,
+                              const char* args, const char* id_str)
+{
+	char err_buf[ERR_BUF_LEN];
+	char path_buf[MAX_PATH_LEN];
+
+	const char* path = mcp_json_get_string(args, "path", path_buf, sizeof(path_buf));
+	if (!path || !path[0]) {
+		mcp_write_error(id_str, -32602, "Missing required parameter: path");
+		return;
+	}
+
+	/* Resolve to absolute path */
+	char abs_path[MAX_PATH_LEN];
+	if (path[0] != '/') {
+		char cwd[MAX_PATH_LEN];
+		if (getcwd(cwd, sizeof(cwd))) {
+			snprintf(abs_path, sizeof(abs_path), "%s/%s", cwd, path);
+		} else {
+			snprintf(abs_path, sizeof(abs_path), "%s", path);
+		}
+	} else {
+		snprintf(abs_path, sizeof(abs_path), "%s", path);
+	}
+
+	/* Collect files */
+	file_list fl;
+	file_list_init(&fl);
+	collect_files(abs_path, &fl);
+
+	if (fl.count == 0) {
+		mcp_write_result_text(id_str, "No supported files found");
+		file_list_free(&fl);
+		return;
+	}
+
+	int have_ollama = ollama_is_available(OLLAMA_HOST, OLLAMA_PORT);
+	int indexed = 0, skipped = 0, errors = 0;
+
+	for (int i = 0; i < fl.count; i++) {
+		const char* fpath = fl.paths[i];
+		const char* fmt = format_for_ext(fpath);
+		if (!fmt) { skipped++; continue; }
+
+		size_t file_len = 0;
+		uint8_t* file_data = read_file(fpath, &file_len);
+		if (!file_data) { errors++; continue; }
+
+		char hash_hex[SHA256_HEX_LEN + 1];
+		sha256_hex(file_data, file_len, hash_hex);
+
+		int needs = docscan_needs_reindex(db, fpath, hash_hex);
+		if (needs == 0) { free(file_data); skipped++; continue; }
+		if (needs < 0) { free(file_data); errors++; continue; }
+
+		docscan_remove_document(db, fpath, err_buf, sizeof(err_buf));
+
+		float* embeddings = NULL;
+		uint32_t num_chunks = 0;
+
+		if (have_ollama) {
+			char* chunks_json = docscan_chunk(file_data, file_len, fpath, fmt,
+			                                   DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
+			if (chunks_json) {
+				num_chunks = (uint32_t)count_json_array_objects(chunks_json);
+				if (num_chunks > 0) {
+					int text_count = 0;
+					char** texts = extract_chunk_texts(chunks_json, &text_count);
+					if (texts && text_count > 0) {
+						int dim = 0;
+						embeddings = ollama_embed(model, OLLAMA_HOST, OLLAMA_PORT,
+						                           texts, text_count, &dim);
+						if (embeddings) num_chunks = (uint32_t)text_count;
+						for (int t = 0; t < text_count; t++) free(texts[t]);
+						free(texts);
+					}
+				}
+				docscan_free(chunks_json);
+			}
+		}
+
+		int rc = docscan_index_file(db, file_data, file_len, fpath, fmt,
+		                             hash_hex, embeddings, num_chunks,
+		                             DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
+		free(file_data);
+		free(embeddings);
+
+		if (rc == 0) indexed++;
+		else errors++;
+	}
+
+	file_list_free(&fl);
+
+	char result[256];
+	snprintf(result, sizeof(result),
+	         "{\"indexed\":%d,\"skipped\":%d,\"errors\":%d}",
+	         indexed, skipped, errors);
+	mcp_write_result_text(id_str, result);
+}
+
+static void mcp_handle_update(docscan_db* db, const char* model,
+                               const char* args, const char* id_str)
+{
+	/* Update is index with reindex check (same behavior — needs_reindex
+	 * already handles the skip logic in mcp_handle_index). */
+	mcp_handle_index(db, model, args, id_str);
+}
+
+/* ── MCP main loop ──────────────────────────────────────────────────── */
+
+static int cmd_mcp_serve(const char* db_path_arg, const char* model) {
+	char err_buf[ERR_BUF_LEN];
+
+	/* Resolve database path */
+	char* db_path = resolve_db_path(db_path_arg, ".");
+	if (!db_path) {
+		fprintf(stderr, "mcp-serve: could not determine database path\n");
+		return 1;
+	}
+
+	docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM,
+	                               err_buf, sizeof(err_buf));
+	if (!db) {
+		fprintf(stderr, "mcp-serve: failed to open database: %s\n", err_buf);
+		free(db_path);
+		return 1;
+	}
+
+	fprintf(stderr, "docscan MCP server running (db: %s)\n", db_path);
+
+	/* 1 MiB line buffer — MCP messages can be large */
+	size_t line_cap = 1024 * 1024;
+	char* line = malloc(line_cap);
+	if (!line) {
+		docscan_close(db);
+		free(db_path);
+		return 1;
+	}
+
+	while (fgets(line, (int)line_cap, stdin)) {
+		/* Strip trailing whitespace/newlines */
+		size_t len = strlen(line);
+		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'
+		                    || line[len - 1] == ' '))
+			line[--len] = '\0';
+
+		if (len == 0) continue; /* skip blank lines */
+
+		/* Extract method */
+		char method[128];
+		if (!mcp_json_get_string(line, "method", method, sizeof(method))) {
+			/* No method — might be a response from client, ignore */
+			continue;
+		}
+
+		/* Extract id. It can be an int, a string, or absent (notification).
+		 * We store it as a raw JSON token for output. */
+		char id_str[128];
+		int has_id = 0;
+		{
+			/* Find "id" key and extract the raw value token */
+			const char* p = strstr(line, "\"id\"");
+			if (p) {
+				p += 4;
+				while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
+				if (*p == '"') {
+					/* String id — extract it quoted */
+					const char* start = p; /* include the quote */
+					p++;
+					while (*p && *p != '"') {
+						if (*p == '\\') p++;
+						p++;
+					}
+					if (*p == '"') p++; /* include closing quote */
+					size_t tok_len = (size_t)(p - start);
+					if (tok_len < sizeof(id_str)) {
+						memcpy(id_str, start, tok_len);
+						id_str[tok_len] = '\0';
+						has_id = 1;
+					}
+				} else if (*p == '-' || (*p >= '0' && *p <= '9')) {
+					/* Numeric id */
+					const char* start = p;
+					if (*p == '-') p++;
+					while (*p >= '0' && *p <= '9') p++;
+					size_t tok_len = (size_t)(p - start);
+					if (tok_len < sizeof(id_str)) {
+						memcpy(id_str, start, tok_len);
+						id_str[tok_len] = '\0';
+						has_id = 1;
+					}
+				}
+				/* null id: treat as notification */
+			}
+		}
+
+		if (!has_id) {
+			/* Notification (no id) — handle known notifications silently */
+			if (strcmp(method, "notifications/initialized") == 0 ||
+			    strcmp(method, "notifications/cancelled") == 0) {
+				continue;
+			}
+			/* Unknown notification — ignore */
+			continue;
+		}
+
+		/* Dispatch by method */
+		if (strcmp(method, "initialize") == 0) {
+			mcp_write_raw_result(id_str,
+				"{\"protocolVersion\":\"2024-11-05\","
+				"\"serverInfo\":{\"name\":\"docscan\",\"version\":\"" DOCSCAN_VERSION "\"},"
+				"\"capabilities\":{\"tools\":{}}}");
+			continue;
+		}
+
+		if (strcmp(method, "tools/list") == 0) {
+			mcp_write_raw_result(id_str,
+				"{\"tools\":" MCP_TOOLS_JSON "}");
+			continue;
+		}
+
+		if (strcmp(method, "tools/call") == 0) {
+			const char* params = mcp_json_get_params(line);
+			if (!params) {
+				mcp_write_error(id_str, -32600, "Invalid request: missing params");
+				continue;
+			}
+
+			char tool_name[128];
+			if (!mcp_json_get_string(params, "name", tool_name, sizeof(tool_name))) {
+				mcp_write_error(id_str, -32602, "Missing required parameter: name");
+				continue;
+			}
+
+			const char* args = mcp_json_get_arguments(params);
+			/* Use empty object if no arguments */
+			const char* empty_args = "{}";
+			if (!args) args = empty_args;
+
+			if (strcmp(tool_name, "docscan_search") == 0) {
+				mcp_handle_search(db, model, args, id_str);
+			} else if (strcmp(tool_name, "docscan_status") == 0) {
+				mcp_handle_status(db, id_str);
+			} else if (strcmp(tool_name, "docscan_read_chunk") == 0) {
+				mcp_handle_read_chunk(db, args, id_str);
+			} else if (strcmp(tool_name, "docscan_list_docs") == 0) {
+				mcp_handle_list_docs(db, id_str);
+			} else if (strcmp(tool_name, "docscan_config") == 0) {
+				mcp_handle_config(db, args, id_str);
+			} else if (strcmp(tool_name, "docscan_index") == 0) {
+				mcp_handle_index(db, model, args, id_str);
+			} else if (strcmp(tool_name, "docscan_update") == 0) {
+				mcp_handle_update(db, model, args, id_str);
+			} else {
+				char msg[256];
+				snprintf(msg, sizeof(msg), "Unknown tool: %s", tool_name);
+				mcp_write_error(id_str, -32601, msg);
+			}
+			continue;
+		}
+
+		if (strcmp(method, "ping") == 0) {
+			mcp_write_raw_result(id_str, "{}");
+			continue;
+		}
+
+		/* Unknown method */
+		char msg[256];
+		snprintf(msg, sizeof(msg), "Method not found: %s", method);
+		mcp_write_error(id_str, -32601, msg);
+	}
+
+	free(line);
+	docscan_close(db);
+	free(db_path);
+	return 0;
 }
 
 /* ── Main: argument parsing ─────────────────────────────────────────── */
@@ -1616,7 +2319,7 @@ int main(int argc, char** argv) {
 	}
 
 	if (strcmp(command, "mcp-serve") == 0) {
-		return cmd_mcp_serve();
+		return cmd_mcp_serve(db_path_arg, model);
 	}
 
 	/* Unknown command */
