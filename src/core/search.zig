@@ -202,6 +202,8 @@ pub fn search(
 			.score = cand.fused_score,
 			.vector_score = cand.vector_distance,
 			.lexical_score = cand.lexical_score,
+			.page = chunk.page,
+			.source_line = chunk.source_line,
 		});
 	}
 

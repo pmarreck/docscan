@@ -54,6 +54,8 @@ pub const ChunkRecord = struct {
 	text: []const u8,
 	start_byte: i64,
 	end_byte: i64,
+	page: ?u32 = null,
+	source_line: ?u32 = null,
 
 	pub fn deinit(self: *const ChunkRecord, allocator: std.mem.Allocator) void {
 		if (self.section_path) |sp| allocator.free(sp);
@@ -124,6 +126,16 @@ fn bindInt64(stmt: *c.sqlite3_stmt, idx: c_int, val: i64) SqliteError!void {
 fn bindInt32(stmt: *c.sqlite3_stmt, idx: c_int, val: i32) SqliteError!void {
 	const rc = c.sqlite3_bind_int(stmt, idx, val);
 	if (rc != c.SQLITE_OK) return SqliteError.SqliteError;
+}
+
+/// Bind a nullable i32 parameter.
+fn bindOptionalInt32(stmt: *c.sqlite3_stmt, idx: c_int, val: ?i32) SqliteError!void {
+	if (val) |v| {
+		return bindInt32(stmt, idx, v);
+	} else {
+		const rc = c.sqlite3_bind_null(stmt, idx);
+		if (rc != c.SQLITE_OK) return SqliteError.SqliteError;
+	}
 }
 
 /// Bind a blob parameter.
@@ -215,7 +227,9 @@ pub fn openDb(allocator: std.mem.Allocator, path: [*:0]const u8, embedding_dim: 
 		\\    heading TEXT,
 		\\    text TEXT NOT NULL,
 		\\    start_byte INTEGER NOT NULL,
-		\\    end_byte INTEGER NOT NULL
+		\\    end_byte INTEGER NOT NULL,
+		\\    page INTEGER,
+		\\    source_line INTEGER
 		\\);
 	) catch {
 		_ = c.sqlite3_close(handle);
@@ -452,7 +466,7 @@ pub fn needsReindex(db: *Db, path: []const u8, content_hash: []const u8) !bool {
 /// Insert a chunk and return its rowid. Also inserts into FTS5 index.
 pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 	const stmt = try prepareSql(db.handle,
-		"INSERT INTO chunks (document_id, chunk_index, section_path, heading, text, start_byte, end_byte) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+		"INSERT INTO chunks (document_id, chunk_index, section_path, heading, text, start_byte, end_byte, page, source_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
 	);
 	defer finalize(stmt);
 	try bindInt64(stmt, 1, doc_id);
@@ -462,6 +476,8 @@ pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 	try bindText(stmt, 5, chunk.text);
 	try bindInt64(stmt, 6, @intCast(chunk.start_byte));
 	try bindInt64(stmt, 7, @intCast(chunk.end_byte));
+	try bindOptionalInt32(stmt, 8, if (chunk.page) |p| @as(i32, @intCast(p)) else null);
+	try bindOptionalInt32(stmt, 9, if (chunk.source_line) |l| @as(i32, @intCast(l)) else null);
 	try stepExpectDone(stmt);
 	const chunk_id = c.sqlite3_last_insert_rowid(db.handle);
 
@@ -482,7 +498,7 @@ pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 /// Retrieve a chunk by its ID. Caller owns the record's strings.
 pub fn getChunk(db: *Db, allocator: std.mem.Allocator, chunk_id: i64) !?ChunkRecord {
 	const stmt = try prepareSql(db.handle,
-		"SELECT id, document_id, chunk_index, section_path, heading, text, start_byte, end_byte FROM chunks WHERE id = ?1;",
+		"SELECT id, document_id, chunk_index, section_path, heading, text, start_byte, end_byte, page, source_line FROM chunks WHERE id = ?1;",
 	);
 	defer finalize(stmt);
 	try bindInt64(stmt, 1, chunk_id);
@@ -494,6 +510,11 @@ pub fn getChunk(db: *Db, allocator: std.mem.Allocator, chunk_id: i64) !?ChunkRec
 		errdefer if (heading) |h| allocator.free(h);
 		const text = try columnTextRequired(allocator, stmt, 5);
 
+		const raw_page = c.sqlite3_column_int(stmt, 8);
+		const page_val: ?u32 = if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL) null else @intCast(raw_page);
+		const raw_line = c.sqlite3_column_int(stmt, 9);
+		const line_val: ?u32 = if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) null else @intCast(raw_line);
+
 		return ChunkRecord{
 			.id = c.sqlite3_column_int64(stmt, 0),
 			.document_id = c.sqlite3_column_int64(stmt, 1),
@@ -503,6 +524,8 @@ pub fn getChunk(db: *Db, allocator: std.mem.Allocator, chunk_id: i64) !?ChunkRec
 			.text = text,
 			.start_byte = c.sqlite3_column_int64(stmt, 6),
 			.end_byte = c.sqlite3_column_int64(stmt, 7),
+			.page = page_val,
+			.source_line = line_val,
 		};
 	}
 	if (rc == c.SQLITE_DONE) return null;

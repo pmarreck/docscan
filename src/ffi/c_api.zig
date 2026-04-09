@@ -92,6 +92,17 @@ fn jsonOptionalString(out: *std.ArrayList(u8), val: ?[]const u8) !void {
 	}
 }
 
+/// Append an optional JSON u32 field (or "null").
+fn jsonOptionalU32(out: *std.ArrayList(u8), val: ?u32) !void {
+	if (val) |v| {
+		var buf: [16]u8 = undefined;
+		const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "0";
+		try out.appendSlice(gpa, s);
+	} else {
+		try out.appendSlice(gpa, "null");
+	}
+}
+
 /// Serialize a Section recursively to JSON.
 fn jsonSection(out: *std.ArrayList(u8), section: document.Section) !void {
 	try out.appendSlice(gpa, "{\"heading\":");
@@ -102,6 +113,10 @@ fn jsonSection(out: *std.ArrayList(u8), section: document.Section) !void {
 	try out.appendSlice(gpa, level_str);
 	try out.appendSlice(gpa, ",\"content\":");
 	try jsonEscapeString(out, section.content);
+	try out.appendSlice(gpa, ",\"page\":");
+	try jsonOptionalU32(out, section.page);
+	try out.appendSlice(gpa, ",\"source_line\":");
+	try jsonOptionalU32(out, section.source_line);
 	try out.appendSlice(gpa, ",\"children\":[");
 	for (section.children, 0..) |child, i| {
 		if (i > 0) try out.append(gpa, ',');
@@ -165,6 +180,10 @@ fn jsonChunks(chunks: []const document.Chunk) ![]const u8 {
 		try out.appendSlice(gpa, ",\"chunk_index\":");
 		const ci = std.fmt.bufPrint(&num_buf, "{d}", .{c.chunk_index}) catch "0";
 		try out.appendSlice(gpa, ci);
+		try out.appendSlice(gpa, ",\"page\":");
+		try jsonOptionalU32(&out, c.page);
+		try out.appendSlice(gpa, ",\"source_line\":");
+		try jsonOptionalU32(&out, c.source_line);
 		try out.append(gpa, '}');
 	}
 	try out.append(gpa, ']');
@@ -201,6 +220,10 @@ fn jsonSearchResults(results: []const document.SearchResult) ![]const u8 {
 		try out.appendSlice(gpa, ",\"lexical_score\":");
 		const ls = std.fmt.bufPrint(&num_buf, "{d:.6}", .{r.lexical_score}) catch "0";
 		try out.appendSlice(gpa, ls);
+		try out.appendSlice(gpa, ",\"page\":");
+		try jsonOptionalU32(&out, r.page);
+		try out.appendSlice(gpa, ",\"source_line\":");
+		try jsonOptionalU32(&out, r.source_line);
 		try out.append(gpa, '}');
 	}
 	try out.append(gpa, ']');
@@ -236,6 +259,10 @@ fn jsonChunkRecord(rec: storage.ChunkRecord) ![]const u8 {
 	try out.appendSlice(gpa, ",\"end_byte\":");
 	const eb_s = std.fmt.bufPrint(&num_buf, "{d}", .{rec.end_byte}) catch "0";
 	try out.appendSlice(gpa, eb_s);
+	try out.appendSlice(gpa, ",\"page\":");
+	try jsonOptionalU32(&out, rec.page);
+	try out.appendSlice(gpa, ",\"source_line\":");
+	try jsonOptionalU32(&out, rec.source_line);
 	try out.append(gpa, '}');
 
 	return out.toOwnedSlice(gpa);

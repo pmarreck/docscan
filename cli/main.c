@@ -1558,12 +1558,35 @@ static int cmd_search(const char* db_path_arg, const char* query,
 					snippet[len] = '\0';
 				}
 
+				/* Extract page (may be null) */
+				int page = -1;
+				const char* pg_start = strstr(p, "\"page\":");
+				if (pg_start) {
+					pg_start += 7;
+					if (*pg_start != 'n') /* not "null" */
+						page = atoi(pg_start);
+				}
+
+				/* Extract source_line (may be null) */
+				int source_line = -1;
+				const char* sl_start = strstr(p, "\"source_line\":");
+				if (sl_start) {
+					sl_start += 14;
+					if (*sl_start != 'n') /* not "null" */
+						source_line = atoi(sl_start);
+				}
+
 				/* Display result */
 				printf("  %s%d.%s %s%s%s",
 					color(ANSI_DIM), result_num, color(ANSI_RESET),
 					color(ANSI_BOLD), doc_path, color(ANSI_RESET));
 				if (heading[0]) {
 					printf(" %s> %s%s", color(ANSI_CYAN), heading, color(ANSI_RESET));
+				}
+				if (page > 0) {
+					printf("  %s(page %d)%s", color(ANSI_DIM), page, color(ANSI_RESET));
+				} else if (source_line > 0) {
+					printf("  %s(line %d)%s", color(ANSI_DIM), source_line, color(ANSI_RESET));
 				}
 				printf("\n");
 				printf("     %sscore: %.4f%s\n", color(ANSI_DIM), score, color(ANSI_RESET));

@@ -277,6 +277,7 @@ const FlatSection = struct {
 	heading: ?[]const u8, // owned
 	level: u8,
 	content_buf: std.ArrayList(u8),
+	page: ?u32 = null, // 1-based page number from first span
 
 	fn deinit(self: *FlatSection, gpa: Allocator) void {
 		if (self.heading) |h| gpa.free(h);
@@ -312,7 +313,7 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 		spans.deinit(allocator);
 	}
 
-	try collectPageSpans(allocator, &ctx, pages_ref.obj, &spans, 0);
+	try collectPageSpans(allocator, &ctx, pages_ref.obj, &spans, 1);
 
 	// Infer structure from font sizes
 	const sections = try inferStructure(allocator, spans.items);
@@ -1037,6 +1038,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 				.heading = try allocator.dupe(u8, span.text),
 				.level = level,
 				.content_buf = .{},
+				.page = span.page,
 			});
 			current = flat_sections.items.len - 1;
 			has_prev_body = false;
@@ -1047,6 +1049,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 					.heading = null,
 					.level = 0,
 					.content_buf = .{},
+					.page = span.page,
 				});
 				current = flat_sections.items.len - 1;
 			}
@@ -1131,6 +1134,7 @@ fn buildTree(
 			.level = fs.level,
 			.content = content,
 			.children = children,
+			.page = fs.page,
 		});
 
 		i = child_end;

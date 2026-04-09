@@ -21,6 +21,8 @@ const ProtoChunk = struct {
 	text: []const u8, // borrowed from section content or allocated during merge
 	parent_path: []const u8, // always allocated
 	text_allocated: bool, // true if text was allocated (merged text)
+	page: ?u32 = null, // page number from section (PDF)
+	source_line: ?u32 = null, // line number from section (markdown)
 };
 
 /// Estimate token count for a text span.
@@ -105,7 +107,7 @@ fn chunkSection(
 	if (has_children) {
 		// Parent with preamble: emit preamble as its own chunk
 		if (has_content) {
-			try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, options, out);
+			try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, options, out, section.page, section.source_line);
 		}
 		// Recurse into children
 		for (section.children) |child| {
@@ -119,7 +121,7 @@ fn chunkSection(
 		}
 	} else if (has_content) {
 		// Leaf section with content
-		try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, options, out);
+		try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, options, out, section.page, section.source_line);
 	} else {
 		// Empty leaf — skip, free path
 		allocator.free(my_path);
@@ -135,6 +137,8 @@ fn emitContentChunks(
 	heading: ?[]const u8,
 	options: ChunkOptions,
 	out: *std.ArrayListUnmanaged(ProtoChunk),
+	page: ?u32,
+	source_line: ?u32,
 ) !void {
 	const token_count = estimateTokens(content, options.tokens_per_byte);
 
@@ -147,6 +151,8 @@ fn emitContentChunks(
 			.text = content,
 			.parent_path = pp,
 			.text_allocated = false,
+			.page = page,
+			.source_line = source_line,
 		});
 		return;
 	}
@@ -164,6 +170,8 @@ fn emitContentChunks(
 			.text = content,
 			.parent_path = pp,
 			.text_allocated = false,
+			.page = page,
+			.source_line = source_line,
 		});
 		return;
 	}
@@ -188,6 +196,8 @@ fn emitContentChunks(
 				.text = buildGroupText(paragraphs[group_start..idx]),
 				.parent_path = pp,
 				.text_allocated = false,
+				.page = page,
+				.source_line = source_line,
 			});
 			group_start = idx;
 			group_tokens = para_tokens;
@@ -209,6 +219,8 @@ fn emitContentChunks(
 			.text = buildGroupText(paragraphs[group_start..]),
 			.parent_path = pp,
 			.text_allocated = false,
+			.page = page,
+			.source_line = source_line,
 		});
 	}
 }
@@ -297,6 +309,8 @@ fn mergeSmallChunks(
 				.text = merged_text,
 				.parent_path = current.parent_path,
 				.text_allocated = true,
+				.page = current.page,
+				.source_line = current.source_line,
 			});
 			i = merge_end;
 		}
@@ -348,6 +362,8 @@ pub fn chunk(allocator: std.mem.Allocator, doc: document.Document, options: Chun
 			.start_byte = byte_offset,
 			.end_byte = byte_offset + text_owned.len,
 			.chunk_index = @intCast(idx),
+			.page = pc.page,
+			.source_line = pc.source_line,
 		};
 		byte_offset += text_owned.len;
 	}

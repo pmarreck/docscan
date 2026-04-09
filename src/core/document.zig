@@ -46,6 +46,8 @@ pub const Section = struct {
 	level: u8,
 	content: []const u8,
 	children: []const Section,
+	page: ?u32 = null, // starting page number (1-based, PDF)
+	source_line: ?u32 = null, // starting line number (1-based, markdown)
 };
 
 /// A parsed document with structural metadata — the output of any format parser.
@@ -69,6 +71,8 @@ pub const Chunk = struct {
 	start_byte: u64,
 	end_byte: u64,
 	chunk_index: u32,
+	page: ?u32 = null, // page number (1-based, PDF)
+	source_line: ?u32 = null, // line number (1-based, markdown)
 };
 
 /// A search result combining vector similarity and lexical BM25 scores
@@ -82,6 +86,8 @@ pub const SearchResult = struct {
 	score: f32,
 	vector_score: f32,
 	lexical_score: f32,
+	page: ?u32 = null, // page number (1-based, PDF)
+	source_line: ?u32 = null, // line number (1-based, markdown)
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────

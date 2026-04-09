@@ -14,6 +14,7 @@ const FlatSection = struct {
 	heading: ?[]const u8,
 	level: u8,
 	content_lines: std.ArrayList([]const u8),
+	source_line: ?u32 = null, // 1-based line number where this section starts
 
 	fn deinit(self: *FlatSection, gpa: Allocator) void {
 		self.content_lines.deinit(gpa);
@@ -132,6 +133,7 @@ fn buildTree(
 			.level = fs.level,
 			.content = content,
 			.children = children,
+			.source_line = fs.source_line,
 		});
 
 		i = child_end;
@@ -168,13 +170,16 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 
 	var line_iter = std.mem.splitScalar(u8, content, '\n');
 	var current: ?usize = null; // index into flat_sections
+	var line_num: u32 = 0; // 0-based counter, stored as 1-based
 
 	while (line_iter.next()) |line| {
+		line_num += 1;
 		if (parseHeadingLine(line)) |heading| {
 			try flat_sections.append(gpa, FlatSection{
 				.heading = heading.text,
 				.level = heading.level,
 				.content_lines = .{},
+				.source_line = line_num,
 			});
 			current = flat_sections.items.len - 1;
 		} else {
@@ -187,6 +192,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 					.heading = null,
 					.level = 0,
 					.content_lines = .{},
+					.source_line = line_num,
 				});
 				current = flat_sections.items.len - 1;
 			}
