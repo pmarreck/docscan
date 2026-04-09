@@ -43,14 +43,23 @@
 #define DEFAULT_LIMIT         10
 #define DEFAULT_DB_SUBDIR     ".docscan"
 #define DEFAULT_DB_FILENAME   "index.db"
-#define OLLAMA_HOST           "127.0.0.1"
-#define OLLAMA_PORT           11434
 #define ERR_BUF_LEN           1024
 #define MAX_PATH_LEN          4096
 #define HTTP_BUF_SIZE         (4 * 1024 * 1024)  /* 4 MiB response buffer */
 #define MAX_CHUNKS_PER_FILE   4096
 #define SHA256_DIGEST_LEN     32
 #define SHA256_HEX_LEN        64
+
+/* ── Embedding API dialect ─────────────────────────────────────────── */
+
+typedef enum {
+	API_OLLAMA = 0,
+	API_OPENAI = 1,
+} ApiDialect;
+
+static ApiDialect g_api_dialect = API_OLLAMA;
+static char g_embedding_url[512] = "http://127.0.0.1:11434";
+static char g_api_key[512] = "";
 
 /* ── Color / formatting ─────────────────────────────────────────────── */
 
@@ -228,6 +237,51 @@ static void sha256_hex(const uint8_t* data, size_t len, char out[SHA256_HEX_LEN 
 	out[SHA256_HEX_LEN] = '\0';
 }
 
+/* ── URL parsing ───────────────────────────────────────────────────── */
+
+/*
+ * Parse "http://host:port" into host string and port integer.
+ * Default port: 80 for http (HTTPS not supported in v1).
+ */
+static void parse_url(const char* url, char* host, int host_len, int* port) {
+	*port = 80;
+	host[0] = '\0';
+
+	const char* p = url;
+	/* Skip scheme */
+	if (strncmp(p, "http://", 7) == 0) {
+		p += 7;
+	} else if (strncmp(p, "https://", 8) == 0) {
+		p += 8;
+		*port = 443;
+	}
+
+	/* Find end of host (port separator or path or end of string) */
+	const char* colon = strchr(p, ':');
+	const char* slash = strchr(p, '/');
+
+	if (colon && (!slash || colon < slash)) {
+		/* host:port */
+		int hlen = (int)(colon - p);
+		if (hlen >= host_len) hlen = host_len - 1;
+		memcpy(host, p, (size_t)hlen);
+		host[hlen] = '\0';
+		*port = atoi(colon + 1);
+	} else if (slash) {
+		/* host/path (no port) */
+		int hlen = (int)(slash - p);
+		if (hlen >= host_len) hlen = host_len - 1;
+		memcpy(host, p, (size_t)hlen);
+		host[hlen] = '\0';
+	} else {
+		/* Just host */
+		int hlen = (int)strlen(p);
+		if (hlen >= host_len) hlen = host_len - 1;
+		memcpy(host, p, (size_t)hlen);
+		host[hlen] = '\0';
+	}
+}
+
 /* ── File I/O helpers ───────────────────────────────────────────────── */
 
 /* Read entire file into malloc'd buffer. Sets *out_len. Returns NULL on error. */
@@ -273,7 +327,8 @@ static const char* format_for_ext(const char* path) {
  * Sets *out_len to response body length.
  */
 static char* http_post(const char* host, int port, const char* path_url,
-                        const char* body, size_t body_len, size_t* out_len)
+                        const char* body, size_t body_len, size_t* out_len,
+                        const char* auth_header)
 {
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) return NULL;
@@ -325,15 +380,28 @@ static char* http_post(const char* host, int port, const char* path_url,
 	}
 
 	/* Build HTTP request */
-	char header[512];
-	int hlen = snprintf(header, sizeof(header),
-		"POST %s HTTP/1.1\r\n"
-		"Host: %s:%d\r\n"
-		"Content-Type: application/json\r\n"
-		"Content-Length: %zu\r\n"
-		"Connection: close\r\n"
-		"\r\n",
-		path_url, host, port, body_len);
+	char header[1024];
+	int hlen;
+	if (auth_header && auth_header[0]) {
+		hlen = snprintf(header, sizeof(header),
+			"POST %s HTTP/1.1\r\n"
+			"Host: %s:%d\r\n"
+			"Content-Type: application/json\r\n"
+			"Content-Length: %zu\r\n"
+			"Authorization: %s\r\n"
+			"Connection: close\r\n"
+			"\r\n",
+			path_url, host, port, body_len, auth_header);
+	} else {
+		hlen = snprintf(header, sizeof(header),
+			"POST %s HTTP/1.1\r\n"
+			"Host: %s:%d\r\n"
+			"Content-Type: application/json\r\n"
+			"Content-Length: %zu\r\n"
+			"Connection: close\r\n"
+			"\r\n",
+			path_url, host, port, body_len);
+	}
 
 	/* Send header + body */
 	if (write(sockfd, header, (size_t)hlen) != hlen) { close(sockfd); return NULL; }
@@ -435,6 +503,73 @@ static int parse_embeddings_json(const char* json, float* out_embeddings,
 	return num_vectors;
 }
 
+/*
+ * Parse the "data" array from an OpenAI-compatible JSON response.
+ * Expected format: {"data":[{"embedding":[0.1,0.2,...],"index":0},...],"model":"..."}
+ *
+ * Writes flat float array into out_embeddings.
+ * Returns number of embedding vectors found.
+ * out_dim is set to the dimension of each vector.
+ */
+static int parse_openai_embeddings_json(const char* json, float* out_embeddings,
+                                         int max_floats, int* out_dim)
+{
+	*out_dim = 0;
+	const char* key = "\"data\"";
+	const char* p = strstr(json, key);
+	if (!p) return 0;
+	p += strlen(key);
+
+	/* Skip to the outer [ */
+	while (*p && *p != '[') p++;
+	if (!*p) return 0;
+	p++; /* past outer [ */
+
+	int num_vectors = 0;
+	int float_idx = 0;
+
+	/* Walk through objects in the data array */
+	while (*p) {
+		/* Skip whitespace/commas */
+		while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+		if (*p == ']') break; /* end of data array */
+		if (*p != '{') break; /* expected object start */
+
+		/* Find "embedding" key within this object */
+		const char* emb = strstr(p, "\"embedding\"");
+		if (!emb) break;
+		emb += 11; /* past "embedding" */
+		while (*emb && *emb != '[') emb++;
+		if (!*emb) break;
+		emb++; /* past [ */
+
+		int this_dim = 0;
+		while (*emb) {
+			while (*emb && (*emb == ' ' || *emb == '\t' || *emb == '\n' || *emb == '\r' || *emb == ',')) emb++;
+			if (*emb == ']') { emb++; break; }
+
+			char* end = NULL;
+			float val = strtof(emb, &end);
+			if (end == emb) break; /* parse error */
+			if (float_idx < max_floats) {
+				out_embeddings[float_idx++] = val;
+			}
+			this_dim++;
+			emb = end;
+		}
+
+		if (num_vectors == 0) *out_dim = this_dim;
+		num_vectors++;
+
+		/* Advance p past the closing } of this object */
+		p = emb;
+		while (*p && *p != '}') p++;
+		if (*p == '}') p++;
+	}
+
+	return num_vectors;
+}
+
 /* ── Minimal JSON array counting (for chunk count from docscan_chunk) ── */
 
 /* Count top-level objects in a JSON array: [{"..."},{"..."},...] */
@@ -525,21 +660,37 @@ static char** extract_chunk_texts(const char* json, int* out_count) {
 	return texts;
 }
 
-/* ── Ollama embedding ───────────────────────────────────────────────── */
+/* ── Embedding (Ollama / OpenAI-compatible) ────────────────────────── */
 
 /*
- * Call Ollama to embed an array of text chunks.
+ * Call an embedding server to embed an array of text chunks.
+ * Dialect-aware: uses g_api_dialect to select endpoint, auth, and parser.
  * Returns malloc'd flat float array (num_chunks * dim), or NULL on error.
  * Sets *out_dim to the embedding dimension.
  */
-static float* ollama_embed(const char* model, const char* host, int port,
-                            char** texts, int num_texts, int* out_dim)
+static float* embed_texts(const char* model, char** texts, int num_texts,
+                           int* out_dim)
 {
 	*out_dim = 0;
 	if (num_texts == 0) return NULL;
 
+	/* Parse URL from global config */
+	char host[256];
+	int port;
+	parse_url(g_embedding_url, host, sizeof(host), &port);
+
+	/* Select endpoint path based on dialect */
+	const char* path_url = (g_api_dialect == API_OPENAI)
+		? "/v1/embeddings" : "/api/embed";
+
+	/* Build auth header for OpenAI dialect */
+	char auth_hdr[600] = "";
+	if (g_api_dialect == API_OPENAI && g_api_key[0]) {
+		snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", g_api_key);
+	}
+
 	/* Build JSON request body: {"model":"...","input":["t1","t2",...]} */
-	/* Estimate needed size */
+	/* (Same format for both Ollama and OpenAI) */
 	size_t body_cap = 256;
 	for (int i = 0; i < num_texts; i++)
 		body_cap += strlen(texts[i]) * 2 + 4; /* worst case with escaping */
@@ -580,20 +731,26 @@ static float* ollama_embed(const char* model, const char* host, int port,
 	off += snprintf(body + off, body_cap - (size_t)off, "]}");
 	body[off] = '\0';
 
-	/* Send to Ollama */
+	/* Send request */
 	size_t resp_len = 0;
-	char* resp = http_post(host, port, "/api/embed", body, (size_t)off, &resp_len);
+	char* resp = http_post(host, port, path_url, body, (size_t)off, &resp_len,
+	                        auth_hdr[0] ? auth_hdr : NULL);
 	free(body);
 
 	if (!resp) return NULL;
 
-	/* Parse embeddings from response */
+	/* Parse embeddings from response — dialect-specific */
 	int max_floats = num_texts * DEFAULT_EMBEDDING_DIM * 2; /* generous */
 	float* embeddings = malloc(sizeof(float) * (size_t)max_floats);
 	if (!embeddings) { free(resp); return NULL; }
 
 	int dim = 0;
-	int nvecs = parse_embeddings_json(resp, embeddings, max_floats, &dim);
+	int nvecs;
+	if (g_api_dialect == API_OPENAI) {
+		nvecs = parse_openai_embeddings_json(resp, embeddings, max_floats, &dim);
+	} else {
+		nvecs = parse_embeddings_json(resp, embeddings, max_floats, &dim);
+	}
 	free(resp);
 
 	if (nvecs == 0 || dim == 0) {
@@ -605,8 +762,12 @@ static float* ollama_embed(const char* model, const char* host, int port,
 	return embeddings;
 }
 
-/* Check if Ollama is reachable by connecting to the port. */
-static int ollama_is_available(const char* host, int port) {
+/* Check if the embedding server is reachable by connecting to its port. */
+static int embedding_server_available(void) {
+	char host[256];
+	int port;
+	parse_url(g_embedding_url, host, sizeof(host), &port);
+
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) return 0;
 
@@ -614,7 +775,13 @@ static int ollama_is_available(const char* host, int port) {
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons((uint16_t)port);
-	inet_pton(AF_INET, host, &addr.sin_addr);
+
+	if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+		/* Try DNS resolution */
+		struct hostent* he = gethostbyname(host);
+		if (!he) { close(sockfd); return 0; }
+		memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+	}
 
 	/* Non-blocking connect with short timeout */
 	int flags = fcntl(sockfd, F_GETFL, 0);
@@ -856,17 +1023,23 @@ static void print_help(void) {
 		"  --limit N             Limit search results (default: 10)\n"
 		"  --exact               Exact (FTS5-only) search\n"
 		"  --similar             Similar (vector-only) search\n"
-		"  --model <name>        Ollama model name (default: nomic-embed-text)\n"
+		"  --model <name>        Embedding model name (default: nomic-embed-text)\n"
 		"  --db <path>           Database path (default: .docscan/index.db)\n"
+		"  --embedding-api <dialect>  Embedding API: ollama or openai (default: ollama)\n"
+		"  --embedding-url <url>      Embedding server URL (default: http://127.0.0.1:11434)\n"
+		"  --embedding-api-key <key>  API key for OpenAI-compatible servers\n"
 		"  --no-color            Disable ANSI colors\n"
 		"  --no-progress         Disable progress bar\n"
 		"  --simple              Plain output (no color, no emoji)\n"
 		"  --lang <code>         Language override\n"
 		"\n"
 		"%sENVIRONMENT%s\n"
-		"  DOCSCAN_MODEL         Default Ollama model\n"
-		"  DOCSCAN_DB            Default database path\n"
-		"  DOCSCAN_LANG          Language override\n"
+		"  DOCSCAN_MODEL              Default embedding model\n"
+		"  DOCSCAN_DB                 Default database path\n"
+		"  DOCSCAN_EMBEDDING_API      Embedding API dialect: ollama or openai\n"
+		"  DOCSCAN_EMBEDDING_URL      Embedding server URL\n"
+		"  DOCSCAN_EMBEDDING_API_KEY  API key for OpenAI-compatible servers\n"
+		"  DOCSCAN_LANG               Language override\n"
 		"\n"
 		"%sEXAMPLES%s\n"
 		"  docscan index ~/Documents\n"
@@ -1098,27 +1271,27 @@ static int cmd_search(const char* db_path_arg, const char* query,
 	int emb_dim = 0;
 
 	if (strcmp(mode, "exact") != 0) {
-		/* Need Ollama for semantic search */
-		if (!ollama_is_available(OLLAMA_HOST, OLLAMA_PORT)) {
+		/* Need embedding server for semantic search */
+		if (!embedding_server_available()) {
 			if (strcmp(mode, "similar") == 0) {
-				err_msg("Ollama is not running (needed for vector search).\n"
-				        "  Start it with: ollama serve\n"
-				        "  Or use --exact for text-only search.");
+				err_msg("Embedding server is not running at %s (needed for vector search).\n"
+				        "  Start it, or use --exact for text-only search.",
+				        g_embedding_url);
 				docscan_close(db);
 				free(db_path);
 				return 1;
 			}
 			/* Hybrid mode: fall back to exact */
-			warn_msg("Ollama not available, falling back to text-only search");
+			warn_msg("Embedding server not available, falling back to text-only search");
 			mode = "exact";
 		} else {
 			char* texts[1];
 			texts[0] = (char*)query;
-			query_emb = ollama_embed(model, OLLAMA_HOST, OLLAMA_PORT,
-			                          texts, 1, &emb_dim);
+			query_emb = embed_texts(model, texts, 1, &emb_dim);
 			if (!query_emb) {
 				if (strcmp(mode, "similar") == 0) {
-					err_msg("failed to embed query via Ollama");
+					err_msg("failed to embed query via %s",
+					        g_api_dialect == API_OPENAI ? "OpenAI-compatible API" : "Ollama");
 					docscan_close(db);
 					free(db_path);
 					return 1;
@@ -1299,12 +1472,11 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		return 1;
 	}
 
-	/* Check Ollama availability */
-	int have_ollama = ollama_is_available(OLLAMA_HOST, OLLAMA_PORT);
-	if (!have_ollama) {
-		warn_msg("Ollama is not running at %s:%d", OLLAMA_HOST, OLLAMA_PORT);
+	/* Check embedding server availability */
+	int have_embedder = embedding_server_available();
+	if (!have_embedder) {
+		warn_msg("Embedding server is not running at %s", g_embedding_url);
 		warn_msg("Documents will be indexed without embeddings (text search only).");
-		warn_msg("Start Ollama with: ollama serve");
 	}
 
 	/* Open/create database */
@@ -1370,7 +1542,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		float* embeddings = NULL;
 		uint32_t num_chunks = 0;
 
-		if (have_ollama) {
+		if (have_embedder) {
 			char* chunks_json = docscan_chunk(file_data, file_len, fpath, fmt,
 			                                   DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
 			if (chunks_json) {
@@ -1382,8 +1554,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 					char** texts = extract_chunk_texts(chunks_json, &text_count);
 					if (texts && text_count > 0) {
 						int dim = 0;
-						embeddings = ollama_embed(model, OLLAMA_HOST, OLLAMA_PORT,
-						                           texts, text_count, &dim);
+						embeddings = embed_texts(model, texts, text_count, &dim);
 						if (embeddings) {
 							num_chunks = (uint32_t)text_count;
 						}
@@ -1445,8 +1616,8 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 			printf("\n");
 		}
 		printf("  Database: %s\n", db_path);
-		if (!have_ollama) {
-			printf("  %sNote: no embeddings stored (Ollama was not running)%s\n",
+		if (!have_embedder) {
+			printf("  %sNote: no embeddings stored (embedding server was not running)%s\n",
 				color(ANSI_YELLOW), color(ANSI_RESET));
 		}
 	}
@@ -1775,16 +1946,14 @@ static void mcp_handle_search(docscan_db* db, const char* model,
 	int emb_dim = 0;
 
 	if (strcmp(mode, "exact") != 0) {
-		if (ollama_is_available(OLLAMA_HOST, OLLAMA_PORT)) {
+		if (embedding_server_available()) {
 			char* texts[1];
 			texts[0] = (char*)query;
-			query_emb = ollama_embed(model, OLLAMA_HOST, OLLAMA_PORT,
-			                          texts, 1, &emb_dim);
+			query_emb = embed_texts(model, texts, 1, &emb_dim);
 		}
 		if (!query_emb && strcmp(mode, "similar") == 0) {
 			mcp_write_error(id_str, -32603,
-				"Ollama not available (needed for vector search). "
-				"Start it with: ollama serve");
+				"Embedding server not available (needed for vector search).");
 			return;
 		}
 		if (!query_emb) {
@@ -1924,7 +2093,7 @@ static void mcp_handle_index(docscan_db* db, const char* model,
 		return;
 	}
 
-	int have_ollama = ollama_is_available(OLLAMA_HOST, OLLAMA_PORT);
+	int have_embedder = embedding_server_available();
 	int indexed = 0, skipped = 0, errors = 0;
 
 	for (int i = 0; i < fl.count; i++) {
@@ -1948,7 +2117,7 @@ static void mcp_handle_index(docscan_db* db, const char* model,
 		float* embeddings = NULL;
 		uint32_t num_chunks = 0;
 
-		if (have_ollama) {
+		if (have_embedder) {
 			char* chunks_json = docscan_chunk(file_data, file_len, fpath, fmt,
 			                                   DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
 			if (chunks_json) {
@@ -1958,8 +2127,7 @@ static void mcp_handle_index(docscan_db* db, const char* model,
 					char** texts = extract_chunk_texts(chunks_json, &text_count);
 					if (texts && text_count > 0) {
 						int dim = 0;
-						embeddings = ollama_embed(model, OLLAMA_HOST, OLLAMA_PORT,
-						                           texts, text_count, &dim);
+						embeddings = embed_texts(model, texts, text_count, &dim);
 						if (embeddings) num_chunks = (uint32_t)text_count;
 						for (int t = 0; t < text_count; t++) free(texts[t]);
 						free(texts);
@@ -2249,6 +2417,26 @@ int main(int argc, char** argv) {
 			lang = argv[++i];
 			continue;
 		}
+		if (strcmp(argv[i], "--embedding-api") == 0 && i + 1 < argc) {
+			const char* val = argv[++i];
+			if (strcasecmp(val, "openai") == 0) {
+				g_api_dialect = API_OPENAI;
+			} else if (strcasecmp(val, "ollama") == 0) {
+				g_api_dialect = API_OLLAMA;
+			} else {
+				err_msg("unknown embedding API dialect: %s (expected: ollama or openai)", val);
+				return 1;
+			}
+			continue;
+		}
+		if (strcmp(argv[i], "--embedding-url") == 0 && i + 1 < argc) {
+			snprintf(g_embedding_url, sizeof(g_embedding_url), "%s", argv[++i]);
+			continue;
+		}
+		if (strcmp(argv[i], "--embedding-api-key") == 0 && i + 1 < argc) {
+			snprintf(g_api_key, sizeof(g_api_key), "%s", argv[++i]);
+			continue;
+		}
 
 		/* Command or positional arg */
 		if (argv[i][0] == '-') {
@@ -2274,6 +2462,28 @@ int main(int argc, char** argv) {
 	if (!lang) {
 		const char* env_lang = getenv("DOCSCAN_LANG");
 		if (env_lang && env_lang[0]) lang = env_lang;
+	}
+
+	/* Embedding API env vars (CLI flags override these) */
+	{
+		const char* env_api = getenv("DOCSCAN_EMBEDDING_API");
+		if (env_api && env_api[0] && g_api_dialect == API_OLLAMA) {
+			/* Only apply if CLI flag didn't already set it */
+			if (strcasecmp(env_api, "openai") == 0) {
+				g_api_dialect = API_OPENAI;
+			}
+		}
+		const char* env_url = getenv("DOCSCAN_EMBEDDING_URL");
+		if (env_url && env_url[0] &&
+		    strcmp(g_embedding_url, "http://127.0.0.1:11434") == 0) {
+			/* Only apply if CLI flag didn't already set it */
+			snprintf(g_embedding_url, sizeof(g_embedding_url), "%s", env_url);
+		}
+		const char* env_key = getenv("DOCSCAN_EMBEDDING_API_KEY");
+		if (env_key && env_key[0] && !g_api_key[0]) {
+			/* Only apply if CLI flag didn't already set it */
+			snprintf(g_api_key, sizeof(g_api_key), "%s", env_key);
+		}
 	}
 
 	/* No command? */
