@@ -1,65 +1,69 @@
 # Code Minimap
 
+~12,700 lines across 18 source files.
+
 ## Build System
 
-- **`build.zig`** — Zig build configuration. Declares sqlite-vec dependency, core module, static library (`docscan_core`), C CLI executable (`docscan`), and unit test step. Defaults to ReleaseFast.
-- **`build.zig.zon`** — Package manifest. Declares sqlite-vec dependency (provides sqlite3 + sqlite_vec0 artifacts).
-- **`flake.nix`** — Nix flake. Pre-fetches sqlite-vec via `fetchgit`, creates `zigPkgCache` linkFarm for `--system` flag. Defines `packages.default`, `checks.${system}.{build,test}`, and `devShells.default` (with zig, jq, hyperfine).
+- **`build.zig`** — Zig build configuration. Declares sqlite-vec dependency, core module (rooted at `root.zig`), static library (`docscan_core`), C CLI executable (`docscan`), unit tests + FFI tests. Defaults to ReleaseFast.
+- **`build.zig.zon`** — Package manifest with sqlite-vec dependency (provides sqlite3 + sqlite_vec0).
+- **`flake.nix`** — Nix flake. Pre-fetches sqlite-vec via `fetchgit`, creates `zigPkgCache` linkFarm for `--system` flag. Defines `packages.default`, `checks.{build,test}`, and `devShells.default` (zig_0_15, jq, hyperfine).
 
-## Source — `src/`
+## Source — Zig Core (`src/core/`)
 
-- **`src/all_tests.zig`** — Aggregated test entry point. Imports all test-containing modules so `zig build test` discovers everything.
-- **`src/core/document.zig`** — Core data model types:
-  - `Format` enum (md, docx, pdf, doc) with `extension()` and `fromExtension()` methods
-  - `MetadataEntry` struct (key, value)
-  - `Section` struct (heading, level, content, children) — recursive hierarchy
-  - `Document` struct (path, format, title, metadata, sections)
-  - `Chunk` struct (document_path, section_path, heading, text, start_byte, end_byte, chunk_index)
-  - `SearchResult` struct (document_path, document_title, section_path, heading, text, score, vector_score, lexical_score)
-- **`src/ffi/c_api.zig`** — C FFI implementation. Currently exports `docscan_version()`.
+All pure computation — no I/O.
 
-## FFI Header — `ffi/`
+- **`root.zig`** (20 lines) — Module root. Re-exports all sub-modules: document, parser_md, parser_docx, parser_pdf, parser_doc, chunker, storage, search, ignore, xml, zip, ole2, pdf_objects.
+- **`document.zig`** (173 lines) — Core data model types:
+  - `Format` enum (md/docx/pdf/doc) with `extension()`/`fromExtension()`
+  - `MetadataEntry`, `Section` (recursive), `Document`, `Chunk`, `SearchResult`
+- **`parser_md.zig`** (417 lines) — Markdown parser. Splits on ATX headings (`# ` through `###### `), builds nested section tree. 8 tests.
+- **`xml.zig`** (552 lines) — Minimal XML parser for DOCX. Elements, attributes, namespaced tags, entity decoding. 14 tests.
+- **`zip.zig`** (360 lines) — In-memory ZIP reader. Stored + deflated extraction. `buildTestZip()` helper. 7 tests.
+- **`parser_docx.zig`** (613 lines) — DOCX parser. ZIP extraction → XML parse → heading style detection (Heading1-6, Title) → text run extraction → metadata from core.xml. 8 tests.
+- **`pdf_objects.zig`** (1145 lines) — Low-level PDF infrastructure. Xref table parsing, object lookup, stream decompression (FlateDecode/zlib), full PDF value parser (dicts, arrays, strings, references, names). 22 tests.
+- **`parser_pdf.zig`** (958 lines) — PDF text extraction. Page tree traversal, content stream operator parsing (BT/ET, Tf, Tj, TJ, Td, Tm), font-size heading heuristic. 8 tests.
+- **`ole2.zig`** (685 lines) — OLE2 (Compound Binary File) reader. Header parsing, FAT chain following, directory walking, mini stream support, UTF-16LE→UTF-8 conversion. 9 tests.
+- **`parser_doc.zig`** (1138 lines) — Legacy Word (.doc) parser. FIB parsing, Piece Table extraction, Windows-1252 decoding, heuristic heading detection (ALL CAPS, numbered sections, Chapter/Section patterns). 24 tests.
+- **`chunker.zig`** (601 lines) — Structure-aware chunker. Recursive section walking, breadcrumb paths, paragraph-boundary splitting, small-section merging. 10 tests.
+- **`storage.zig`** (1010 lines) — SQLite + sqlite-vec + FTS5. Document/chunk/embedding CRUD, vector KNN search, BM25 full-text search, WAL mode, config table, incremental reindex via hash. 11 tests.
+- **`search.zig`** (518 lines) — Hybrid search engine. Exact (FTS5), hybrid (vector+lexical with RRF fusion), similar (vector-only) modes. Format filtering, document caching. 10 tests.
+- **`ignore.zig`** (607 lines) — Gitignore-compatible pattern matcher. Globs (`*`, `**`, `?`), negation, dir-only, anchored patterns, last-match-wins. Built-in defaults. 14 tests.
 
-- **`ffi/docscan_core.h`** — C header declaring the public FFI API. Currently declares `docscan_version()`.
+## Source — C FFI (`src/ffi/`)
 
-## CLI — `cli/`
+- **`c_api.zig`** (1009 lines) — C FFI boundary. 14 exported functions: open/close DB, parse, chunk, index_file, search, needs_reindex, remove_document, status, read_chunk, config get/set, free. Hand-rolled JSON serialization. 14 tests.
 
-- **`cli/main.c`** — Full C CLI entry point (~1050 lines). Dogfoods the C FFI for all operations. Includes:
-  - **SHA-256** — Minimal FIPS 180-4 implementation for file change detection hashing.
-  - **HTTP client** — POSIX socket-based HTTP POST for Ollama embedding API (`/api/embed`). Non-blocking connect with timeout.
-  - **JSON extraction** — Minimal parsers for Ollama embedding responses and chunk text extraction.
-  - **Directory walker** — Recursive `opendir`/`readdir` with format filtering (.md, .docx, .pdf, .doc) and noise directory skipping.
-  - **Progress bar** — Terminal-aware progress with rate/ETA display on stderr.
-  - **Commands**: `index <path>`, `update [path]`, `search <query>`, `status`, `config [key] [value]`, `mcp-serve`.
-  - **MCP server** (`cmd_mcp_serve`) — JSON-RPC 2.0 over newline-delimited stdin/stdout. Implements:
-    - Protocol: `initialize`, `tools/list`, `tools/call`, `ping`, `notifications/initialized`
-    - Tools: `docscan_search`, `docscan_status`, `docscan_read_chunk`, `docscan_list_docs`, `docscan_config`, `docscan_index`, `docscan_update`
-    - JSON helpers: `mcp_json_get_string`, `mcp_json_get_int`, `mcp_json_has_key`, `mcp_json_get_params`, `mcp_json_get_arguments`
-    - Response helpers: `mcp_write_result_text`, `mcp_write_raw_result`, `mcp_write_error`
-    - Supports integer and string request ids; graceful error handling for malformed input and unknown methods/tools
-  - **Flags**: `--help`, `--about`, `--json`, `--limit`, `--exact`, `--similar`, `--model`, `--db`, `--no-color`, `--no-progress`, `--simple`, `--lang`.
-  - **Environment**: `DOCSCAN_MODEL`, `DOCSCAN_DB`, `DOCSCAN_LANG`.
+## FFI Header (`ffi/`)
+
+- **`docscan_core.h`** — Complete C header declaring all 14 FFI functions with opaque `docscan_db` handle.
+
+## C CLI (`cli/`)
+
+- **`main.c`** (2329 lines) — C CLI entry point, dogfoods the C FFI. Includes:
+  - SHA-256 (FIPS 180-4) for content hashing
+  - POSIX socket HTTP client for Ollama `/api/embed`
+  - Recursive directory walker with format filtering
+  - Terminal-aware progress bar
+  - MCP server (JSON-RPC 2.0 over stdio, 7 tools)
+  - Commands: index, update, search, status, config, mcp-serve
+  - Flags: --help, --about, --json, --limit, --exact, --similar, --model, --db, --no-color, --no-progress, --simple, --lang
+
+## Tests
+
+- **`src/all_tests.zig`** — Aggregated Zig unit tests (~153 tests across all modules)
+- **`tests/cli/test-cli`** (288 lines) — 18 Bash black-box CLI tests
+- **`tests/mcp/test-mcp`** (316 lines) — 14 Bash MCP protocol tests
+- **`tests/integration/`** — Placeholder for Ollama-dependent tests
+- **`tests/unit/`** — Test fixture directory
 
 ## Scripts
 
-- **`build`** — Nix build wrapper. Supports `--test`, `--debug` flags.
-- **`test`** — Master test runner. Runs unit + cli + mcp suites, accumulates failures.
-- **`bm`** — Benchmark runner stub. Rejects debug builds, uses hyperfine.
-- **`build_all`** — Cross-compile for 5 targets (native + 4 cross).
+- **`build`** — `nix build` wrapper (--test, --debug flags)
+- **`test`** — Master runner: unit + cli + mcp suites
+- **`bm`** — Benchmark runner stub (rejects debug builds)
+- **`build_all`** — Cross-compile for 5 targets
 
-## Documentation
+## Config
 
-- **`PROJECT_OVERVIEW.md`** — Architecture, terminology, supported formats, commands.
-- **`PLAN.md`** — Task checklist with completion timestamps.
-- **`CODE_MINIMAP.md`** — This file.
-
-## Tests — `tests/`
-
-- **`tests/unit/`** — Zig unit test fixtures (empty, tests live in source files)
-- **`tests/cli/`** — Bash CLI black-box tests (not yet created)
-- **`tests/mcp/`** — MCP JSON-RPC tests (not yet created)
-- **`tests/integration/`** — Full pipeline tests requiring Ollama (not yet created)
-
-## Benchmarks — `benchmarks/`
-
-- **`benchmarks/fixtures/`** — Benchmark fixture documents (not yet populated)
+- **`.docscanignore.default`** — Default ignore patterns (VCS, deps, build artifacts, binaries, IDE, OS files)
+- **`.gitignore`** — Git ignores for build artifacts

@@ -2,23 +2,40 @@
 
 See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task details.
 
-## Tasks
+## Completed
 
-- [x] Task 1: Project Scaffolding — build.zig, flake.nix, stub sources, scripts, docs (2026-04-09 ~09:00 EST)
-- [ ] Task 2: Markdown Parser — structure-aware .md text extraction
-- [ ] Task 3: XML Parser for DOCX — minimal XML parser (pure Zig)
-- [ ] Task 4: DOCX Parser — ZIP + XML walk for text extraction
-- [ ] Task 5: PDF Parser — content stream text operators + font heuristics
-- [ ] Task 6: DOC Parser — OLE2 container + Piece Table
-- [ ] Task 7: Chunker — structure-aware splitting with breadcrumb paths
-- [ ] Task 8: Storage Layer — SQLite + sqlite-vec + FTS5
-- [ ] Task 9: Search Engine — hybrid vector + BM25 with RRF fusion
-- [ ] Task 10: C FFI Boundary — full C API with opaque handles
-- [x] Task 11: C CLI — all commands, flags, progress, i18n groundwork (2026-04-09 ~11:10 EST)
-- [x] Task 12: MCP Server — JSON-RPC 2.0 over stdio (2026-04-08 ~EST)
-- [ ] Task 13: CLI Tests — Bash black-box tests
-- [ ] Task 14: MCP Tests — JSON-RPC stdin/stdout tests
-- [ ] Task 15: Integration Tests — full pipeline with Ollama
-- [ ] Task 16: Benchmark Suite — parsing, chunking, search latency
-- [ ] Task 17: Ignore Patterns — .docscanignore with sensible defaults
-- [ ] Task 18: Final Integration + Documentation
+- [x] Task 1: Project Scaffolding (2026-04-09)
+- [x] Task 2: Markdown Parser — 8 tests (2026-04-09)
+- [x] Task 3: XML Parser for DOCX — 14 tests (2026-04-09)
+- [x] Task 4: DOCX Parser — 15 tests (2026-04-09)
+- [x] Task 5: PDF Parser — 30 tests (2026-04-09)
+- [x] Task 6: DOC Parser — 33 tests (2026-04-09)
+- [x] Task 7: Chunker — 10 tests (2026-04-09)
+- [x] Task 8: Storage Layer — 11 tests (2026-04-09)
+- [x] Task 9: Search Engine — 10 tests (2026-04-09)
+- [x] Task 10: C FFI Boundary — 14 tests (2026-04-09)
+- [x] Task 11: C CLI (2026-04-09)
+- [x] Task 12: MCP Server (2026-04-09)
+- [x] Task 13: CLI Tests — 18 tests (2026-04-09)
+- [x] Task 14: MCP Tests — 14 tests (2026-04-09)
+- [x] Task 17: Ignore Patterns — 14 tests (2026-04-09)
+- [x] Task 18: Final Integration + Documentation (2026-04-09)
+
+## Deferred
+
+- [ ] Task 15: Integration Tests — requires running Ollama
+- [ ] Task 16: Benchmark Suite — `./bm` stub exists
+- [ ] Wire ignore patterns into CLI directory walker
+- [ ] `docscan_list_documents` FFI function
+- [ ] DIFAT chain support in OLE2 (>7MB .doc files)
+- [ ] Xref stream support in PDF parser
+- [ ] CIDFont/ToUnicode mapping in PDF
+- [ ] Windows directory walking (currently POSIX-only)
+- [ ] i18n translations (groundwork laid: --lang, DOCSCAN_LANG)
+- [ ] Legal embedding model research/fine-tuning
+
+## Stats
+
+- ~12,700 lines across 18 source files
+- ~185 automated tests (153 Zig unit + 18 CLI + 14 MCP)
+- 4 format parsers (md, docx, pdf, doc)
