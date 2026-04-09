@@ -1,6 +1,11 @@
 //! Aggregated test entry point for docscan.
 //! Import every module that contains tests here so `zig build test`
 //! discovers them all in a single pass.
+//!
+//! NOTE: FFI tests live in a separate test target (ffi_tests) because
+//! c_api.zig uses @import("core") (a named module), while this file
+//! imports core files directly. Zig does not allow a file to exist in
+//! two modules simultaneously.
 
 test {
 	_ = @import("core/document.zig");
