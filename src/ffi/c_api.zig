@@ -16,6 +16,7 @@ const parser_md = core.parser_md;
 const parser_docx = core.parser_docx;
 const parser_pdf = core.parser_pdf;
 const parser_doc = core.parser_doc;
+const parser_rtf = core.parser_rtf;
 
 // ── Allocator ─────────────────────────────────────────────────────────
 
@@ -307,6 +308,9 @@ fn getParser(format: []const u8) ?struct { parse: ParseFn, free: FreeFn } {
 	if (std.mem.eql(u8, format, "doc")) {
 		return .{ .parse = &parser_doc.parse, .free = &parser_doc.freeDocument };
 	}
+	if (std.mem.eql(u8, format, "rtf")) {
+		return .{ .parse = &parser_rtf.parse, .free = &parser_rtf.freeDocument };
+	}
 	return null;
 }
 
@@ -346,7 +350,7 @@ export fn docscan_close(db: ?*DocscanDb) void {
 }
 
 /// Parse a document from raw bytes.
-/// format: "md", "docx", "pdf", "doc"
+/// format: "md", "docx", "pdf", "doc", "rtf"
 /// Returns a JSON string (caller must free with docscan_free), or null on error.
 export fn docscan_parse(
 	data: ?[*]const u8,

@@ -11,6 +11,7 @@ pub const Format = enum {
 	docx,
 	pdf,
 	doc,
+	rtf,
 
 	/// Return the file extension string (without dot) for this format.
 	pub fn extension(self: Format) []const u8 {
@@ -19,6 +20,7 @@ pub const Format = enum {
 			.docx => "docx",
 			.pdf => "pdf",
 			.doc => "doc",
+			.rtf => "rtf",
 		};
 	}
 
@@ -29,6 +31,7 @@ pub const Format = enum {
 		if (std.mem.eql(u8, lower, "docx")) return .docx;
 		if (std.mem.eql(u8, lower, "pdf")) return .pdf;
 		if (std.mem.eql(u8, lower, "doc")) return .doc;
+		if (std.mem.eql(u8, lower, "rtf")) return .rtf;
 		return null;
 	}
 };
@@ -98,6 +101,7 @@ test "Format.extension round-trips" {
 		.{ .fmt = .docx, .ext = "docx" },
 		.{ .fmt = .pdf, .ext = "pdf" },
 		.{ .fmt = .doc, .ext = "doc" },
+		.{ .fmt = .rtf, .ext = "rtf" },
 	};
 	for (cases) |c| {
 		try std.testing.expectEqualStrings(c.ext, c.fmt.extension());

@@ -367,6 +367,7 @@ static const char* format_for_ext(const char* path) {
 	if (strcasecmp(dot, "docx") == 0) return "docx";
 	if (strcasecmp(dot, "pdf") == 0) return "pdf";
 	if (strcasecmp(dot, "doc") == 0) return "doc";
+	if (strcasecmp(dot, "rtf") == 0) return "rtf";
 	return NULL;
 }
 
