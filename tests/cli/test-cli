@@ -288,6 +288,109 @@ else
 fi
 
 # ──────────────────────────────────────────────
+# 19. config.ini is created on index
+# ──────────────────────────────────────────────
+CFG_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cfg-test-XXXXXX")"
+echo "# Config test" > "$CFG_TEST_DIR/doc.md"
+out="" ; err="" ; rc=""
+capture "$BINARY" index "$CFG_TEST_DIR"
+if [ "$rc" -eq 0 ] && [ -f "$CFG_TEST_DIR/.docscan/config.ini" ]; then
+	pass "config.ini is created on index"
+else
+	fail "config.ini is created on index" "rc=$rc, file exists=$([ -f "$CFG_TEST_DIR/.docscan/config.ini" ] && echo yes || echo no)"
+fi
+
+# ──────────────────────────────────────────────
+# 20. config.ini persists CLI flags (embedding-api)
+# ──────────────────────────────────────────────
+CFG_TEST_DIR2="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cfg-test2-XXXXXX")"
+echo "# Config persist test" > "$CFG_TEST_DIR2/doc.md"
+out="" ; err="" ; rc=""
+capture "$BINARY" index "$CFG_TEST_DIR2" --embedding-api openai --embedding-url http://localhost:8000 --model bge-m3-mlx
+if [ "$rc" -eq 0 ]; then
+	ini_content=""
+	ini_content=$(cat "$CFG_TEST_DIR2/.docscan/config.ini" 2>/dev/null)
+	if echo "$ini_content" | grep -q "api = openai" && \
+	   echo "$ini_content" | grep -q "url = http://localhost:8000" && \
+	   echo "$ini_content" | grep -q "model = bge-m3-mlx"; then
+		pass "config.ini persists CLI flags (embedding-api, url, model)"
+	else
+		fail "config.ini persists CLI flags" "ini contents don't match expected values"
+	fi
+else
+	fail "config.ini persists CLI flags" "index failed rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 21. config dot-notation get reads from INI
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$CFG_TEST_DIR2/.docscan/index.db" embedding.api
+if [ "$rc" -eq 0 ] && [ "$out" = "openai" ]; then
+	pass "config dot-notation get (embedding.api = openai)"
+else
+	fail "config dot-notation get" "expected 'openai', got '$out' (rc=$rc)"
+fi
+
+# ──────────────────────────────────────────────
+# 22. config dot-notation set modifies INI
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$CFG_TEST_DIR2/.docscan/index.db" embedding.url http://localhost:9999
+if [ "$rc" -eq 0 ]; then
+	out="" ; err="" ; rc=""
+	capture "$BINARY" config --db "$CFG_TEST_DIR2/.docscan/index.db" embedding.url
+	if [ "$rc" -eq 0 ] && [ "$out" = "http://localhost:9999" ]; then
+		pass "config dot-notation set/get roundtrips"
+	else
+		fail "config dot-notation set/get roundtrips" "expected 'http://localhost:9999', got '$out'"
+	fi
+else
+	fail "config dot-notation set/get roundtrips" "set failed rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 23. config shows all values with INI sections
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$CFG_TEST_DIR2/.docscan/index.db"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "\[embedding\]" && echo "$out" | grep -q "\[search\]" && echo "$out" | grep -q "\[index\]"; then
+	pass "config shows all values with INI sections"
+else
+	fail "config shows all values with INI sections" "rc=$rc, sections not found in output"
+fi
+
+# ──────────────────────────────────────────────
+# 24. config --json shows all values as JSON
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --json --db "$CFG_TEST_DIR2/.docscan/index.db"
+if [ "$rc" -eq 0 ] && echo "$out" | jq . > /dev/null 2>&1; then
+	api_val=$(echo "$out" | jq -r '."embedding.api"')
+	if [ "$api_val" = "openai" ]; then
+		pass "config --json shows all values as valid JSON"
+	else
+		fail "config --json shows all values as valid JSON" "embedding.api='$api_val'"
+	fi
+else
+	fail "config --json shows all values as valid JSON" "rc=$rc, invalid JSON: '$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 25. legacy key 'model' still works (backward compat)
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$CFG_TEST_DIR2/.docscan/index.db" model
+if [ "$rc" -eq 0 ] && [ "$out" = "bge-m3-mlx" ]; then
+	pass "legacy key 'model' returns value from INI"
+else
+	fail "legacy key 'model' returns value from INI" "expected 'bge-m3-mlx', got '$out'"
+fi
+
+# Cleanup temp dirs
+rm -rf "$CFG_TEST_DIR" "$CFG_TEST_DIR2"
+
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 echo ""

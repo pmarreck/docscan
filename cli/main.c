@@ -1094,6 +1094,28 @@ static void progress_finish(progress_t* p) {
 
 /* ── Database path resolution ───────────────────────────────────────── */
 
+/* Default config.ini template — also used in the INI config section below */
+static const char* DEFAULT_CONFIG_TEMPLATE_EARLY =
+	"# docscan project configuration\n"
+	"# Edit values below. Changes take effect on next command.\n"
+	"# See: docscan --help\n"
+	"\n"
+	"[embedding]\n"
+	"# Embedding provider: ollama (default) or openai (for oMLX, LiteLLM, vLLM)\n"
+	"#api = ollama\n"
+	"#url = http://127.0.0.1:11434\n"
+	"#model = nomic-embed-text\n"
+	"#api_key =\n"
+	"#dim = 768\n"
+	"\n"
+	"[search]\n"
+	"#limit = 10\n"
+	"#weight_vector = 0.7\n"
+	"#weight_lexical = 0.3\n"
+	"\n"
+	"[index]\n"
+	"#max_chunk_tokens = 1500\n";
+
 /*
  * Resolve the database path.
  * If --db was given, use that.
@@ -1136,9 +1158,392 @@ static char* resolve_db_path(const char* explicit_db, const char* target_path) {
 	snprintf(docscan_dir, sizeof(docscan_dir), "%s/%s", dir, DEFAULT_DB_SUBDIR);
 	mkdir(docscan_dir, 0755); /* ignore error if exists */
 
+	/* Create default config.ini if it doesn't exist */
+	{
+		char ini_path[MAX_PATH_LEN];
+		snprintf(ini_path, sizeof(ini_path), "%s/config.ini", docscan_dir);
+		struct stat ini_st;
+		if (stat(ini_path, &ini_st) != 0) {
+			/* File doesn't exist — create with default template */
+			FILE* ini_f = fopen(ini_path, "w");
+			if (ini_f) {
+				fprintf(ini_f, "%s", DEFAULT_CONFIG_TEMPLATE_EARLY);
+				fclose(ini_f);
+			}
+		}
+	}
+
 	char* db_path = malloc(MAX_PATH_LEN);
 	snprintf(db_path, MAX_PATH_LEN, "%s/%s", docscan_dir, DEFAULT_DB_FILENAME);
 	return db_path;
+}
+
+/* ── INI config file (.docscan/config.ini) ─────────────────────────── */
+
+/*
+ * Persistent project-level settings stored in .docscan/config.ini.
+ * Override precedence (highest to lowest):
+ *   1. CLI flags
+ *   2. Environment variables
+ *   3. .docscan/config.ini
+ *   4. Hardcoded defaults
+ */
+
+typedef struct {
+	/* [embedding] */
+	char embedding_api[64];
+	char embedding_url[512];
+	char embedding_model[256];
+	char embedding_api_key[512];
+	int  embedding_dim;
+
+	/* [search] */
+	int   search_limit;
+	float weight_vector;
+	float weight_lexical;
+
+	/* [index] */
+	int max_chunk_tokens;
+} DocscanConfig;
+
+/* Initialize config with defaults */
+static void config_defaults(DocscanConfig* cfg) {
+	snprintf(cfg->embedding_api, sizeof(cfg->embedding_api), "ollama");
+	snprintf(cfg->embedding_url, sizeof(cfg->embedding_url), "http://127.0.0.1:11434");
+	snprintf(cfg->embedding_model, sizeof(cfg->embedding_model), "%s", DEFAULT_MODEL);
+	cfg->embedding_api_key[0] = '\0';
+	cfg->embedding_dim = DEFAULT_EMBEDDING_DIM;
+	cfg->search_limit = DEFAULT_LIMIT;
+	cfg->weight_vector = 0.7f;
+	cfg->weight_lexical = 0.3f;
+	cfg->max_chunk_tokens = DEFAULT_MAX_TOKENS;
+}
+
+/* Trim leading/trailing whitespace in-place, return pointer into buf */
+static char* str_trim(char* s) {
+	while (*s && (*s == ' ' || *s == '\t')) s++;
+	if (!*s) return s;
+	char* end = s + strlen(s) - 1;
+	while (end > s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+		*end-- = '\0';
+	return s;
+}
+
+/* Derive config.ini path from a .docscan directory path.
+ * If db_path ends with /index.db, strip that to get the dir.
+ * Returns malloc'd string. Caller frees. */
+static char* config_ini_path_from_db(const char* db_path) {
+	char dir[MAX_PATH_LEN];
+
+	/* If db_path ends with "/index.db", use the directory part */
+	const char* suffix = "/index.db";
+	size_t db_len = strlen(db_path);
+	size_t suf_len = strlen(suffix);
+	if (db_len > suf_len && strcmp(db_path + db_len - suf_len, suffix) == 0) {
+		size_t dlen = db_len - suf_len;
+		if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
+		memcpy(dir, db_path, dlen);
+		dir[dlen] = '\0';
+	} else {
+		/* Fallback: use db_path's parent directory */
+		const char* slash = strrchr(db_path, '/');
+#ifdef _WIN32
+		const char* bslash = strrchr(db_path, '\\');
+		if (!slash || (bslash && bslash > slash)) slash = bslash;
+#endif
+		if (slash) {
+			size_t dlen = (size_t)(slash - db_path);
+			if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
+			memcpy(dir, db_path, dlen);
+			dir[dlen] = '\0';
+		} else {
+			snprintf(dir, sizeof(dir), ".");
+		}
+	}
+
+	char* path = malloc(MAX_PATH_LEN);
+	if (!path) return NULL;
+	snprintf(path, MAX_PATH_LEN, "%s/config.ini", dir);
+	return path;
+}
+
+/* Load config from .ini file. Returns 0 on success, -1 if file not found. */
+static int load_config(const char* config_path, DocscanConfig* cfg) {
+	FILE* f = fopen(config_path, "r");
+	if (!f) return -1;
+
+	char section[64] = "";
+	char line[1024];
+
+	while (fgets(line, sizeof(line), f)) {
+		char* s = str_trim(line);
+		/* Skip empty lines and comments */
+		if (!*s || *s == '#' || *s == ';') continue;
+
+		/* Section header */
+		if (*s == '[') {
+			char* end = strchr(s, ']');
+			if (end) {
+				*end = '\0';
+				snprintf(section, sizeof(section), "%s", s + 1);
+			}
+			continue;
+		}
+
+		/* key = value */
+		char* eq = strchr(s, '=');
+		if (!eq) continue;
+
+		*eq = '\0';
+		char* key = str_trim(s);
+		char* val = str_trim(eq + 1);
+
+		/* Strip surrounding quotes if present */
+		size_t vlen = strlen(val);
+		if (vlen >= 2 && ((val[0] == '"' && val[vlen-1] == '"') ||
+		                   (val[0] == '\'' && val[vlen-1] == '\''))) {
+			val[vlen-1] = '\0';
+			val++;
+		}
+
+		/* Map section.key -> config field */
+		if (strcmp(section, "embedding") == 0) {
+			if (strcmp(key, "api") == 0) {
+				snprintf(cfg->embedding_api, sizeof(cfg->embedding_api), "%s", val);
+			} else if (strcmp(key, "url") == 0) {
+				snprintf(cfg->embedding_url, sizeof(cfg->embedding_url), "%s", val);
+			} else if (strcmp(key, "model") == 0) {
+				snprintf(cfg->embedding_model, sizeof(cfg->embedding_model), "%s", val);
+			} else if (strcmp(key, "api_key") == 0) {
+				snprintf(cfg->embedding_api_key, sizeof(cfg->embedding_api_key), "%s", val);
+			} else if (strcmp(key, "dim") == 0) {
+				int d = atoi(val);
+				if (d > 0) cfg->embedding_dim = d;
+			}
+			/* Unknown keys: silently ignore */
+		} else if (strcmp(section, "search") == 0) {
+			if (strcmp(key, "limit") == 0) {
+				int v = atoi(val);
+				if (v > 0) cfg->search_limit = v;
+			} else if (strcmp(key, "weight_vector") == 0) {
+				float v = strtof(val, NULL);
+				if (v >= 0.0f && v <= 1.0f) cfg->weight_vector = v;
+			} else if (strcmp(key, "weight_lexical") == 0) {
+				float v = strtof(val, NULL);
+				if (v >= 0.0f && v <= 1.0f) cfg->weight_lexical = v;
+			}
+		} else if (strcmp(section, "index") == 0) {
+			if (strcmp(key, "max_chunk_tokens") == 0) {
+				int v = atoi(val);
+				if (v > 0) cfg->max_chunk_tokens = v;
+			}
+		}
+		/* Unknown sections: silently ignore */
+	}
+
+	fclose(f);
+	return 0;
+}
+
+/* Save config to .ini file. Writes all non-default values as active lines,
+ * commented defaults for unset values. */
+static int save_config(const char* config_path, const DocscanConfig* cfg) {
+	FILE* f = fopen(config_path, "w");
+	if (!f) return -1;
+
+	DocscanConfig defaults;
+	config_defaults(&defaults);
+
+	fprintf(f, "# docscan project configuration\n");
+	fprintf(f, "# Edit values below. Changes take effect on next command.\n");
+	fprintf(f, "# See: docscan --help\n");
+	fprintf(f, "\n");
+
+	fprintf(f, "[embedding]\n");
+	fprintf(f, "# Embedding provider: ollama (default) or openai (for oMLX, LiteLLM, vLLM)\n");
+	if (strcmp(cfg->embedding_api, defaults.embedding_api) != 0)
+		fprintf(f, "api = %s\n", cfg->embedding_api);
+	else
+		fprintf(f, "#api = ollama\n");
+
+	if (strcmp(cfg->embedding_url, defaults.embedding_url) != 0)
+		fprintf(f, "url = %s\n", cfg->embedding_url);
+	else
+		fprintf(f, "#url = http://127.0.0.1:11434\n");
+
+	if (strcmp(cfg->embedding_model, defaults.embedding_model) != 0)
+		fprintf(f, "model = %s\n", cfg->embedding_model);
+	else
+		fprintf(f, "#model = nomic-embed-text\n");
+
+	if (cfg->embedding_api_key[0])
+		fprintf(f, "api_key = %s\n", cfg->embedding_api_key);
+	else
+		fprintf(f, "#api_key =\n");
+
+	if (cfg->embedding_dim != defaults.embedding_dim)
+		fprintf(f, "dim = %d\n", cfg->embedding_dim);
+	else
+		fprintf(f, "#dim = 768\n");
+
+	fprintf(f, "\n");
+	fprintf(f, "[search]\n");
+
+	if (cfg->search_limit != defaults.search_limit)
+		fprintf(f, "limit = %d\n", cfg->search_limit);
+	else
+		fprintf(f, "#limit = 10\n");
+
+	if (cfg->weight_vector != defaults.weight_vector)
+		fprintf(f, "weight_vector = %.1f\n", (double)cfg->weight_vector);
+	else
+		fprintf(f, "#weight_vector = 0.7\n");
+
+	if (cfg->weight_lexical != defaults.weight_lexical)
+		fprintf(f, "weight_lexical = %.1f\n", (double)cfg->weight_lexical);
+	else
+		fprintf(f, "#weight_lexical = 0.3\n");
+
+	fprintf(f, "\n");
+	fprintf(f, "[index]\n");
+
+	if (cfg->max_chunk_tokens != defaults.max_chunk_tokens)
+		fprintf(f, "max_chunk_tokens = %d\n", cfg->max_chunk_tokens);
+	else
+		fprintf(f, "#max_chunk_tokens = 1500\n");
+
+	fclose(f);
+	return 0;
+}
+
+/* Set a single config key using dot notation (e.g., "embedding.api").
+ * Loads the current config, modifies, and saves. Returns 0 on success. */
+static int config_ini_set(const char* config_path, const char* dotkey, const char* value) {
+	DocscanConfig cfg;
+	config_defaults(&cfg);
+	load_config(config_path, &cfg); /* OK if file doesn't exist yet */
+
+	/* Parse section.key */
+	char section[64] = "";
+	char key[64] = "";
+	const char* dot = strchr(dotkey, '.');
+	if (dot) {
+		size_t slen = (size_t)(dot - dotkey);
+		if (slen >= sizeof(section)) slen = sizeof(section) - 1;
+		memcpy(section, dotkey, slen);
+		section[slen] = '\0';
+		snprintf(key, sizeof(key), "%s", dot + 1);
+	} else {
+		/* No dot: treat as a legacy DB-config key (model, etc.) */
+		/* Map legacy keys to their INI equivalents */
+		if (strcmp(dotkey, "model") == 0) {
+			snprintf(section, sizeof(section), "embedding");
+			snprintf(key, sizeof(key), "model");
+		} else if (strcmp(dotkey, "embedding_dim") == 0) {
+			snprintf(section, sizeof(section), "embedding");
+			snprintf(key, sizeof(key), "dim");
+		} else if (strcmp(dotkey, "max_chunk_tokens") == 0) {
+			snprintf(section, sizeof(section), "index");
+			snprintf(key, sizeof(key), "max_chunk_tokens");
+		} else {
+			return -1; /* unknown key */
+		}
+	}
+
+	/* Apply to the config struct */
+	if (strcmp(section, "embedding") == 0) {
+		if (strcmp(key, "api") == 0) {
+			snprintf(cfg.embedding_api, sizeof(cfg.embedding_api), "%s", value);
+		} else if (strcmp(key, "url") == 0) {
+			snprintf(cfg.embedding_url, sizeof(cfg.embedding_url), "%s", value);
+		} else if (strcmp(key, "model") == 0) {
+			snprintf(cfg.embedding_model, sizeof(cfg.embedding_model), "%s", value);
+		} else if (strcmp(key, "api_key") == 0) {
+			snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key), "%s", value);
+		} else if (strcmp(key, "dim") == 0) {
+			int d = atoi(value);
+			if (d > 0) cfg.embedding_dim = d;
+		} else {
+			return -1;
+		}
+	} else if (strcmp(section, "search") == 0) {
+		if (strcmp(key, "limit") == 0) {
+			int v = atoi(value);
+			if (v > 0) cfg.search_limit = v;
+		} else if (strcmp(key, "weight_vector") == 0) {
+			cfg.weight_vector = strtof(value, NULL);
+		} else if (strcmp(key, "weight_lexical") == 0) {
+			cfg.weight_lexical = strtof(value, NULL);
+		} else {
+			return -1;
+		}
+	} else if (strcmp(section, "index") == 0) {
+		if (strcmp(key, "max_chunk_tokens") == 0) {
+			int v = atoi(value);
+			if (v > 0) cfg.max_chunk_tokens = v;
+		} else {
+			return -1;
+		}
+	} else {
+		return -1;
+	}
+
+	return save_config(config_path, &cfg);
+}
+
+/* Get a single config value by dot notation. Returns malloc'd string or NULL. */
+static char* config_ini_get(const char* config_path, const char* dotkey) {
+	DocscanConfig cfg;
+	config_defaults(&cfg);
+	if (load_config(config_path, &cfg) != 0) return NULL;
+
+	/* Parse section.key */
+	char section[64] = "";
+	char key[64] = "";
+	const char* dot = strchr(dotkey, '.');
+	if (dot) {
+		size_t slen = (size_t)(dot - dotkey);
+		if (slen >= sizeof(section)) slen = sizeof(section) - 1;
+		memcpy(section, dotkey, slen);
+		section[slen] = '\0';
+		snprintf(key, sizeof(key), "%s", dot + 1);
+	} else {
+		/* Legacy key mapping */
+		if (strcmp(dotkey, "model") == 0) {
+			snprintf(section, sizeof(section), "embedding");
+			snprintf(key, sizeof(key), "model");
+		} else if (strcmp(dotkey, "embedding_dim") == 0) {
+			snprintf(section, sizeof(section), "embedding");
+			snprintf(key, sizeof(key), "dim");
+		} else if (strcmp(dotkey, "max_chunk_tokens") == 0) {
+			snprintf(section, sizeof(section), "index");
+			snprintf(key, sizeof(key), "max_chunk_tokens");
+		} else {
+			return NULL;
+		}
+	}
+
+	char buf[512];
+	if (strcmp(section, "embedding") == 0) {
+		if (strcmp(key, "api") == 0) snprintf(buf, sizeof(buf), "%s", cfg.embedding_api);
+		else if (strcmp(key, "url") == 0) snprintf(buf, sizeof(buf), "%s", cfg.embedding_url);
+		else if (strcmp(key, "model") == 0) snprintf(buf, sizeof(buf), "%s", cfg.embedding_model);
+		else if (strcmp(key, "api_key") == 0) snprintf(buf, sizeof(buf), "%s", cfg.embedding_api_key);
+		else if (strcmp(key, "dim") == 0) snprintf(buf, sizeof(buf), "%d", cfg.embedding_dim);
+		else return NULL;
+	} else if (strcmp(section, "search") == 0) {
+		if (strcmp(key, "limit") == 0) snprintf(buf, sizeof(buf), "%d", cfg.search_limit);
+		else if (strcmp(key, "weight_vector") == 0) snprintf(buf, sizeof(buf), "%.1f", (double)cfg.weight_vector);
+		else if (strcmp(key, "weight_lexical") == 0) snprintf(buf, sizeof(buf), "%.1f", (double)cfg.weight_lexical);
+		else return NULL;
+	} else if (strcmp(section, "index") == 0) {
+		if (strcmp(key, "max_chunk_tokens") == 0) snprintf(buf, sizeof(buf), "%d", cfg.max_chunk_tokens);
+		else return NULL;
+	} else {
+		return NULL;
+	}
+
+	return strdup(buf);
 }
 
 /* ── Help / About ───────────────────────────────────────────────────── */
@@ -1183,13 +1588,20 @@ static void print_help(void) {
 		"  DOCSCAN_EMBEDDING_API_KEY  API key for OpenAI-compatible servers\n"
 		"  DOCSCAN_LANG               Language override\n"
 		"\n"
+		"%sCONFIG FILE%s\n"
+		"  Settings are saved in .docscan/config.ini (created on first index).\n"
+		"  Use dot notation: docscan config embedding.api openai\n"
+		"  Override precedence: CLI flags > env vars > config.ini > defaults\n"
+		"\n"
 		"%sEXAMPLES%s\n"
 		"  docscan index ~/Documents\n"
 		"  docscan search \"contract renewal terms\"\n"
 		"  docscan search --exact \"indemnification clause\"\n"
 		"  docscan update ~/Documents\n"
 		"  docscan status\n"
-		"  docscan config model nomic-embed-text\n",
+		"  docscan config embedding.model bge-m3\n"
+		"  docscan config embedding.api openai\n",
+		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
@@ -1316,62 +1728,110 @@ static int cmd_config(const char* db_path_arg, const char* key, const char* valu
 		return 1;
 	}
 
-	docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
-	if (!db) {
-		err_msg("failed to open database: %s", err_buf);
+	/* Derive config.ini path from the DB path */
+	char* cfg_path = config_ini_path_from_db(db_path);
+	if (!cfg_path) {
+		err_msg("could not determine config path");
 		free(db_path);
 		return 1;
 	}
 
 	if (key == NULL) {
-		/* Show all config — just show known keys */
-		const char* known_keys[] = { "model", "embedding_dim", "max_chunk_tokens", "lang", NULL };
-		if (g_json_output) printf("{");
-		int first = 1;
-		for (int i = 0; known_keys[i]; i++) {
-			char* val = docscan_config_get(db, known_keys[i], err_buf, sizeof(err_buf));
-			if (val) {
-				if (g_json_output) {
-					printf("%s\"%s\":\"%s\"", first ? "" : ",", known_keys[i], val);
-				} else {
-					printf("  %s%s%s = %s\n", color(ANSI_CYAN), known_keys[i], color(ANSI_RESET), val);
+		/* Show all config — load from INI file */
+		DocscanConfig cfg;
+		config_defaults(&cfg);
+		load_config(cfg_path, &cfg); /* OK if missing, we show defaults */
+
+		/* Also pull any legacy DB config values */
+		docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+		if (db) {
+			char* db_model = docscan_config_get(db, "model", err_buf, sizeof(err_buf));
+			if (db_model) {
+				/* DB model only applies if INI doesn't have one set already */
+				if (strcmp(cfg.embedding_model, DEFAULT_MODEL) == 0) {
+					snprintf(cfg.embedding_model, sizeof(cfg.embedding_model), "%s", db_model);
 				}
-				docscan_free(val);
-				first = 0;
+				docscan_free(db_model);
 			}
+			docscan_close(db);
 		}
-		if (g_json_output) printf("}\n");
-		if (first && !g_json_output) {
-			printf("  (no configuration set)\n");
+
+		if (g_json_output) {
+			printf("{");
+			printf("\"embedding.api\":\"%s\"", cfg.embedding_api);
+			printf(",\"embedding.url\":\"%s\"", cfg.embedding_url);
+			printf(",\"embedding.model\":\"%s\"", cfg.embedding_model);
+			printf(",\"embedding.api_key\":\"%s\"", cfg.embedding_api_key);
+			printf(",\"embedding.dim\":%d", cfg.embedding_dim);
+			printf(",\"search.limit\":%d", cfg.search_limit);
+			printf(",\"search.weight_vector\":%.1f", (double)cfg.weight_vector);
+			printf(",\"search.weight_lexical\":%.1f", (double)cfg.weight_lexical);
+			printf(",\"index.max_chunk_tokens\":%d", cfg.max_chunk_tokens);
+			printf("}\n");
+		} else {
+			fprintf(stderr, "Using config: %s\n", cfg_path);
+			printf("%s[embedding]%s\n", color(ANSI_BOLD), color(ANSI_RESET));
+			printf("  %sapi%s = %s\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_api);
+			printf("  %surl%s = %s\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_url);
+			printf("  %smodel%s = %s\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_model);
+			printf("  %sapi_key%s = %s\n", color(ANSI_CYAN), color(ANSI_RESET),
+				cfg.embedding_api_key[0] ? cfg.embedding_api_key : "(not set)");
+			printf("  %sdim%s = %d\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_dim);
+			printf("\n%s[search]%s\n", color(ANSI_BOLD), color(ANSI_RESET));
+			printf("  %slimit%s = %d\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.search_limit);
+			printf("  %sweight_vector%s = %.1f\n", color(ANSI_CYAN), color(ANSI_RESET), (double)cfg.weight_vector);
+			printf("  %sweight_lexical%s = %.1f\n", color(ANSI_CYAN), color(ANSI_RESET), (double)cfg.weight_lexical);
+			printf("\n%s[index]%s\n", color(ANSI_BOLD), color(ANSI_RESET));
+			printf("  %smax_chunk_tokens%s = %d\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.max_chunk_tokens);
 		}
 	} else if (value == NULL) {
-		/* Get single key */
-		char* val = docscan_config_get(db, key, err_buf, sizeof(err_buf));
+		/* Get single key — try INI first, then legacy DB */
+		char* val = config_ini_get(cfg_path, key);
+		if (!val) {
+			/* Try legacy DB config */
+			docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+			if (db) {
+				char* db_val = docscan_config_get(db, key, err_buf, sizeof(err_buf));
+				if (db_val) {
+					val = strdup(db_val);
+					docscan_free(db_val);
+				}
+				docscan_close(db);
+			}
+		}
 		if (val) {
 			if (g_json_output) {
 				printf("{\"%s\":\"%s\"}\n", key, val);
 			} else {
 				printf("%s\n", val);
 			}
-			docscan_free(val);
+			free(val);
 		} else {
 			if (g_json_output) {
 				printf("{\"error\":\"key not found: %s\"}\n", key);
 			} else {
 				fprintf(stderr, "Key '%s' not set\n", key);
 			}
-			docscan_close(db);
+			free(cfg_path);
 			free(db_path);
 			return 1;
 		}
 	} else {
-		/* Set key=value */
-		int rc = docscan_config_set(db, key, value, err_buf, sizeof(err_buf));
+		/* Set key=value — write to INI file */
+		int rc = config_ini_set(cfg_path, key, value);
 		if (rc != 0) {
-			err_msg("failed to set config: %s", err_buf);
-			docscan_close(db);
-			free(db_path);
-			return 1;
+			/* Fall back to legacy DB config for unknown keys */
+			docscan_db* db = docscan_open(db_path, DEFAULT_EMBEDDING_DIM, err_buf, sizeof(err_buf));
+			if (db) {
+				rc = docscan_config_set(db, key, value, err_buf, sizeof(err_buf));
+				docscan_close(db);
+			}
+			if (rc != 0) {
+				err_msg("failed to set config key '%s'", key);
+				free(cfg_path);
+				free(db_path);
+				return 1;
+			}
 		}
 		if (!g_json_output) {
 			printf("Set %s%s%s = %s\n", color(ANSI_CYAN), key, color(ANSI_RESET), value);
@@ -1380,7 +1840,7 @@ static int cmd_config(const char* db_path_arg, const char* key, const char* valu
 		}
 	}
 
-	docscan_close(db);
+	free(cfg_path);
 	free(db_path);
 	return 0;
 }
@@ -1690,6 +2150,34 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 	/* Store model in config */
 	docscan_config_set(db, "model", model, err_buf, sizeof(err_buf));
+
+	/* Save config.ini with current effective settings */
+	{
+		char* cfg_path = config_ini_path_from_db(db_path);
+		if (cfg_path) {
+			DocscanConfig cfg;
+			config_defaults(&cfg);
+			load_config(cfg_path, &cfg); /* Preserve existing settings */
+
+			/* Apply current effective values from globals/args */
+			snprintf(cfg.embedding_api, sizeof(cfg.embedding_api),
+				"%s", g_api_dialect == API_OPENAI ? "openai" : "ollama");
+			snprintf(cfg.embedding_url, sizeof(cfg.embedding_url),
+				"%s", g_embedding_url);
+			snprintf(cfg.embedding_model, sizeof(cfg.embedding_model),
+				"%s", model);
+			if (g_api_key[0]) {
+				snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key),
+					"%s", g_api_key);
+			}
+			if (embedding_dim != DEFAULT_EMBEDDING_DIM) {
+				cfg.embedding_dim = embedding_dim;
+			}
+
+			save_config(cfg_path, &cfg);
+			free(cfg_path);
+		}
+	}
 
 	/* Process files */
 	progress_t prog;
@@ -2573,6 +3061,13 @@ int main(int argc, char** argv) {
 	const char* search_mode = "hybrid";
 	int limit = DEFAULT_LIMIT;
 
+	/* Track which settings were explicitly set by CLI flags */
+	int cli_set_model = 0;
+	int cli_set_api = 0;
+	int cli_set_url = 0;
+	int cli_set_key = 0;
+	int cli_set_limit = 0;
+
 	/* Collect positional args after command */
 	int positional_count = 0;
 	const char* positionals[16] = {0};
@@ -2620,11 +3115,13 @@ int main(int argc, char** argv) {
 		}
 		if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
 			model = argv[++i];
+			cli_set_model = 1;
 			continue;
 		}
 		if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
 			limit = atoi(argv[++i]);
 			if (limit <= 0) limit = DEFAULT_LIMIT;
+			cli_set_limit = 1;
 			continue;
 		}
 		if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
@@ -2641,14 +3138,17 @@ int main(int argc, char** argv) {
 				err_msg("unknown embedding API dialect: %s (expected: ollama or openai)", val);
 				return 1;
 			}
+			cli_set_api = 1;
 			continue;
 		}
 		if (strcmp(argv[i], "--embedding-url") == 0 && i + 1 < argc) {
 			snprintf(g_embedding_url, sizeof(g_embedding_url), "%s", argv[++i]);
+			cli_set_url = 1;
 			continue;
 		}
 		if (strcmp(argv[i], "--embedding-api-key") == 0 && i + 1 < argc) {
 			snprintf(g_api_key, sizeof(g_api_key), "%s", argv[++i]);
+			cli_set_key = 1;
 			continue;
 		}
 
@@ -2668,34 +3168,83 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	/* Apply environment variable defaults */
-	if (!model) {
+	/* ── Load .docscan/config.ini (lowest priority after hardcoded defaults) ── */
+	/* Try to determine the .docscan/ dir for config loading.
+	 * Priority: --db path > first positional for index/update > cwd */
+	{
+		const char* cfg_target = ".";
+		if (positional_count > 0) cfg_target = positionals[0];
+
+		char* early_db = resolve_db_path(db_path_arg, cfg_target);
+		if (early_db) {
+			char* cfg_path = config_ini_path_from_db(early_db);
+			if (cfg_path) {
+				DocscanConfig cfg;
+				config_defaults(&cfg);
+				if (load_config(cfg_path, &cfg) == 0) {
+					/* Apply config.ini values only where CLI didn't override */
+					if (!cli_set_api) {
+						if (strcasecmp(cfg.embedding_api, "openai") == 0) {
+							g_api_dialect = API_OPENAI;
+						} else {
+							g_api_dialect = API_OLLAMA;
+						}
+					}
+					if (!cli_set_url) {
+						snprintf(g_embedding_url, sizeof(g_embedding_url),
+							"%s", cfg.embedding_url);
+					}
+					if (!cli_set_model && !model) {
+						/* Use a static buffer so the pointer stays valid */
+						static char ini_model[256];
+						snprintf(ini_model, sizeof(ini_model), "%s", cfg.embedding_model);
+						model = ini_model;
+					}
+					if (!cli_set_key && !g_api_key[0]) {
+						snprintf(g_api_key, sizeof(g_api_key),
+							"%s", cfg.embedding_api_key);
+					}
+					if (!cli_set_limit) {
+						limit = cfg.search_limit;
+					}
+				}
+				free(cfg_path);
+			}
+			free(early_db);
+		}
+	}
+
+	/* Apply environment variable overrides (higher priority than config.ini) */
+	{
 		const char* env_model = getenv("DOCSCAN_MODEL");
-		model = (env_model && env_model[0]) ? env_model : DEFAULT_MODEL;
+		if (env_model && env_model[0] && !cli_set_model) {
+			model = env_model;
+		}
+	}
+	if (!model) {
+		model = DEFAULT_MODEL;
 	}
 	if (!lang) {
 		const char* env_lang = getenv("DOCSCAN_LANG");
 		if (env_lang && env_lang[0]) lang = env_lang;
 	}
 
-	/* Embedding API env vars (CLI flags override these) */
+	/* Embedding API env vars (override config.ini, but CLI flags override these) */
 	{
 		const char* env_api = getenv("DOCSCAN_EMBEDDING_API");
-		if (env_api && env_api[0] && g_api_dialect == API_OLLAMA) {
-			/* Only apply if CLI flag didn't already set it */
+		if (env_api && env_api[0] && !cli_set_api) {
 			if (strcasecmp(env_api, "openai") == 0) {
 				g_api_dialect = API_OPENAI;
+			} else if (strcasecmp(env_api, "ollama") == 0) {
+				g_api_dialect = API_OLLAMA;
 			}
 		}
 		const char* env_url = getenv("DOCSCAN_EMBEDDING_URL");
-		if (env_url && env_url[0] &&
-		    strcmp(g_embedding_url, "http://127.0.0.1:11434") == 0) {
-			/* Only apply if CLI flag didn't already set it */
+		if (env_url && env_url[0] && !cli_set_url) {
 			snprintf(g_embedding_url, sizeof(g_embedding_url), "%s", env_url);
 		}
 		const char* env_key = getenv("DOCSCAN_EMBEDDING_API_KEY");
-		if (env_key && env_key[0] && !g_api_key[0]) {
-			/* Only apply if CLI flag didn't already set it */
+		if (env_key && env_key[0] && !cli_set_key) {
 			snprintf(g_api_key, sizeof(g_api_key), "%s", env_key);
 		}
 	}
