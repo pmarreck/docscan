@@ -61,6 +61,31 @@ fn buildBreadcrumb(allocator: std.mem.Allocator, parent_path: []const u8, headin
 
 /// Split content at paragraph boundaries (double newline).
 /// Returns slices into the original content (no allocation for the text itself).
+/// Split content on single newlines (fallback when no \n\n boundaries exist).
+fn splitOnSingleNewline(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
+	var lines: std.ArrayListUnmanaged([]const u8) = .{};
+	defer lines.deinit(allocator);
+
+	var start: usize = 0;
+	for (content, 0..) |ch, i| {
+		if (ch == '\n') {
+			const line = content[start..i];
+			if (!isBlankContent(line)) {
+				try lines.append(allocator, line);
+			}
+			start = i + 1;
+		}
+	}
+	if (start < content.len) {
+		const line = content[start..];
+		if (!isBlankContent(line)) {
+			try lines.append(allocator, line);
+		}
+	}
+
+	return try lines.toOwnedSlice(allocator);
+}
+
 fn splitParagraphs(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
 	var paragraphs: std.ArrayListUnmanaged([]const u8) = .{};
 	defer paragraphs.deinit(allocator);
@@ -158,23 +183,30 @@ fn emitContentChunks(
 	}
 
 	// Split at paragraph boundaries
-	const paragraphs = try splitParagraphs(allocator, content);
-	defer allocator.free(paragraphs);
+	var paragraphs = try splitParagraphs(allocator, content);
 
 	if (paragraphs.len <= 1) {
-		// Can't split further — emit as-is
-		const pp = try allocator.dupe(u8, parent_path);
-		try out.append(allocator, .{
-			.section_path = section_path,
-			.heading = heading,
-			.text = content,
-			.parent_path = pp,
-			.text_allocated = false,
-			.page = page,
-			.source_line = source_line,
-		});
-		return;
+		// No \n\n boundaries found — try splitting on single \n instead
+		allocator.free(paragraphs);
+		paragraphs = try splitOnSingleNewline(allocator, content);
+
+		if (paragraphs.len <= 1) {
+			// Can't split further — emit as-is
+			allocator.free(paragraphs);
+			const pp = try allocator.dupe(u8, parent_path);
+			try out.append(allocator, .{
+				.section_path = section_path,
+				.heading = heading,
+				.text = content,
+				.parent_path = pp,
+				.text_allocated = false,
+				.page = page,
+				.source_line = source_line,
+			});
+			return;
+		}
 	}
+	defer allocator.free(paragraphs);
 
 	// Group paragraphs into chunks that fit within max_chunk_tokens.
 	// Each sub-chunk gets its own section_path dupe (except the first which

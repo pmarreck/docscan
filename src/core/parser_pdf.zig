@@ -1043,8 +1043,8 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 			current = flat_sections.items.len - 1;
 			has_prev_body = false;
 		} else {
-			// Body text
-			if (current == null) {
+			// Body text — start new section on page change
+			if (current == null or (has_prev_body and span.page != prev_page)) {
 				try flat_sections.append(allocator, FlatSection{
 					.heading = null,
 					.level = 0,
@@ -1052,22 +1052,20 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 					.page = span.page,
 				});
 				current = flat_sections.items.len - 1;
+				has_prev_body = false;
 			}
 			const fs = &flat_sections.items[current.?];
 			if (fs.content_buf.items.len > 0) {
 				// Decide separator: space (same line) vs newline (different line)
-				if (has_prev_body and span.page == prev_page) {
+				if (has_prev_body) {
 					const y_diff = @abs(span.y_position - prev_y);
 					const line_threshold = prev_font_size * 1.2;
 					if (y_diff < line_threshold) {
-						// Same line — use space
 						try fs.content_buf.append(allocator, ' ');
 					} else {
-						// Different line — use newline
 						try fs.content_buf.append(allocator, '\n');
 					}
 				} else {
-					// Different page or no previous body — use newline
 					try fs.content_buf.append(allocator, '\n');
 				}
 			}
