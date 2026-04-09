@@ -10,4 +10,6 @@ test {
 	_ = @import("core/parser_docx.zig");
 	_ = @import("core/pdf_objects.zig");
 	_ = @import("core/parser_pdf.zig");
+	_ = @import("core/ole2.zig");
+	_ = @import("core/parser_doc.zig");
 }
