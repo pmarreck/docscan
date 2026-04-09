@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# CLI black-box test suite for docscan.
+# Run via: nix develop -c tests/cli/test-cli
+#   or via the master test runner: ./test
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BINARY="$ROOT_DIR/zig-out/bin/docscan"
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cli-test-XXXXXX")"
+
+source "$HOME/dotfiles/bin/src/capture.bash"
+
+errors=0
+tests=0
+pass() { ((tests++)); printf '  \033[32mPASS\033[0m: %s\n' "$1"; }
+fail() { ((tests++)); ((errors++)); printf '  \033[31mFAIL\033[0m: %s — %s\n' "$1" "$2"; }
+
+# Ensure binary exists
+if [ ! -f "$BINARY" ]; then
+	echo "Binary not found at $BINARY — run './build' first" >&2
+	exit 1
+fi
+
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+# ---------- Create test fixtures ----------
+
+cat > "$TEST_DIR/contract.md" << 'FIXTURE'
+# Service Agreement
+
+This is a service agreement between parties.
+
+## Indemnification
+
+The service provider shall indemnify the client.
+
+## Governing Law
+
+This agreement is governed by New York law.
+FIXTURE
+
+mkdir -p "$TEST_DIR/subdir"
+cat > "$TEST_DIR/subdir/notes.md" << 'FIXTURE'
+# Meeting Notes
+
+Discussed quarterly targets and budget allocation.
+FIXTURE
+
+mkdir -p "$TEST_DIR/path with spaces"
+cat > "$TEST_DIR/path with spaces/spaced.md" << 'FIXTURE'
+# Spaced Document
+
+This document lives in a path with spaces.
+FIXTURE
+
+echo "binary junk" > "$TEST_DIR/file.xyz"
+
+# Common DB path for tests that share state
+DB="$TEST_DIR/test.db"
+
+echo "=== docscan CLI Tests ==="
+
+# ──────────────────────────────────────────────
+# 1. --help exits 0 and shows USAGE
+# ──────────────────────────────────────────────
+local out err rc 2>/dev/null || true
+out="" ; err="" ; rc=""
+capture "$BINARY" --help
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "USAGE"; then
+	pass "--help exits 0 and shows USAGE"
+else
+	fail "--help exits 0 and shows USAGE" "rc=$rc, USAGE not found in stdout"
+fi
+
+# ──────────────────────────────────────────────
+# 2. --about exits 0, shows "docscan" and version
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" --about
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "docscan" && echo "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
+	pass "--about exits 0 and shows docscan + version"
+else
+	fail "--about exits 0 and shows docscan + version" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 3. No args shows usage text
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY"
+if echo "$out" | grep -qi "usage"; then
+	pass "no args shows usage"
+else
+	fail "no args shows usage" "rc=$rc, 'usage' not found in stdout"
+fi
+
+# ──────────────────────────────────────────────
+# 4. index with a single .md file succeeds
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" index --db "$DB" "$TEST_DIR/contract.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
+	pass "index single .md file succeeds"
+else
+	fail "index single .md file succeeds" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 5. index with a directory succeeds
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" index --db "$DB" "$TEST_DIR/subdir"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
+	pass "index directory succeeds"
+else
+	fail "index directory succeeds" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 6. index with no path exits non-zero
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" index --db "$DB"
+if [ "$rc" -ne 0 ] && echo "$err" | grep -qi "error"; then
+	pass "index with no path exits non-zero"
+else
+	fail "index with no path exits non-zero" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 7. status after index shows correct doc count
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" status --db "$DB"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Documents: 2"; then
+	pass "status shows correct document count (2)"
+else
+	fail "status shows correct document count (2)" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 8. status --json produces valid JSON
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" status --json --db "$DB"
+if [ "$rc" -eq 0 ] && echo "$out" | jq . > /dev/null 2>&1; then
+	pass "status --json produces valid JSON"
+else
+	fail "status --json produces valid JSON" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 9. search --exact finds indexed content
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" search --exact --db "$DB" "indemnification"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qi "indemnif"; then
+	pass "search --exact finds indexed content"
+else
+	fail "search --exact finds indexed content" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 10. search --exact for nonexistent term returns empty
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" search --exact --db "$DB" "nonexistentxyzabc123"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qi "no results"; then
+	pass "search --exact for nonexistent term returns empty"
+else
+	fail "search --exact for nonexistent term returns empty" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 11. search --json --exact produces valid JSON
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" search --json --exact --db "$DB" "indemnification"
+if [ "$rc" -eq 0 ] && echo "$out" | jq . > /dev/null 2>&1; then
+	pass "search --json --exact produces valid JSON"
+else
+	fail "search --json --exact produces valid JSON" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 12. search --limit 1 returns at most 1 result
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" search --json --exact --limit 1 --db "$DB" "indemnification"
+if [ "$rc" -eq 0 ]; then
+	count=$(echo "$out" | jq 'length')
+	if [ "$count" -le 1 ]; then
+		pass "search --limit 1 returns at most 1 result (got $count)"
+	else
+		fail "search --limit 1 returns at most 1 result" "got $count results"
+	fi
+else
+	fail "search --limit 1 returns at most 1 result" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 13. config model returns a value
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$DB" model
+if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+	pass "config model returns a value ('$out')"
+else
+	fail "config model returns a value" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 14. config set then get roundtrips
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$DB" test_key test_value_42
+if [ "$rc" -eq 0 ]; then
+	# Now retrieve it
+	out="" ; err="" ; rc=""
+	capture "$BINARY" config --db "$DB" test_key
+	if [ "$rc" -eq 0 ] && [ "$out" = "test_value_42" ]; then
+		pass "config set/get roundtrips"
+	else
+		fail "config set/get roundtrips" "expected 'test_value_42', got '$out'"
+	fi
+else
+	fail "config set/get roundtrips" "set failed rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 15. Paths with spaces work for index
+# ──────────────────────────────────────────────
+SPACED_DB="$TEST_DIR/spaced test.db"
+out="" ; err="" ; rc=""
+capture "$BINARY" index --db "$SPACED_DB" "$TEST_DIR/path with spaces"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
+	pass "paths with spaces work for index"
+else
+	fail "paths with spaces work for index" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 16. --no-color does not crash
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" --no-color status --db "$DB"
+if [ "$rc" -eq 0 ]; then
+	pass "--no-color does not crash"
+else
+	fail "--no-color does not crash" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 17. --simple does not crash
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" --simple status --db "$DB"
+if [ "$rc" -eq 0 ]; then
+	pass "--simple does not crash"
+else
+	fail "--simple does not crash" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 18. Unsupported file extension is handled gracefully
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" index --db "$TEST_DIR/unsupported.db" "$TEST_DIR/file.xyz"
+# Should not crash — may exit 0 with a warning or exit non-zero with a message
+if [ "$rc" -le 1 ]; then
+	# Check it gave some feedback about "unsupported" or "no supported"
+	combined="$out$err"
+	if echo "$combined" | grep -qi "unsupported\|no supported\|skip"; then
+		pass "unsupported file extension handled gracefully"
+	else
+		pass "unsupported file extension did not crash (rc=$rc)"
+	fi
+else
+	fail "unsupported file extension handled gracefully" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# Summary
+# ──────────────────────────────────────────────
+echo ""
+echo "$tests tests, $((tests - errors)) passed, $errors failed"
+exit "$errors"
