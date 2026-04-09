@@ -5,4 +5,5 @@
 test {
 	_ = @import("core/document.zig");
 	_ = @import("core/parser_md.zig");
+	_ = @import("core/xml.zig");
 }
