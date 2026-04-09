@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# Integration test suite for docscan — requires Ollama running with nomic-embed-text.
+# Run via: nix develop -c tests/integration/test-integration
+#   or via the master test runner: ./test
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BINARY="$ROOT_DIR/zig-out/bin/docscan"
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-integ-XXXXXX")"
+
+source "$HOME/dotfiles/bin/src/capture.bash"
+
+errors=0
+tests=0
+pass() { ((tests++)); printf '  \033[32mPASS\033[0m: %s\n' "$1"; }
+fail() { ((tests++)); ((errors++)); printf '  \033[31mFAIL\033[0m: %s — %s\n' "$1" "$2"; }
+
+# Ensure binary exists
+if [ ! -f "$BINARY" ]; then
+	echo "Binary not found at $BINARY — run './build' first" >&2
+	exit 1
+fi
+
+# Check Ollama is running and nomic-embed-text is available
+if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+	echo "SKIP: Ollama not running on localhost:11434"
+	exit 0
+fi
+
+if ! curl -s http://localhost:11434/api/tags | grep -q "nomic-embed-text"; then
+	echo "SKIP: nomic-embed-text model not available in Ollama"
+	exit 0
+fi
+
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+echo "=== docscan Integration Tests (Ollama required) ==="
+
+# ---------- Create test corpus ----------
+
+DB="$TEST_DIR/integ.db"
+
+mkdir -p "$TEST_DIR/corpus"
+
+cat > "$TEST_DIR/corpus/contract.md" << 'FIXTURE'
+# Service Agreement
+
+This is a binding service agreement between Acme Corp and Widget LLC.
+
+## Indemnification
+
+The service provider shall indemnify and hold harmless the client against
+any and all claims, damages, losses, costs, and expenses arising from
+the provider's negligence or breach of this agreement.
+
+## Limitation of Liability
+
+In no event shall either party be liable for indirect, incidental,
+special, or consequential damages, including but not limited to loss
+of profits, data, or business opportunities.
+
+## Governing Law
+
+This agreement shall be governed by and construed in accordance with
+the laws of the State of New York, without regard to conflict of laws principles.
+FIXTURE
+
+cat > "$TEST_DIR/corpus/privacy.md" << 'FIXTURE'
+# Privacy Policy
+
+## Data Collection
+
+We collect personal information including name, email address,
+and browsing activity when you use our services.
+
+## Data Retention
+
+Personal data is retained for a maximum of 36 months from the
+date of last interaction, after which it is permanently deleted.
+
+## Third Party Sharing
+
+We do not sell personal information to third parties. Data may
+be shared with service providers who assist in operating our platform,
+subject to strict confidentiality agreements.
+
+## User Rights
+
+Users may request access to, correction of, or deletion of their
+personal data at any time by contacting our privacy team.
+FIXTURE
+
+cat > "$TEST_DIR/corpus/readme.md" << 'FIXTURE'
+# Project Documentation
+
+## Getting Started
+
+Clone the repository and run the setup script.
+Ensure you have Node.js 18+ and PostgreSQL 14+ installed.
+
+## Architecture
+
+The application uses a microservices architecture with
+an API gateway, authentication service, and data processing pipeline.
+
+## Deployment
+
+Deploy to production using the CI/CD pipeline.
+All merges to main trigger automatic deployment to staging.
+Manual approval is required for production releases.
+FIXTURE
+
+# ──────────────────────────────────────────────
+# 1. Full index with embeddings
+# ──────────────────────────────────────────────
+local out err rc 2>/dev/null || true
+out="" ; err="" ; rc=""
+echo "  Indexing corpus with embeddings (this may take a moment)..."
+capture "$BINARY" index --db "$DB" --model nomic-embed-text "$TEST_DIR/corpus"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
+	pass "full index with embeddings succeeds"
+else
+	fail "full index with embeddings succeeds" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 1b. Status shows docs and chunks with embeddings
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" status --json --db "$DB"
+if [ "$rc" -eq 0 ]; then
+	doc_count=$(echo "$out" | jq -r '.documents // .doc_count // .total_documents // empty' 2>/dev/null)
+	chunk_count=$(echo "$out" | jq -r '.chunks // .chunk_count // .total_chunks // empty' 2>/dev/null)
+	embed_count=$(echo "$out" | jq -r '.embeddings // .embedding_count // .total_embeddings // .vectors // empty' 2>/dev/null)
+	# We indexed 3 .md files; expect at least 3 documents and some chunks
+	if [ -n "$doc_count" ] && [ "$doc_count" -ge 3 ] 2>/dev/null; then
+		pass "status shows correct doc count (got $doc_count)"
+	else
+		# Fallback: check non-JSON status
+		out="" ; err="" ; rc=""
+		capture "$BINARY" status --db "$DB"
+		if echo "$out" | grep -q "Documents: 3"; then
+			pass "status shows correct doc count (3)"
+		else
+			fail "status shows correct doc count" "doc_count='$doc_count', raw='$out'"
+		fi
+	fi
+	# Check chunks exist (should be more than 0)
+	if [ -n "$chunk_count" ] && [ "$chunk_count" -gt 0 ] 2>/dev/null; then
+		pass "status shows chunks ($chunk_count)"
+	else
+		# Try non-JSON
+		out2="" ; err2="" ; rc2=""
+		local out2 err2 rc2 2>/dev/null || true
+		capture "$BINARY" status --db "$DB"
+		if echo "$out" | grep -qi "chunk"; then
+			pass "status shows chunk info"
+		else
+			fail "status shows chunk info" "chunk_count='$chunk_count', raw='$out'"
+		fi
+	fi
+else
+	fail "status after index" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 2. Hybrid search — semantic match
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+echo "  Running hybrid search (embedding query may take a few seconds)..."
+capture "$BINARY" search --db "$DB" --model nomic-embed-text "liability protection"
+if [ "$rc" -eq 0 ]; then
+	# "liability protection" should semantically match the contract's indemnification/liability section
+	combined="$out$err"
+	if echo "$combined" | grep -qi "indemnif\|liability\|contract\|harmless\|damages"; then
+		pass "hybrid search finds semantically related content ('liability protection' -> indemnification)"
+	else
+		fail "hybrid search finds semantically related content" "no relevant terms in output: '$out'"
+	fi
+else
+	fail "hybrid search finds semantically related content" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 3. Exact search still works alongside embeddings
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" search --exact --db "$DB" "indemnification"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qi "indemnif"; then
+	pass "exact search still works alongside embeddings"
+else
+	fail "exact search still works alongside embeddings" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 3b. Exact search for known unique term in privacy doc
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" search --exact --db "$DB" "retention"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qi "retention\|privacy\|data"; then
+	pass "exact search finds content in privacy doc"
+else
+	fail "exact search finds content in privacy doc" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 4. Update detects changes
+# ──────────────────────────────────────────────
+
+# Modify the privacy document with distinctive new content
+cat >> "$TEST_DIR/corpus/privacy.md" << 'FIXTURE'
+
+## GDPR Compliance
+
+Our platform is fully compliant with the General Data Protection
+Regulation (GDPR) including the right to data portability
+and the right to be forgotten (erasure).
+FIXTURE
+
+# Small delay to ensure filesystem mtime differs
+sleep 1
+
+out="" ; err="" ; rc=""
+echo "  Running update after modifying a file..."
+capture "$BINARY" update --db "$DB" --model nomic-embed-text "$TEST_DIR/corpus"
+if [ "$rc" -eq 0 ]; then
+	pass "update command succeeds after file modification"
+else
+	fail "update command succeeds after file modification" "rc=$rc, err='$err'"
+fi
+
+# Now search for the newly added content
+out="" ; err="" ; rc=""
+capture "$BINARY" search --exact --db "$DB" "GDPR"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qi "GDPR\|portability\|erasure\|forgotten"; then
+	pass "update detects changes — new content is searchable"
+else
+	fail "update detects changes — new content is searchable" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 5. Multi-format: additional .md files indexed correctly
+# ──────────────────────────────────────────────
+
+# Add a new markdown file and re-index
+cat > "$TEST_DIR/corpus/security.md" << 'FIXTURE'
+# Security Whitepaper
+
+## Encryption at Rest
+
+All data stored in our databases is encrypted using AES-256-GCM.
+Encryption keys are managed through a hardware security module (HSM).
+
+## Penetration Testing
+
+We conduct annual penetration testing through certified third-party
+security firms. Results are available upon request under NDA.
+FIXTURE
+
+out="" ; err="" ; rc=""
+echo "  Indexing additional file..."
+capture "$BINARY" update --db "$DB" --model nomic-embed-text "$TEST_DIR/corpus"
+if [ "$rc" -eq 0 ]; then
+	pass "update picks up new file"
+else
+	fail "update picks up new file" "rc=$rc, err='$err'"
+fi
+
+# Verify the new file's content is searchable
+out="" ; err="" ; rc=""
+capture "$BINARY" search --exact --db "$DB" "penetration testing"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qi "penetration\|security"; then
+	pass "newly added .md file content is searchable"
+else
+	fail "newly added .md file content is searchable" "rc=$rc, out='$out'"
+fi
+
+# Final doc count should be 4
+out="" ; err="" ; rc=""
+capture "$BINARY" status --db "$DB"
+if echo "$out" | grep -q "Documents: 4"; then
+	pass "status shows updated doc count (4)"
+else
+	fail "status shows updated doc count (4)" "out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# Summary
+# ──────────────────────────────────────────────
+echo ""
+echo "$tests tests, $((tests - errors)) passed, $errors failed"
+exit "$errors"

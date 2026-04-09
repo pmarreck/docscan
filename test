@@ -33,6 +33,11 @@ if [ -x tests/mcp/test-mcp ]; then
 	run_suite "mcp" nix develop -c tests/mcp/test-mcp
 fi
 
+# Integration tests (require Ollama — skips gracefully if unavailable)
+if [ -x tests/integration/test-integration ]; then
+	run_suite "integration" nix develop -c tests/integration/test-integration
+fi
+
 if [ "$failed" -eq 0 ]; then
 	printf '\n\033[32mAll test suites passed.\033[0m\n'
 else
