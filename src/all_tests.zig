@@ -12,4 +12,5 @@ test {
 	_ = @import("core/parser_pdf.zig");
 	_ = @import("core/ole2.zig");
 	_ = @import("core/parser_doc.zig");
+	_ = @import("core/chunker.zig");
 }
