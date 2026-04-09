@@ -21,6 +21,7 @@ const FlatSection = struct {
 	heading: ?[]const u8, // owned, must be freed
 	level: u8,
 	content_buf: std.ArrayList(u8),
+	page: u32 = 1, // 1-based page number at start of this section
 
 	fn deinit(self: *FlatSection, gpa: Allocator) void {
 		if (self.heading) |h| gpa.free(h);
@@ -64,6 +65,46 @@ fn getParagraphStyle(p_node: xml.XmlNode) ?[]const u8 {
 	const pPr = findChild(p_node, "w:pPr") orelse return null;
 	const pStyle = findChild(pPr, "w:pStyle") orelse return null;
 	return pStyle.getAttr("w:val");
+}
+
+/// Count page break elements inside a `<w:p>` paragraph.
+/// Counts both `<w:lastRenderedPageBreak/>` and `<w:br w:type="page"/>` inside runs.
+fn countPageBreaks(p_node: xml.XmlNode) u32 {
+	var count: u32 = 0;
+	for (p_node.children) |child| {
+		if (std.mem.eql(u8, child.tag, "w:r")) {
+			for (child.children) |run_child| {
+				if (std.mem.eql(u8, run_child.tag, "w:lastRenderedPageBreak")) {
+					count += 1;
+				} else if (std.mem.eql(u8, run_child.tag, "w:br")) {
+					if (run_child.getAttr("w:type")) |btype| {
+						if (std.mem.eql(u8, btype, "page")) {
+							count += 1;
+						}
+					}
+				}
+			}
+		}
+		// Also check inside w:hyperlink which wraps w:r elements
+		if (std.mem.eql(u8, child.tag, "w:hyperlink")) {
+			for (child.children) |hyp_child| {
+				if (std.mem.eql(u8, hyp_child.tag, "w:r")) {
+					for (hyp_child.children) |run_child| {
+						if (std.mem.eql(u8, run_child.tag, "w:lastRenderedPageBreak")) {
+							count += 1;
+						} else if (std.mem.eql(u8, run_child.tag, "w:br")) {
+							if (run_child.getAttr("w:type")) |btype| {
+								if (std.mem.eql(u8, btype, "page")) {
+									count += 1;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return count;
 }
 
 /// Extract concatenated text from all `<w:r>/<w:t>` runs in a `<w:p>` paragraph.
@@ -144,6 +185,7 @@ fn buildTree(
 			.level = fs.level,
 			.content = content,
 			.children = children,
+			.page = fs.page,
 		});
 
 		i = child_end;
@@ -263,8 +305,15 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 
 	if (body) |body_node| {
 		var current: ?usize = null;
+		var current_page: u32 = 1;
 		for (body_node.children) |child| {
 			if (!std.mem.eql(u8, child.tag, "w:p")) continue;
+
+			// Count page breaks in this paragraph (before processing text).
+			// Page breaks appear inside runs and indicate the content that
+			// follows them is on the next page.
+			const page_breaks = countPageBreaks(child);
+			current_page += page_breaks;
 
 			const text = try extractParagraphText(gpa, child);
 
@@ -278,6 +327,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 					.heading = text,
 					.level = level.?,
 					.content_buf = .{},
+					.page = current_page,
 				});
 				current = flat_sections.items.len - 1;
 			} else {
@@ -291,6 +341,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 						.heading = null,
 						.level = 0,
 						.content_buf = .{},
+						.page = current_page,
 					});
 					current = flat_sections.items.len - 1;
 				}
@@ -610,4 +661,78 @@ test "title level maps correctly" {
 	try testing.expectEqualStrings("First Chapter", ch.heading.?);
 	try testing.expectEqual(@as(u8, 1), ch.level);
 	try testing.expect(std.mem.indexOf(u8, ch.content, "Body text.") != null);
+}
+
+test "page tracking with lastRenderedPageBreak" {
+	const body =
+		\\<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Page 1 Heading</w:t></w:r></w:p>
+		\\<w:p><w:r><w:t>Content on page 1.</w:t></w:r></w:p>
+		\\<w:p><w:r><w:lastRenderedPageBreak/><w:t>Content on page 2.</w:t></w:r></w:p>
+		\\<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Page 2 Heading</w:t></w:r></w:p>
+		\\<w:p><w:r><w:t>More page 2 content.</w:t></w:r></w:p>
+	;
+
+	const docx = try buildTestDocx(testing.allocator, body, null);
+	defer testing.allocator.free(docx);
+
+	const doc = try parse(testing.allocator, docx, "/test/pagebreak.docx");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expectEqual(@as(usize, 2), doc.sections.len);
+
+	// First section starts on page 1
+	try testing.expectEqualStrings("Page 1 Heading", doc.sections[0].heading.?);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+
+	// Second section starts on page 2 (after the lastRenderedPageBreak)
+	try testing.expectEqualStrings("Page 2 Heading", doc.sections[1].heading.?);
+	try testing.expectEqual(@as(?u32, 2), doc.sections[1].page);
+}
+
+test "page tracking with hard page break (w:br type=page)" {
+	const body =
+		\\<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>First Page</w:t></w:r></w:p>
+		\\<w:p><w:r><w:t>Some text.</w:t></w:r></w:p>
+		\\<w:p><w:r><w:br w:type="page"/></w:r></w:p>
+		\\<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Second Page</w:t></w:r></w:p>
+		\\<w:p><w:r><w:t>More text.</w:t></w:r></w:p>
+	;
+
+	const docx = try buildTestDocx(testing.allocator, body, null);
+	defer testing.allocator.free(docx);
+
+	const doc = try parse(testing.allocator, docx, "/test/hardbreak.docx");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expectEqual(@as(usize, 2), doc.sections.len);
+
+	try testing.expectEqualStrings("First Page", doc.sections[0].heading.?);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+
+	try testing.expectEqualStrings("Second Page", doc.sections[1].heading.?);
+	try testing.expectEqual(@as(?u32, 2), doc.sections[1].page);
+}
+
+test "page tracking with multiple page breaks" {
+	const body =
+		\\<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Page 1</w:t></w:r></w:p>
+		\\<w:p><w:r><w:lastRenderedPageBreak/><w:t>Text.</w:t></w:r></w:p>
+		\\<w:p><w:r><w:lastRenderedPageBreak/><w:t>Text.</w:t></w:r></w:p>
+		\\<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Page 3</w:t></w:r></w:p>
+	;
+
+	const docx = try buildTestDocx(testing.allocator, body, null);
+	defer testing.allocator.free(docx);
+
+	const doc = try parse(testing.allocator, docx, "/test/multipagebreak.docx");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expectEqual(@as(usize, 2), doc.sections.len);
+
+	try testing.expectEqualStrings("Page 1", doc.sections[0].heading.?);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+
+	// Two page breaks passed → page 3
+	try testing.expectEqualStrings("Page 3", doc.sections[1].heading.?);
+	try testing.expectEqual(@as(?u32, 3), doc.sections[1].page);
 }
