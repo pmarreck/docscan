@@ -28,8 +28,14 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] Wire ignore patterns into CLI directory walker
 - [ ] `docscan_list_documents` FFI function
 - [ ] DIFAT chain support in OLE2 (>7MB .doc files)
-- [ ] Xref stream support in PDF parser
-- [ ] CIDFont/ToUnicode mapping in PDF
+- [x] Xref stream support in PDF parser (2026-04-08 EST)
+- [x] CIDFont/ToUnicode mapping in PDF (2026-04-08 EST)
+- [x] Object stream support in PDF parser (2026-04-08 EST)
+- [x] PNG predictor decompression for xref streams (2026-04-08 EST)
+- [x] Incremental update /Prev chain following in PDF xref (2026-04-08 EST)
+- [x] Word spacing in PDF text extraction (same-line vs newline) (2026-04-08 EST)
+- [x] TJ kerning-to-space insertion for word boundaries (2026-04-08 EST)
+- [x] Indirect /Length reference resolution in PDF streams (2026-04-08 EST)
 - [ ] Windows directory walking (currently POSIX-only)
 - [ ] i18n translations (groundwork laid: --lang, DOCSCAN_LANG)
 - [ ] Legal embedding model research/fine-tuning
@@ -37,5 +43,5 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 ## Stats
 
 - ~12,700 lines across 18 source files
-- ~185 automated tests (153 Zig unit + 18 CLI + 14 MCP)
+- ~191 automated tests (159 Zig unit + 18 CLI + 14 MCP)
 - 4 format parsers (md, docx, pdf, doc)

@@ -9,9 +9,10 @@ const Allocator = std.mem.Allocator;
 // ── Public Types ────────────────────────────────────────────────────
 
 pub const XrefEntry = struct {
-	offset: u64,
-	gen: u16,
+	offset: u64, // For type 1: byte offset. For type 2: object stream number.
+	gen: u16, // For type 1: generation. For type 2: index within object stream.
 	in_use: bool,
+	compressed: bool = false, // true for type-2 entries (object in object stream)
 };
 
 pub const DictEntry = struct {
@@ -87,6 +88,11 @@ pub const PdfContext = struct {
 		const entry = self.xref.get(obj_num) orelse return null;
 		if (!entry.in_use) return null;
 
+		if (entry.compressed) {
+			// Object is inside an object stream
+			return self.getCompressedObject(@intCast(entry.offset), entry.gen);
+		}
+
 		const offset: usize = @intCast(entry.offset);
 		if (offset >= self.data.len) return PdfError.InvalidPdf;
 
@@ -97,11 +103,94 @@ pub const PdfContext = struct {
 		return val;
 	}
 
+	/// Extract an object from an object stream (/Type /ObjStm).
+	/// obj_stream_num: the object number of the containing ObjStm.
+	/// index: the index of the target object within the stream.
+	/// The returned value is a deep copy with all names allocated (since the
+	/// decompressed stream data is temporary).
+	fn getCompressedObject(self: *PdfContext, obj_stream_num: u32, index: u16) PdfError!?PdfValue {
+		// Get the object stream (it's a regular object with a stream)
+		const stream_data = (self.getStream(obj_stream_num) catch return null) orelse return null;
+		defer self.allocator.free(stream_data);
+
+		// Parse the ObjStm dict to get /N (number of objects) and /First (offset to first object body)
+		const objstm_entry = self.xref.get(obj_stream_num) orelse return null;
+		if (!objstm_entry.in_use or objstm_entry.compressed) return null;
+
+		const stm_offset: usize = @intCast(objstm_entry.offset);
+		const obj_body_start = findObjBody(self.data, stm_offset) orelse return null;
+		var dict_pos = obj_body_start;
+		const dict_val = parsePdfValue(self.allocator, self.data, &dict_pos) catch return null;
+		defer freePdfValue(self.allocator, dict_val);
+
+		if (dict_val != .dict) return null;
+		const n_objects = getDictInt(dict_val.dict, "N") orelse return null;
+		const first_offset = getDictInt(dict_val.dict, "First") orelse return null;
+
+		if (index >= n_objects) return null;
+		const first: usize = @intCast(first_offset);
+
+		// Parse the header: N pairs of (obj_num offset) in the stream data
+		var header_pos: usize = 0;
+		var target_offset: ?usize = null;
+
+		var i: usize = 0;
+		const n: usize = @intCast(n_objects);
+		while (i < n) : (i += 1) {
+			// Skip whitespace
+			while (header_pos < stream_data.len and
+				(stream_data[header_pos] == ' ' or stream_data[header_pos] == '\n' or
+				stream_data[header_pos] == '\r' or stream_data[header_pos] == '\t'))
+			{
+				header_pos += 1;
+			}
+			// Parse object number
+			while (header_pos < stream_data.len and stream_data[header_pos] >= '0' and stream_data[header_pos] <= '9') {
+				header_pos += 1;
+			}
+			// Skip whitespace
+			while (header_pos < stream_data.len and
+				(stream_data[header_pos] == ' ' or stream_data[header_pos] == '\n' or
+				stream_data[header_pos] == '\r' or stream_data[header_pos] == '\t'))
+			{
+				header_pos += 1;
+			}
+			// Parse offset
+			var obj_offset: usize = 0;
+			while (header_pos < stream_data.len and stream_data[header_pos] >= '0' and stream_data[header_pos] <= '9') {
+				obj_offset = obj_offset * 10 + (stream_data[header_pos] - '0');
+				header_pos += 1;
+			}
+
+			if (i == index) {
+				target_offset = first + obj_offset;
+			}
+		}
+
+		const obj_start = target_offset orelse return null;
+		if (obj_start >= stream_data.len) return null;
+
+		// Parse the object value from the stream data
+		var parse_pos = obj_start;
+		const val = parsePdfValue(self.allocator, stream_data, &parse_pos) catch return null;
+
+		// Deep-copy the value so all names are heap-allocated
+		// (the stream_data backing the zero-copy names is about to be freed)
+		const cloned = deepClonePdfValue(self.allocator, val) catch {
+			freePdfValue(self.allocator, val);
+			return null;
+		};
+		freePdfValue(self.allocator, val);
+		return cloned;
+	}
+
 	/// Get decompressed stream data for an object (must be a stream object).
 	/// Caller owns the returned slice.
 	pub fn getStream(self: *PdfContext, obj_num: u32) PdfError!?[]const u8 {
 		const entry = self.xref.get(obj_num) orelse return null;
 		if (!entry.in_use) return null;
+		// Compressed objects don't have their own streams
+		if (entry.compressed) return null;
 
 		const offset: usize = @intCast(entry.offset);
 		if (offset >= self.data.len) return PdfError.InvalidPdf;
@@ -119,8 +208,8 @@ pub const PdfContext = struct {
 		pos = skipWhitespace(self.data, pos);
 		const stream_start = findStreamStart(self.data, pos) orelse return PdfError.MalformedObject;
 
-		// Determine length
-		const length = getDictInt(dict_val.dict, "Length") orelse {
+		// Determine length (may be a direct integer or an indirect reference)
+		const length = self.resolveDictInt(dict_val.dict, "Length") orelse {
 			// Try to find endstream
 			const end_pos = std.mem.indexOf(u8, self.data[stream_start..], "endstream") orelse
 				return PdfError.MalformedObject;
@@ -139,6 +228,23 @@ pub const PdfContext = struct {
 	pub fn resolveRef(self: *PdfContext, val: PdfValue) PdfError!?PdfValue {
 		if (val != .reference) return val;
 		return self.getObject(val.reference.obj);
+	}
+
+	/// Look up a dictionary key that should be an integer, resolving indirect
+	/// references if needed (e.g., /Length 3 0 R where object 3 holds the value).
+	fn resolveDictInt(self: *PdfContext, dict: []const DictEntry, key: []const u8) ?i64 {
+		for (dict) |entry| {
+			if (std.mem.eql(u8, entry.key, key)) {
+				if (entry.value == .integer) return entry.value.integer;
+				if (entry.value == .reference) {
+					const resolved = (self.getObject(entry.value.reference.obj) catch return null) orelse return null;
+					defer freePdfValue(self.allocator, resolved);
+					if (resolved == .integer) return resolved.integer;
+				}
+				return null;
+			}
+		}
+		return null;
 	}
 };
 
@@ -179,13 +285,20 @@ pub fn findStartxref(data: []const u8) ?u64 {
 	return offset;
 }
 
-/// Parse a traditional xref section at the given offset in the PDF data.
+/// Parse an xref section at the given offset — dispatches to traditional
+/// xref table or xref stream (PDF 1.5+) depending on what's found.
 fn parseXrefSection(ctx: *PdfContext, offset: u64) PdfError!void {
 	const off: usize = @intCast(offset);
 	if (off + 4 > ctx.data.len) return PdfError.InvalidPdf;
 
-	// Check for "xref" keyword
-	if (!std.mem.eql(u8, ctx.data[off .. off + 4], "xref")) return PdfError.InvalidPdf;
+	// Check for "xref" keyword (traditional table)
+	if (!std.mem.eql(u8, ctx.data[off .. off + 4], "xref")) {
+		// Might be an xref stream (PDF 1.5+): starts with object number
+		if (ctx.data[off] >= '0' and ctx.data[off] <= '9') {
+			return parseXrefStream(ctx, off);
+		}
+		return PdfError.InvalidPdf;
+	}
 
 	var pos: usize = off + 4;
 	pos = skipWhitespace(ctx.data, pos);
@@ -199,7 +312,18 @@ fn parseXrefSection(ctx: *PdfContext, offset: u64) PdfError!void {
 			// Parse trailer dictionary
 			const dict_val = parsePdfValue(ctx.allocator, ctx.data, &pos) catch return PdfError.MalformedObject;
 			if (dict_val == .dict) {
-				ctx.trailer_dict = dict_val.dict;
+				// Follow /Prev chain for incremental updates
+				const prev_offset = getDictInt(dict_val.dict, "Prev");
+				// Only set trailer_dict from the first (most recent) xref section
+				if (ctx.trailer_dict == null) {
+					ctx.trailer_dict = dict_val.dict;
+				} else {
+					freePdfValue(ctx.allocator, dict_val);
+				}
+				if (prev_offset) |prev_off| {
+					const prev: u64 = @intCast(prev_off);
+					parseXrefSection(ctx, prev) catch {};
+				}
 			} else {
 				freePdfValue(ctx.allocator, dict_val);
 			}
@@ -271,6 +395,189 @@ fn parseXrefSection(ctx: *PdfContext, offset: u64) PdfError!void {
 			}) catch return PdfError.OutOfMemory;
 		}
 	}
+}
+
+/// Parse an xref stream object (PDF 1.5+).
+/// The startxref offset points to an object "N G obj << /Type /XRef ... >> stream ... endstream endobj".
+/// The stream data contains binary xref entries; the dictionary serves as the trailer.
+fn parseXrefStream(ctx: *PdfContext, offset: usize) PdfError!void {
+	// Parse the object: skip "N G obj", then parse the dictionary
+	const obj_body_start = findObjBody(ctx.data, offset) orelse return PdfError.InvalidPdf;
+	var pos = obj_body_start;
+
+	const dict_val = parsePdfValue(ctx.allocator, ctx.data, &pos) catch return PdfError.MalformedObject;
+
+	if (dict_val != .dict) {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.MalformedObject;
+	}
+
+	// Verify this is an xref stream
+	const type_name = getDictName(dict_val.dict, "Type");
+	if (type_name == null or !std.mem.eql(u8, type_name.?, "XRef")) {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.InvalidPdf;
+	}
+
+	// Extract required fields
+	const size_val = getDictInt(dict_val.dict, "Size") orelse {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.MalformedObject;
+	};
+	const size: u32 = @intCast(size_val);
+
+	// /W array: field widths [w1 w2 w3]
+	const w_array = getDictArray(dict_val.dict, "W") orelse {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.MalformedObject;
+	};
+	if (w_array.len != 3) {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.MalformedObject;
+	}
+
+	var w: [3]u8 = undefined;
+	for (w_array, 0..) |wv, i| {
+		if (wv != .integer) {
+			freePdfValue(ctx.allocator, dict_val);
+			return PdfError.MalformedObject;
+		}
+		w[i] = @intCast(wv.integer);
+	}
+	const entry_size: usize = @as(usize, w[0]) + @as(usize, w[1]) + @as(usize, w[2]);
+
+	// /Index array (optional, defaults to [0 Size])
+	var index_pairs: []const PdfValue = &.{};
+	var default_index: [2]PdfValue = .{
+		PdfValue{ .integer = 0 },
+		PdfValue{ .integer = @intCast(size) },
+	};
+	const has_index = getDictArray(dict_val.dict, "Index");
+	if (has_index) |idx| {
+		index_pairs = idx;
+	} else {
+		index_pairs = &default_index;
+	}
+
+	// Get stream data
+	const stream_length = getDictInt(dict_val.dict, "Length") orelse {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.MalformedObject;
+	};
+
+	// Find "stream" keyword
+	pos = skipWhitespace(ctx.data, pos);
+	const stream_start = findStreamStart(ctx.data, pos) orelse {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.MalformedObject;
+	};
+
+	const slen: usize = @intCast(stream_length);
+	if (stream_start + slen > ctx.data.len) {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.InvalidPdf;
+	}
+	const raw_stream = ctx.data[stream_start .. stream_start + slen];
+
+	// Decompress if needed
+	const stream_data = decompressStream(ctx.allocator, raw_stream, dict_val.dict) catch {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.DecompressionFailed;
+	};
+	defer ctx.allocator.free(stream_data);
+
+	// Parse index pairs and read entries
+	var pair_idx: usize = 0;
+	var data_offset: usize = 0;
+	while (pair_idx + 1 < index_pairs.len) {
+		const first_obj: u32 = if (index_pairs[pair_idx] == .integer)
+			@intCast(index_pairs[pair_idx].integer)
+		else
+			break;
+		const count: u32 = if (index_pairs[pair_idx + 1] == .integer)
+			@intCast(index_pairs[pair_idx + 1].integer)
+		else
+			break;
+
+		var i: u32 = 0;
+		while (i < count) : (i += 1) {
+			if (data_offset + entry_size > stream_data.len) break;
+
+			const entry_data = stream_data[data_offset .. data_offset + entry_size];
+			data_offset += entry_size;
+
+			// Read field 1: type (default 1 if w[0]==0)
+			const entry_type: u8 = if (w[0] == 0) 1 else readBigEndianUint(entry_data[0..w[0]]);
+			// Read field 2
+			const field2_start: usize = w[0];
+			const field2 = readBigEndianU64(entry_data[field2_start .. field2_start + w[1]]);
+			// Read field 3
+			const field3_start: usize = field2_start + w[1];
+			const field3 = readBigEndianUint(entry_data[field3_start .. field3_start + w[2]]);
+
+			const obj_num: u32 = first_obj + i;
+			switch (entry_type) {
+				0 => {
+					// Free entry
+					ctx.xref.put(obj_num, XrefEntry{
+						.offset = 0,
+						.gen = @intCast(field3),
+						.in_use = false,
+					}) catch return PdfError.OutOfMemory;
+				},
+				1 => {
+					// In-use entry: field2 = byte offset, field3 = generation
+					ctx.xref.put(obj_num, XrefEntry{
+						.offset = field2,
+						.gen = @intCast(field3),
+						.in_use = true,
+					}) catch return PdfError.OutOfMemory;
+				},
+				2 => {
+					// Compressed object in object stream
+					// field2 = object stream number, field3 = index in stream
+					ctx.xref.put(obj_num, XrefEntry{
+						.offset = field2, // object stream number
+						.gen = @intCast(field3), // index within stream
+						.in_use = true,
+						.compressed = true,
+					}) catch return PdfError.OutOfMemory;
+				},
+				else => {},
+			}
+		}
+		pair_idx += 2;
+	}
+
+	// Check for /Prev (incremental updates)
+	if (getDictInt(dict_val.dict, "Prev")) |prev_offset| {
+		const prev_off: u64 = @intCast(prev_offset);
+		parseXrefSection(ctx, prev_off) catch {};
+	}
+
+	// Store the xref stream dict as the trailer dict
+	// (xref stream dict contains trailer entries like /Root, /Info, etc.)
+	ctx.trailer_dict = dict_val.dict;
+}
+
+/// Read a big-endian unsigned integer from a byte slice (1-8 bytes) as u64.
+fn readBigEndianU64(bytes: []const u8) u64 {
+	var result: u64 = 0;
+	for (bytes) |b| {
+		result = (result << 8) | @as(u64, b);
+	}
+	return result;
+}
+
+/// Read a big-endian unsigned integer from a byte slice (1-4 bytes) as u8.
+fn readBigEndianUint(bytes: []const u8) u8 {
+	if (bytes.len == 0) return 0;
+	// Only the last byte matters for u8 result
+	var result: u32 = 0;
+	for (bytes) |b| {
+		result = (result << 8) | @as(u32, b);
+	}
+	return @intCast(result & 0xFF);
 }
 
 // ── Object Parsing ─────────────────────────────────────────────────
@@ -669,7 +976,8 @@ fn parseNumberOrRef(allocator: Allocator, data: []const u8, pos: *usize) PdfErro
 // ── Stream Decompression ───────────────────────────────────────────
 
 /// Decompress stream data according to the stream dictionary's /Filter.
-/// Supports FlateDecode (zlib). Unfiltered streams are returned as-is (duped).
+/// Supports FlateDecode (zlib) with optional PNG Predictor (/DecodeParms).
+/// Unfiltered streams are returned as-is (duped).
 fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const DictEntry) PdfError![]const u8 {
 	const filter = getDictName(dict, "Filter");
 
@@ -679,11 +987,110 @@ fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const
 	}
 
 	if (std.mem.eql(u8, filter.?, "FlateDecode")) {
-		return inflateZlib(allocator, stream_data);
+		const decompressed = try inflateZlib(allocator, stream_data);
+
+		// Check for DecodeParms with Predictor (PNG prediction)
+		const decode_parms = getDictDict(dict, "DecodeParms");
+		if (decode_parms) |parms| {
+			const predictor = getDictInt(parms, "Predictor") orelse 1;
+			if (predictor >= 10) {
+				// PNG predictor (10-14): needs un-prediction
+				const columns_val = getDictInt(parms, "Columns") orelse 1;
+				const columns: usize = @intCast(columns_val);
+				const result = applyPngUnpredict(allocator, decompressed, columns) catch {
+					allocator.free(decompressed);
+					return PdfError.DecompressionFailed;
+				};
+				allocator.free(decompressed);
+				return result;
+			}
+		}
+
+		return decompressed;
 	}
 
 	// Unsupported filter
 	return PdfError.UnsupportedFeature;
+}
+
+/// Reverse PNG prediction on decompressed data.
+/// Each row is: 1 filter byte + `columns` data bytes.
+/// Supports filter types 0 (None), 1 (Sub), 2 (Up), 3 (Average), 4 (Paeth).
+fn applyPngUnpredict(allocator: Allocator, data: []const u8, columns: usize) ![]const u8 {
+	const row_size = columns + 1; // filter byte + data bytes
+	if (row_size == 0 or data.len == 0) {
+		return allocator.dupe(u8, &.{}) catch return error.OutOfMemory;
+	}
+
+	const n_rows = data.len / row_size;
+	var result = try allocator.alloc(u8, n_rows * columns);
+	errdefer allocator.free(result);
+
+	var prev_row: ?[]const u8 = null;
+	var row: usize = 0;
+	while (row < n_rows) : (row += 1) {
+		const src_start = row * row_size;
+		if (src_start >= data.len) break;
+		const filter_type = data[src_start];
+		const src = data[src_start + 1 .. src_start + row_size];
+		const dst_start = row * columns;
+		const dst = result[dst_start .. dst_start + columns];
+
+		switch (filter_type) {
+			0 => {
+				// None: copy as-is
+				@memcpy(dst, src);
+			},
+			1 => {
+				// Sub: each byte += byte to its left (same row)
+				for (0..columns) |i| {
+					const left: u8 = if (i > 0) dst[i - 1] else 0;
+					dst[i] = src[i] +% left;
+				}
+			},
+			2 => {
+				// Up: each byte += byte above (previous row)
+				for (0..columns) |i| {
+					const above: u8 = if (prev_row) |pr| pr[i] else 0;
+					dst[i] = src[i] +% above;
+				}
+			},
+			3 => {
+				// Average: each byte += floor((left + above) / 2)
+				for (0..columns) |i| {
+					const left: u16 = if (i > 0) @as(u16, dst[i - 1]) else 0;
+					const above: u16 = if (prev_row) |pr| @as(u16, pr[i]) else 0;
+					dst[i] = src[i] +% @as(u8, @intCast((left + above) / 2));
+				}
+			},
+			4 => {
+				// Paeth: each byte += PaethPredictor(left, above, upper-left)
+				for (0..columns) |i| {
+					const left: i16 = if (i > 0) @as(i16, dst[i - 1]) else 0;
+					const above: i16 = if (prev_row) |pr| @as(i16, pr[i]) else 0;
+					const upper_left: i16 = if (i > 0 and prev_row != null) @as(i16, prev_row.?[i - 1]) else 0;
+					const p = left + above - upper_left;
+					const pa = @abs(p - left);
+					const pb = @abs(p - above);
+					const pc = @abs(p - upper_left);
+					const predictor_val: u8 = if (pa <= pb and pa <= pc)
+						@intCast(@as(u16, @bitCast(left)))
+					else if (pb <= pc)
+						@intCast(@as(u16, @bitCast(above)))
+					else
+						@intCast(@as(u16, @bitCast(upper_left)));
+					dst[i] = src[i] +% predictor_val;
+				}
+			},
+			else => {
+				// Unknown filter — copy as-is
+				@memcpy(dst, src);
+			},
+		}
+		prev_row = dst;
+	}
+
+	return result;
 }
 
 /// Decompress zlib-wrapped deflate data (PDF FlateDecode).
@@ -701,10 +1108,13 @@ fn inflateZlib(allocator: Allocator, compressed: []const u8) PdfError![]const u8
 // ── Dictionary Helpers ─────────────────────────────────────────────
 
 /// Look up a name value in a dictionary (returns the name string or null).
+/// Also accepts string values (for deep-cloned compressed object values where
+/// names are stored as strings).
 pub fn getDictName(dict: []const DictEntry, key: []const u8) ?[]const u8 {
 	for (dict) |entry| {
 		if (std.mem.eql(u8, entry.key, key)) {
 			if (entry.value == .name) return entry.value.name;
+			if (entry.value == .string) return entry.value.string;
 			return null;
 		}
 	}
@@ -758,6 +1168,59 @@ pub fn getDictArray(dict: []const DictEntry, key: []const u8) ?[]const PdfValue 
 // ── Memory Management ──────────────────────────────────────────────
 
 /// Free a PdfValue and all its owned sub-values recursively.
+/// Deep-clone a PdfValue, allocating copies of all referenced data.
+/// Names (which are normally zero-copy slices) are converted to allocated strings
+/// so they remain valid after the original backing data is freed.
+fn deepClonePdfValue(allocator: Allocator, value: PdfValue) PdfError!PdfValue {
+	switch (value) {
+		.name => |n| {
+			// Convert zero-copy name to allocated string (freed by freePdfValue)
+			const copy = allocator.dupe(u8, n) catch return PdfError.OutOfMemory;
+			return PdfValue{ .string = copy };
+		},
+		.string => |s| {
+			const copy = allocator.dupe(u8, s) catch return PdfError.OutOfMemory;
+			return PdfValue{ .string = copy };
+		},
+		.array => |arr| {
+			const new_arr = allocator.alloc(PdfValue, arr.len) catch return PdfError.OutOfMemory;
+			var i: usize = 0;
+			errdefer {
+				for (new_arr[0..i]) |item| freePdfValue(allocator, item);
+				allocator.free(new_arr);
+			}
+			while (i < arr.len) : (i += 1) {
+				new_arr[i] = try deepClonePdfValue(allocator, arr[i]);
+			}
+			return PdfValue{ .array = new_arr };
+		},
+		.dict => |entries| {
+			const new_entries = allocator.alloc(DictEntry, entries.len) catch return PdfError.OutOfMemory;
+			var i: usize = 0;
+			errdefer {
+				for (new_entries[0..i]) |entry| {
+					allocator.free(entry.key);
+					freePdfValue(allocator, entry.value);
+				}
+				allocator.free(new_entries);
+			}
+			while (i < entries.len) : (i += 1) {
+				const key_copy = allocator.dupe(u8, entries[i].key) catch return PdfError.OutOfMemory;
+				errdefer allocator.free(key_copy);
+				const val_copy = try deepClonePdfValue(allocator, entries[i].value);
+				new_entries[i] = DictEntry{ .key = key_copy, .value = val_copy };
+			}
+			return PdfValue{ .dict = new_entries };
+		},
+		// Scalars and references are copied by value
+		.integer => return value,
+		.real => return value,
+		.boolean => return value,
+		.reference => return value,
+		.null_val => return value,
+	}
+}
+
 pub fn freePdfValue(allocator: Allocator, value: PdfValue) void {
 	switch (value) {
 		.string => |s| allocator.free(s),
@@ -1112,6 +1575,92 @@ fn buildMinimalPdf(allocator: Allocator, objects: []const TestObj, trailer_dict:
 	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
 
 	return try buf.toOwnedSlice(allocator);
+}
+
+test "xref stream — basic type-1 entries" {
+	// Build a minimal PDF that uses an xref stream instead of a traditional xref table.
+	// This is the modern PDF 1.5+ format that many PDFs use.
+	//
+	// Layout:
+	// - Object 1 at offset X: catalog dict
+	// - Object 2 at offset Y: xref stream (contains xref data for objects 0,1,2)
+	//
+	// The xref stream entry format with /W [1 2 1]:
+	//   Type (1 byte) | Field2 (2 bytes) | Field3 (1 byte)
+	//   0 = free: next_free_obj, gen
+	//   1 = in-use: byte_offset, gen
+	//   2 = compressed: obj_stream_num, index
+
+	var pdf_buf = std.ArrayList(u8){};
+	defer pdf_buf.deinit(testing.allocator);
+	const w = pdf_buf.writer(testing.allocator);
+
+	try pdf_buf.appendSlice(testing.allocator, "%PDF-1.5\n");
+
+	// Object 1: Catalog
+	const obj1_offset = pdf_buf.items.len;
+	try pdf_buf.appendSlice(testing.allocator, "1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+	// Object 2: Xref stream
+	const obj2_offset = pdf_buf.items.len;
+
+	// Build xref stream data (uncompressed, /W [1 2 1]):
+	// Entry for obj 0: type=0 (free), next_free=0, gen=255
+	// Entry for obj 1: type=1 (in-use), offset=obj1_offset, gen=0
+	// Entry for obj 2: type=1 (in-use), offset=obj2_offset, gen=0
+	var stream_data: [12]u8 = undefined;
+	// Obj 0: free
+	stream_data[0] = 0; // type=free
+	stream_data[1] = 0; // next free (high byte)
+	stream_data[2] = 0; // next free (low byte)
+	stream_data[3] = 255; // gen
+	// Obj 1: in-use at obj1_offset
+	stream_data[4] = 1; // type=in-use
+	stream_data[5] = @intCast((obj1_offset >> 8) & 0xFF);
+	stream_data[6] = @intCast(obj1_offset & 0xFF);
+	stream_data[7] = 0; // gen
+	// Obj 2: in-use at obj2_offset
+	stream_data[8] = 1; // type=in-use
+	stream_data[9] = @intCast((obj2_offset >> 8) & 0xFF);
+	stream_data[10] = @intCast(obj2_offset & 0xFF);
+	stream_data[11] = 0; // gen
+
+	try std.fmt.format(w, "2 0 obj\n<< /Type /XRef /Size 3 /W [1 2 1] /Length {d} /Root 1 0 R >>\nstream\n", .{stream_data.len});
+	try pdf_buf.appendSlice(testing.allocator, &stream_data);
+	try pdf_buf.appendSlice(testing.allocator, "\nendstream\nendobj\n");
+
+	try std.fmt.format(w, "startxref\n{d}\n%%EOF", .{obj2_offset});
+
+	var ctx = try PdfContext.init(testing.allocator, pdf_buf.items);
+	defer ctx.deinit();
+
+	// Should have parsed xref entries
+	try testing.expectEqual(@as(u32, 3), ctx.xref.count());
+
+	// Object 0 should be free
+	const e0 = ctx.xref.get(0).?;
+	try testing.expect(!e0.in_use);
+
+	// Object 1 should be in-use at the right offset
+	const e1 = ctx.xref.get(1).?;
+	try testing.expect(e1.in_use);
+	try testing.expectEqual(@as(u64, obj1_offset), e1.offset);
+
+	// Object 2 should be in-use at the right offset
+	const e2 = ctx.xref.get(2).?;
+	try testing.expect(e2.in_use);
+	try testing.expectEqual(@as(u64, obj2_offset), e2.offset);
+
+	// Trailer dict should be set (from the xref stream dict)
+	try testing.expect(ctx.trailer_dict != null);
+
+	// Should be able to look up object 1
+	const obj = (try ctx.getObject(1)).?;
+	defer freePdfValue(testing.allocator, obj);
+	try testing.expect(obj == .dict);
+	const type_val = getDictName(obj.dict, "Type");
+	try testing.expect(type_val != null);
+	try testing.expectEqualStrings("Catalog", type_val.?);
 }
 
 test "FlateDecode stream decompression" {

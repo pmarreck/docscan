@@ -16,6 +16,254 @@ const PdfContext = pdf_objects.PdfContext;
 const PdfValue = pdf_objects.PdfValue;
 const PdfError = pdf_objects.PdfError;
 
+/// ToUnicode CMap: maps glyph IDs (as u16) to Unicode text.
+/// Built from PDF font /ToUnicode streams.
+const CMap = struct {
+	/// Single character mappings: glyph_id -> unicode codepoint(s)
+	char_map: std.AutoHashMap(u16, []const u8),
+	/// Range mappings: start_glyph -> (end_glyph, base_unicode)
+	ranges: std.ArrayList(CMapRange),
+	allocator: Allocator,
+
+	const CMapRange = struct {
+		start: u16,
+		end: u16,
+		base_unicode: u21, // first Unicode codepoint in range
+	};
+
+	fn init(allocator: Allocator) CMap {
+		return .{
+			.char_map = std.AutoHashMap(u16, []const u8).init(allocator),
+			.ranges = std.ArrayList(CMapRange){},
+			.allocator = allocator,
+		};
+	}
+
+	fn deinit(self: *CMap) void {
+		var iter = self.char_map.iterator();
+		while (iter.next()) |entry| {
+			self.allocator.free(entry.value_ptr.*);
+		}
+		self.char_map.deinit();
+		self.ranges.deinit(self.allocator);
+	}
+
+	/// Look up a glyph ID and return the corresponding Unicode text, or null.
+	fn lookup(self: *const CMap, glyph_id: u16) ?[]const u8 {
+		if (self.char_map.get(glyph_id)) |text| return text;
+		// Check ranges
+		for (self.ranges.items) |range| {
+			if (glyph_id >= range.start and glyph_id <= range.end) {
+				// Would need to encode the unicode codepoint to UTF-8
+				// For now, return null for range lookups (handled by caller)
+				return null;
+			}
+		}
+		return null;
+	}
+
+	/// Look up a glyph ID, returning Unicode codepoint for range-based mappings.
+	fn lookupCodepoint(self: *const CMap, glyph_id: u16) ?u21 {
+		// Check ranges first (lighter weight than string alloc)
+		for (self.ranges.items) |range| {
+			if (glyph_id >= range.start and glyph_id <= range.end) {
+				const delta = glyph_id - range.start;
+				return range.base_unicode + delta;
+			}
+		}
+		return null;
+	}
+};
+
+/// Parse a ToUnicode CMap stream into a CMap.
+/// Handles beginbfchar/endbfchar and beginbfrange/endbfrange sections.
+fn parseCMap(allocator: Allocator, data: []const u8) CMap {
+	var cmap = CMap.init(allocator);
+
+	var pos: usize = 0;
+	while (pos < data.len) {
+		// Find beginbfchar or beginbfrange (handle \n, \r\n, and \r line endings)
+		if (pos + 11 <= data.len and std.mem.eql(u8, data[pos .. pos + 11], "beginbfchar")) {
+			pos += 11;
+			// Skip the line ending
+			if (pos < data.len and data[pos] == '\r') pos += 1;
+			if (pos < data.len and data[pos] == '\n') pos += 1;
+			parseBfCharSection(allocator, data, &pos, &cmap);
+		} else if (pos + 12 <= data.len and std.mem.eql(u8, data[pos .. pos + 12], "beginbfrange")) {
+			pos += 12;
+			if (pos < data.len and data[pos] == '\r') pos += 1;
+			if (pos < data.len and data[pos] == '\n') pos += 1;
+			parseBfRangeSection(allocator, data, &pos, &cmap);
+		} else {
+			pos += 1;
+		}
+	}
+
+	return cmap;
+}
+
+/// Parse a bfchar section: lines of "<srcCode> <dstCode>" until endbfchar.
+fn parseBfCharSection(allocator: Allocator, data: []const u8, pos: *usize, cmap: *CMap) void {
+	while (pos.* < data.len) {
+		// Skip whitespace
+		while (pos.* < data.len and (data[pos.*] == ' ' or data[pos.*] == '\t' or data[pos.*] == '\n' or data[pos.*] == '\r')) {
+			pos.* += 1;
+		}
+		if (pos.* >= data.len) return;
+
+		// Check for endbfchar
+		if (pos.* + 9 <= data.len and std.mem.eql(u8, data[pos.* .. pos.* + 9], "endbfchar")) {
+			pos.* += 9;
+			return;
+		}
+
+		// Parse <srcCode>
+		const src = parseHexToken(data, pos) orelse return;
+		// Skip whitespace
+		while (pos.* < data.len and (data[pos.*] == ' ' or data[pos.*] == '\t')) {
+			pos.* += 1;
+		}
+		// Parse <dstCode>
+		const dst = parseHexToken(data, pos) orelse return;
+
+		// Convert dst hex to UTF-8 string
+		const utf8 = hexToUtf8(allocator, dst) catch continue;
+		cmap.char_map.put(hexToU16(src), utf8) catch continue;
+	}
+}
+
+/// Parse a bfrange section: lines of "<start> <end> <base>" until endbfrange.
+fn parseBfRangeSection(allocator: Allocator, data: []const u8, pos: *usize, cmap: *CMap) void {
+	_ = allocator;
+	while (pos.* < data.len) {
+		while (pos.* < data.len and (data[pos.*] == ' ' or data[pos.*] == '\t' or data[pos.*] == '\n' or data[pos.*] == '\r')) {
+			pos.* += 1;
+		}
+		if (pos.* >= data.len) return;
+
+		if (pos.* + 10 <= data.len and std.mem.eql(u8, data[pos.* .. pos.* + 10], "endbfrange")) {
+			pos.* += 10;
+			return;
+		}
+
+		const start = parseHexToken(data, pos) orelse return;
+		while (pos.* < data.len and (data[pos.*] == ' ' or data[pos.*] == '\t')) pos.* += 1;
+		const end_tok = parseHexToken(data, pos) orelse return;
+		while (pos.* < data.len and (data[pos.*] == ' ' or data[pos.*] == '\t')) pos.* += 1;
+
+		// The base can be a hex token <XXXX> or an array [<X> <Y> ...]
+		if (pos.* < data.len and data[pos.*] == '<') {
+			const base = parseHexToken(data, pos) orelse return;
+			const base_cp = hexToU21(base);
+			cmap.ranges.append(cmap.allocator, CMap.CMapRange{
+				.start = hexToU16(start),
+				.end = hexToU16(end_tok),
+				.base_unicode = base_cp,
+			}) catch continue;
+		} else if (pos.* < data.len and data[pos.*] == '[') {
+			// Array form — skip for now, less common
+			while (pos.* < data.len and data[pos.*] != ']') pos.* += 1;
+			if (pos.* < data.len) pos.* += 1;
+		}
+	}
+}
+
+/// Parse a hex token like <0042> and return the hex digits (without brackets).
+fn parseHexToken(data: []const u8, pos: *usize) ?[]const u8 {
+	if (pos.* >= data.len or data[pos.*] != '<') return null;
+	pos.* += 1;
+	const start = pos.*;
+	while (pos.* < data.len and data[pos.*] != '>') pos.* += 1;
+	const end_pos = pos.*;
+	if (pos.* < data.len) pos.* += 1;
+	if (start >= end_pos) return null;
+	return data[start..end_pos];
+}
+
+/// Convert hex string (e.g. "0042") to u16.
+fn hexToU16(hex: []const u8) u16 {
+	var result: u16 = 0;
+	for (hex) |c| {
+		result <<= 4;
+		if (c >= '0' and c <= '9') {
+			result |= @as(u16, c - '0');
+		} else if (c >= 'a' and c <= 'f') {
+			result |= @as(u16, c - 'a' + 10);
+		} else if (c >= 'A' and c <= 'F') {
+			result |= @as(u16, c - 'A' + 10);
+		}
+	}
+	return result;
+}
+
+/// Convert hex string to u21 (Unicode codepoint).
+fn hexToU21(hex: []const u8) u21 {
+	var result: u21 = 0;
+	for (hex) |c| {
+		result <<= 4;
+		if (c >= '0' and c <= '9') {
+			result |= @as(u21, c - '0');
+		} else if (c >= 'a' and c <= 'f') {
+			result |= @as(u21, c - 'a' + 10);
+		} else if (c >= 'A' and c <= 'F') {
+			result |= @as(u21, c - 'A' + 10);
+		}
+	}
+	return result;
+}
+
+/// Convert hex-encoded Unicode codepoints to UTF-8 string.
+/// Input is hex digits like "0042" (= U+0042 = 'B') or "00420043" (= "BC").
+fn hexToUtf8(allocator: Allocator, hex: []const u8) ![]const u8 {
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(allocator);
+
+	var i: usize = 0;
+	while (i + 4 <= hex.len) {
+		const cp = hexToU21(hex[i .. i + 4]);
+		if (cp <= 0x7F) {
+			try buf.append(allocator, @intCast(cp));
+		} else if (cp <= 0x7FF) {
+			try buf.append(allocator, @intCast(0xC0 | (cp >> 6)));
+			try buf.append(allocator, @intCast(0x80 | (cp & 0x3F)));
+		} else if (cp <= 0xFFFF) {
+			try buf.append(allocator, @intCast(0xE0 | (cp >> 12)));
+			try buf.append(allocator, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+			try buf.append(allocator, @intCast(0x80 | (cp & 0x3F)));
+		}
+		i += 4;
+	}
+
+	return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode a single Unicode codepoint to UTF-8 bytes in the provided buffer.
+/// Returns the number of bytes written (1-4).
+fn encodeUtf8(cp: u21, buf: *[4]u8) u3 {
+	if (cp <= 0x7F) {
+		buf[0] = @intCast(cp);
+		return 1;
+	} else if (cp <= 0x7FF) {
+		buf[0] = @intCast(0xC0 | (cp >> 6));
+		buf[1] = @intCast(0x80 | (cp & 0x3F));
+		return 2;
+	} else if (cp <= 0xFFFF) {
+		buf[0] = @intCast(0xE0 | (cp >> 12));
+		buf[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+		buf[2] = @intCast(0x80 | (cp & 0x3F));
+		return 3;
+	} else {
+		buf[0] = @intCast(0xF0 | (cp >> 18));
+		buf[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+		buf[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+		buf[3] = @intCast(0x80 | (cp & 0x3F));
+		return 4;
+	}
+}
+
+/// Font-to-CMap mapping for a page's font resources.
+const FontMap = std.StringHashMap(CMap);
+
 /// A span of text extracted from a PDF content stream, with font metadata.
 const TextSpan = struct {
 	text: []const u8, // owned
@@ -119,6 +367,18 @@ fn collectPageSpans(allocator: Allocator, ctx: *PdfContext, obj_num: u32, spans:
 
 /// Extract text spans from a single page's content stream(s).
 fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pdf_objects.DictEntry, spans: *std.ArrayList(TextSpan), page_num: u32) PdfError!void {
+	// Build font CMap table from page resources
+	var font_maps = FontMap.init(allocator);
+	defer {
+		var iter = font_maps.iterator();
+		while (iter.next()) |entry| {
+			var cm = entry.value_ptr.*;
+			cm.deinit();
+		}
+		font_maps.deinit();
+	}
+	buildFontMaps(allocator, ctx, page_dict, &font_maps);
+
 	// Get the content stream reference
 	// /Contents can be a single reference or an array of references
 	for (page_dict) |entry| {
@@ -127,13 +387,13 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 		if (entry.value == .reference) {
 			const stream_data = (ctx.getStream(entry.value.reference.obj) catch return) orelse return;
 			defer allocator.free(stream_data);
-			try parseContentStream(allocator, stream_data, spans, page_num);
+			try parseContentStream(allocator, stream_data, spans, page_num, &font_maps);
 		} else if (entry.value == .array) {
 			for (entry.value.array) |item| {
 				if (item == .reference) {
 					const stream_data = (ctx.getStream(item.reference.obj) catch continue) orelse continue;
 					defer allocator.free(stream_data);
-					try parseContentStream(allocator, stream_data, spans, page_num);
+					try parseContentStream(allocator, stream_data, spans, page_num, &font_maps);
 				}
 			}
 		}
@@ -141,11 +401,94 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 	}
 }
 
+/// Build font-name-to-CMap mappings from a page's /Resources/Font dictionary.
+fn buildFontMaps(allocator: Allocator, ctx: *PdfContext, page_dict: []const pdf_objects.DictEntry, font_maps: *FontMap) void {
+	// Find /Resources dict (may be direct or indirect)
+	const resources = pdf_objects.getDictDict(page_dict, "Resources") orelse {
+		// Try indirect reference
+		const res_ref = pdf_objects.getDictRef(page_dict, "Resources") orelse return;
+		const res_val = (ctx.getObject(res_ref.obj) catch return) orelse return;
+		defer pdf_objects.freePdfValue(allocator, res_val);
+		if (res_val != .dict) return;
+		buildFontMapsFromResources(allocator, ctx, res_val.dict, font_maps);
+		return;
+	};
+	buildFontMapsFromResources(allocator, ctx, resources, font_maps);
+}
+
+fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources: []const pdf_objects.DictEntry, font_maps: *FontMap) void {
+	// Find /Font dict within resources
+	const font_dict_or_ref = blk: {
+		for (resources) |entry| {
+			if (std.mem.eql(u8, entry.key, "Font")) {
+				break :blk entry.value;
+			}
+		}
+		return;
+	};
+
+	var font_dict: []const pdf_objects.DictEntry = undefined;
+	var owned_font_dict: ?pdf_objects.PdfValue = null;
+
+	if (font_dict_or_ref == .dict) {
+		font_dict = font_dict_or_ref.dict;
+	} else if (font_dict_or_ref == .reference) {
+		const resolved = (ctx.getObject(font_dict_or_ref.reference.obj) catch return) orelse return;
+		if (resolved != .dict) {
+			pdf_objects.freePdfValue(allocator, resolved);
+			return;
+		}
+		owned_font_dict = resolved;
+		font_dict = resolved.dict;
+	} else {
+		return;
+	}
+	defer if (owned_font_dict) |v| pdf_objects.freePdfValue(allocator, v);
+
+	// For each font in /Font dict, check for /ToUnicode
+	for (font_dict) |font_entry| {
+		const font_name = font_entry.key; // e.g. "F1"
+
+		// Get the font object (may be direct dict or reference)
+		var font_obj_dict: []const pdf_objects.DictEntry = undefined;
+		var owned_font_obj: ?pdf_objects.PdfValue = null;
+
+		if (font_entry.value == .dict) {
+			font_obj_dict = font_entry.value.dict;
+		} else if (font_entry.value == .reference) {
+			const resolved = (ctx.getObject(font_entry.value.reference.obj) catch continue) orelse continue;
+			if (resolved != .dict) {
+				pdf_objects.freePdfValue(allocator, resolved);
+				continue;
+			}
+			owned_font_obj = resolved;
+			font_obj_dict = resolved.dict;
+		} else {
+			continue;
+		}
+		defer if (owned_font_obj) |v| pdf_objects.freePdfValue(allocator, v);
+
+		// Check for /ToUnicode stream reference
+		const tounicode_ref = pdf_objects.getDictRef(font_obj_dict, "ToUnicode") orelse continue;
+		const cmap_data = (ctx.getStream(tounicode_ref.obj) catch continue) orelse continue;
+		defer allocator.free(cmap_data);
+
+		var cmap = parseCMap(allocator, cmap_data);
+		font_maps.put(font_name, cmap) catch {
+			cmap.deinit();
+			continue;
+		};
+	}
+}
+
 /// Parse a PDF content stream and extract text spans.
 /// Handles BT/ET blocks, Tf (font size), Tj/TJ (show text), Td/TD/Tm (positioning).
-fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.ArrayList(TextSpan), page_num: u32) PdfError!void {
+/// font_maps provides ToUnicode CMap lookups for hex-encoded glyph IDs.
+fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.ArrayList(TextSpan), page_num: u32, font_maps: ?*const FontMap) PdfError!void {
 	var pos: usize = 0;
 	var current_font_size: f32 = 12.0; // default
+	var current_font_name: ?[]const u8 = null; // e.g., "F1" — points into stream data
+	var last_name: ?[]const u8 = null; // last /Name token seen (for Tf matching)
 	var y_pos: f32 = 0;
 	var in_text_block = false;
 
@@ -189,9 +532,42 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 			continue;
 		}
 
+		// Hex string: <hex> — could be Tj operand with glyph IDs
+		if (ch == '<' and pos + 1 < stream.len and stream[pos + 1] != '<') {
+			const hex_text = extractHexStringText(allocator, stream, &pos, getCurrentCMap(font_maps, current_font_name)) catch continue;
+			const next_pos = skipStreamWhitespace(stream, pos);
+			if (next_pos < stream.len) {
+				if (stream[next_pos] == 'T' and next_pos + 1 < stream.len and stream[next_pos + 1] == 'j') {
+					pos = next_pos + 2;
+					if (in_text_block and hex_text.len > 0) {
+						spans.append(allocator, TextSpan{
+							.text = hex_text,
+							.font_size = current_font_size,
+							.page = page_num,
+							.y_position = y_pos,
+						}) catch return PdfError.OutOfMemory;
+						continue;
+					}
+				} else if (stream[next_pos] == '\'') {
+					pos = next_pos + 1;
+					if (in_text_block and hex_text.len > 0) {
+						spans.append(allocator, TextSpan{
+							.text = hex_text,
+							.font_size = current_font_size,
+							.page = page_num,
+							.y_position = y_pos,
+						}) catch return PdfError.OutOfMemory;
+						continue;
+					}
+				}
+			}
+			allocator.free(hex_text);
+			continue;
+		}
+
 		// PDF array: [...] — could be TJ operand
 		if (ch == '[') {
-			const arr_text = extractTJArray(allocator, stream, &pos) catch continue;
+			const arr_text = extractTJArray(allocator, stream, &pos, getCurrentCMap(font_maps, current_font_name)) catch continue;
 			const next_pos = skipStreamWhitespace(stream, pos);
 			if (next_pos + 1 < stream.len and stream[next_pos] == 'T' and stream[next_pos + 1] == 'J') {
 				pos = next_pos + 2;
@@ -213,6 +589,9 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 		if (ch == 'B' and pos + 1 < stream.len and stream[pos + 1] == 'T') {
 			if (pos + 2 >= stream.len or isDelimiter(stream[pos + 2])) {
 				in_text_block = true;
+				// Per PDF spec, BT resets the text matrix and text line matrix
+				// to identity. Td offsets are relative within a BT block.
+				y_pos = 0;
 				pos += 2;
 				continue;
 			}
@@ -264,9 +643,11 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 			const ws_pos = skipStreamWhitespace(stream, pos);
 
 			// Check for "number Tf" pattern — that's the font size
+			// Full pattern: /FontName fontSize Tf
 			if (ws_pos < stream.len and stream[ws_pos] == 'T' and ws_pos + 1 < stream.len and stream[ws_pos + 1] == 'f') {
 				if (ws_pos + 2 >= stream.len or isDelimiter(stream[ws_pos + 2])) {
 					current_font_size = num;
+					current_font_name = last_name;
 					pos = ws_pos + 2;
 					continue;
 				}
@@ -319,9 +700,12 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 
 		// Name token (e.g., /F1 in "/F1 12 Tf")
 		if (ch == '/') {
-			// Skip the name
+			// Capture the name (for font tracking via Tf)
 			pos += 1;
+			const name_start = pos;
 			while (pos < stream.len and !isDelimiter(stream[pos])) pos += 1;
+			// Remember the last name token for Tf operator matching
+			last_name = stream[name_start..pos];
 			continue;
 		}
 
@@ -402,9 +786,92 @@ fn extractStreamString(allocator: Allocator, data: []const u8, pos: *usize) ![]c
 	return try buf.toOwnedSlice(allocator);
 }
 
+/// Get the CMap for the current font, if available.
+fn getCurrentCMap(font_maps: ?*const FontMap, font_name: ?[]const u8) ?*const CMap {
+	const maps = font_maps orelse return null;
+	const name = font_name orelse return null;
+	return maps.getPtr(name);
+}
+
+/// Extract text from a hex string like <0042004300440045>, decoding
+/// glyph IDs via CMap if available, otherwise returning raw bytes.
+fn extractHexStringText(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*const CMap) ![]const u8 {
+	var p = pos.* + 1; // skip '<'
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(allocator);
+
+	// Collect hex digits
+	var hex_buf = std.ArrayList(u8){};
+	defer hex_buf.deinit(allocator);
+	while (p < data.len and data[p] != '>') {
+		const c = data[p];
+		if ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')) {
+			try hex_buf.append(allocator, c);
+		}
+		p += 1;
+	}
+	if (p < data.len) p += 1; // skip '>'
+	pos.* = p;
+
+	// Decode hex string using CMap
+	if (cmap) |cm| {
+		var i: usize = 0;
+		const hex = hex_buf.items;
+		while (i + 2 <= hex.len) {
+			// Try 2-byte (4 hex digit) glyph ID first
+			if (i + 4 <= hex.len) {
+				const glyph_id = hexToU16(hex[i .. i + 4]);
+				if (cm.lookup(glyph_id)) |text| {
+					try buf.appendSlice(allocator, text);
+					i += 4;
+					continue;
+				}
+				// Try range lookup
+				if (cm.lookupCodepoint(glyph_id)) |cp| {
+					var utf8_buf: [4]u8 = undefined;
+					const n = encodeUtf8(cp, &utf8_buf);
+					try buf.appendSlice(allocator, utf8_buf[0..n]);
+					i += 4;
+					continue;
+				}
+			}
+			// Try 1-byte (2 hex digit) glyph ID
+			const glyph_id_1 = hexToU16(hex[i .. i + 2]);
+			if (cm.lookup(glyph_id_1)) |text| {
+				try buf.appendSlice(allocator, text);
+				i += 2;
+				continue;
+			}
+			if (cm.lookupCodepoint(glyph_id_1)) |cp| {
+				var utf8_buf: [4]u8 = undefined;
+				const n = encodeUtf8(cp, &utf8_buf);
+				try buf.appendSlice(allocator, utf8_buf[0..n]);
+				i += 2;
+				continue;
+			}
+			// No mapping found — skip this glyph
+			i += 2;
+		}
+	} else {
+		// No CMap — try to interpret as raw bytes (standard encoding)
+		var i: usize = 0;
+		const hex = hex_buf.items;
+		while (i + 2 <= hex.len) {
+			const byte_val = hexToU16(hex[i .. i + 2]);
+			if (byte_val >= 0x20 and byte_val < 0x7F) {
+				try buf.append(allocator, @intCast(byte_val));
+			}
+			i += 2;
+		}
+	}
+
+	return try buf.toOwnedSlice(allocator);
+}
+
 /// Extract text from a TJ array: [(text) kern (text) kern ...]
-/// Numbers (kerning) are ignored; strings are concatenated.
-fn extractTJArray(allocator: Allocator, data: []const u8, pos: *usize) ![]const u8 {
+/// Numbers represent kerning; large negative values insert spaces.
+/// Hex strings (<XX>) are decoded via CMap if available.
+fn extractTJArray(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*const CMap) ![]const u8 {
 	var p = pos.* + 1; // skip '['
 	var buf = std.ArrayList(u8){};
 	errdefer buf.deinit(allocator);
@@ -420,13 +887,21 @@ fn extractTJArray(allocator: Allocator, data: []const u8, pos: *usize) ![]const 
 			defer allocator.free(str);
 			try buf.appendSlice(allocator, str);
 		} else if (c == '-' or c == '+' or c == '.' or (c >= '0' and c <= '9')) {
-			// Skip number (kerning value)
-			_ = parseStreamNumber(data, &p);
+			// Kerning value: large negative numbers indicate word boundaries
+			const kern = parseStreamNumber(data, &p);
+			if (kern < -200) {
+				try buf.append(allocator, ' ');
+			}
 		} else if (c == '<') {
-			// Hex string in TJ array
-			p += 1;
-			while (p < data.len and data[p] != '>') p += 1;
-			if (p < data.len) p += 1;
+			// Hex string in TJ array — decode via CMap if available
+			const hex_text = extractHexStringText(allocator, data, &p, cmap) catch {
+				// Skip on error
+				while (p < data.len and data[p] != '>') p += 1;
+				if (p < data.len) p += 1;
+				continue;
+			};
+			defer allocator.free(hex_text);
+			try buf.appendSlice(allocator, hex_text);
 		} else {
 			p += 1;
 		}
@@ -547,6 +1022,10 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 	}
 
 	var current: ?usize = null;
+	var prev_y: f32 = 0;
+	var prev_page: u32 = 0;
+	var prev_font_size: f32 = 12.0;
+	var has_prev_body: bool = false;
 
 	for (spans) |span| {
 		if (span.text.len == 0) continue;
@@ -560,6 +1039,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 				.content_buf = .{},
 			});
 			current = flat_sections.items.len - 1;
+			has_prev_body = false;
 		} else {
 			// Body text
 			if (current == null) {
@@ -572,9 +1052,27 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 			}
 			const fs = &flat_sections.items[current.?];
 			if (fs.content_buf.items.len > 0) {
-				try fs.content_buf.append(allocator, '\n');
+				// Decide separator: space (same line) vs newline (different line)
+				if (has_prev_body and span.page == prev_page) {
+					const y_diff = @abs(span.y_position - prev_y);
+					const line_threshold = prev_font_size * 1.2;
+					if (y_diff < line_threshold) {
+						// Same line — use space
+						try fs.content_buf.append(allocator, ' ');
+					} else {
+						// Different line — use newline
+						try fs.content_buf.append(allocator, '\n');
+					}
+				} else {
+					// Different page or no previous body — use newline
+					try fs.content_buf.append(allocator, '\n');
+				}
 			}
 			try fs.content_buf.appendSlice(allocator, span.text);
+			prev_y = span.y_position;
+			prev_page = span.page;
+			prev_font_size = span.font_size;
+			has_prev_body = true;
 		}
 	}
 
@@ -915,7 +1413,7 @@ test "content stream TJ operator — array text extraction" {
 		spans.deinit(testing.allocator);
 	}
 
-	try parseContentStream(testing.allocator, stream, &spans, 0);
+	try parseContentStream(testing.allocator, stream, &spans, 0, null);
 
 	try testing.expect(spans.items.len > 0);
 	// The concatenated text should be "Hello World"
@@ -946,6 +1444,135 @@ test "multiple heading levels by font size" {
 	const child = doc.sections[0].children[0];
 	try testing.expectEqualStrings("Section Heading", child.heading.?);
 	try testing.expectEqual(@as(u8, 2), child.level);
+}
+
+test "TJ array — large kerning inserts space between words" {
+	// In PDF, TJ array numbers are in thousandths of a text space unit.
+	// Large negative values (> ~200) indicate a word boundary.
+	const stream = "BT\n/F1 12 Tf\n[(Hello) -600 (World)] TJ\nET\n";
+	var spans = std.ArrayList(TextSpan){};
+	defer {
+		for (spans.items) |s| testing.allocator.free(s.text);
+		spans.deinit(testing.allocator);
+	}
+
+	try parseContentStream(testing.allocator, stream, &spans, 0, null);
+
+	try testing.expect(spans.items.len > 0);
+	// Large negative kerning (-600) should produce a space between "Hello" and "World"
+	try testing.expectEqualStrings("Hello World", spans.items[0].text);
+}
+
+test "same-line spans get space separator, not newline" {
+	// When two Tj operations have the same Y position, they should be
+	// joined with a space, not a newline.
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "The", .font_size = 12, .y_pos = 700 },
+			.{ .text = "dominant", .font_size = 12, .y_pos = 700 },
+			.{ .text = "sequence", .font_size = 12, .y_pos = 700 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/spacing.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	// Should have space-separated text, not newline-separated
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	try testing.expect(content.len > 0);
+	// Must contain "The dominant sequence" with spaces
+	try testing.expect(std.mem.indexOf(u8, content, "The dominant sequence") != null);
+}
+
+test "different-line spans get newline separator" {
+	// When spans have different Y positions (different lines), they should be
+	// joined with a newline.
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "Line one", .font_size = 12, .y_pos = 700 },
+			.{ .text = "Line two", .font_size = 12, .y_pos = 680 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/newlines.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// Should contain a newline between lines, not a space
+	try testing.expect(std.mem.indexOf(u8, content, "Line one\nLine two") != null);
+}
+
+test "CMap parsing — bfchar and bfrange sections" {
+	const cmap_data =
+		"/CIDInit /ProcSet findresource begin\n" ++
+		"12 dict begin\n" ++
+		"begincmap\n" ++
+		"/CMapType 2 def\n" ++
+		"1 begincodespacerange\n" ++
+		"<00> <FF>\n" ++
+		"endcodespacerange\n" ++
+		"3 beginbfchar\n" ++
+		"<01> <0042>\n" ++
+		"<02> <0069>\n" ++
+		"<03> <0074>\n" ++
+		"endbfchar\n" ++
+		"1 beginbfrange\n" ++
+		"<04> <06> <0063>\n" ++
+		"endbfrange\n" ++
+		"endcmap\n";
+
+	var cmap = parseCMap(testing.allocator, cmap_data);
+	defer cmap.deinit();
+
+	// bfchar mappings: 0x01 -> 'B', 0x02 -> 'i', 0x03 -> 't'
+	try testing.expect(cmap.lookup(0x01) != null);
+	try testing.expectEqualStrings("B", cmap.lookup(0x01).?);
+	try testing.expect(cmap.lookup(0x02) != null);
+	try testing.expectEqualStrings("i", cmap.lookup(0x02).?);
+	try testing.expect(cmap.lookup(0x03) != null);
+	try testing.expectEqualStrings("t", cmap.lookup(0x03).?);
+
+	// bfrange mapping: 0x04 -> 'c' (U+0063), 0x05 -> 'd', 0x06 -> 'e'
+	try testing.expectEqual(@as(?u21, 0x0063), cmap.lookupCodepoint(0x04));
+	try testing.expectEqual(@as(?u21, 0x0064), cmap.lookupCodepoint(0x05));
+	try testing.expectEqual(@as(?u21, 0x0065), cmap.lookupCodepoint(0x06));
+}
+
+test "hex string text extraction with CMap" {
+	// Simulate hex-encoded glyph IDs with a CMap
+	var cmap = CMap.init(testing.allocator);
+	defer cmap.deinit();
+
+	// Map glyph 0x01 -> "B", 0x02 -> "i", 0x03 -> "t"
+	try cmap.char_map.put(0x01, try testing.allocator.dupe(u8, "B"));
+	try cmap.char_map.put(0x02, try testing.allocator.dupe(u8, "i"));
+	try cmap.char_map.put(0x03, try testing.allocator.dupe(u8, "t"));
+
+	const data = "<010203>";
+	var pos: usize = 0;
+	const result = try extractHexStringText(testing.allocator, data, &pos, &cmap);
+	defer testing.allocator.free(result);
+
+	try testing.expectEqualStrings("Bit", result);
+}
+
+test "TJ array with hex strings decoded via CMap" {
+	var cmap = CMap.init(testing.allocator);
+	defer cmap.deinit();
+
+	try cmap.char_map.put(0x01, try testing.allocator.dupe(u8, "H"));
+	try cmap.char_map.put(0x02, try testing.allocator.dupe(u8, "i"));
+
+	const data = "[<01> -10 <02>]";
+	var pos: usize = 0;
+	const result = try extractTJArray(testing.allocator, data, &pos, &cmap);
+	defer testing.allocator.free(result);
+
+	try testing.expectEqualStrings("Hi", result);
 }
 
 test "invalid PDF returns empty document" {
