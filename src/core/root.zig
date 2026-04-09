@@ -17,3 +17,4 @@ pub const xml = @import("xml.zig");
 pub const zip = @import("zip.zig");
 pub const pdf_objects = @import("pdf_objects.zig");
 pub const ole2 = @import("ole2.zig");
+pub const ignore = @import("ignore.zig");

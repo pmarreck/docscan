@@ -1,0 +1,52 @@
+# Version control
+.git/
+.jj/
+
+# Dependencies
+node_modules/
+__pycache__/
+.venv/
+vendor/
+
+# Build artifacts
+zig-out/
+zig-cache/
+target/
+build/
+dist/
+
+# Binary/image files
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.svg
+*.mp3
+*.mp4
+*.wav
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# docscan's own index
+.docscan/

@@ -20,4 +20,5 @@ test {
 	_ = @import("core/chunker.zig");
 	_ = @import("core/storage.zig");
 	_ = @import("core/search.zig");
+	_ = @import("core/ignore.zig");
 }
