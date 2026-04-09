@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [yolo]
+  pull_request:
+    branches: [yolo]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build
+        run: nix build
+
+      - name: Unit tests
+        run: nix flake check
+
+  cli-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build binary
+        run: |
+          nix build
+          mkdir -p zig-out/bin
+          cp result/bin/docscan zig-out/bin/docscan
+
+      - name: CLI tests
+        run: nix develop -c bash tests/cli/test-cli
+
+      - name: MCP tests
+        run: nix develop -c bash tests/mcp/test-mcp

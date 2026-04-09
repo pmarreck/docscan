@@ -9,7 +9,14 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$ROOT_DIR/zig-out/bin/docscan"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-integ-XXXXXX")"
 
-source "$HOME/dotfiles/bin/src/capture.bash"
+# Source capture.bash — local copy for CI, fallback to dotfiles
+if [ -f "$SCRIPT_DIR/../lib/capture.bash" ]; then
+	source "$SCRIPT_DIR/../lib/capture.bash"
+elif [ -f "$HOME/dotfiles/bin/src/capture.bash" ]; then
+	source "$HOME/dotfiles/bin/src/capture.bash"
+else
+	echo "capture.bash not found" >&2; exit 1
+fi
 
 errors=0
 tests=0
