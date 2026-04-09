@@ -14,7 +14,7 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] Task 8: Storage Layer — SQLite + sqlite-vec + FTS5
 - [ ] Task 9: Search Engine — hybrid vector + BM25 with RRF fusion
 - [ ] Task 10: C FFI Boundary — full C API with opaque handles
-- [ ] Task 11: C CLI — all commands, flags, progress, i18n groundwork
+- [x] Task 11: C CLI — all commands, flags, progress, i18n groundwork (2026-04-09 ~11:10 EST)
 - [ ] Task 12: MCP Server — JSON-RPC 2.0 over stdio
 - [ ] Task 13: CLI Tests — Bash black-box tests
 - [ ] Task 14: MCP Tests — JSON-RPC stdin/stdout tests

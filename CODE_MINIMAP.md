@@ -24,7 +24,15 @@
 
 ## CLI — `cli/`
 
-- **`cli/main.c`** — C CLI entry point. Prints version via FFI. Emits DEBUG BUILD warning when compiled without NDEBUG.
+- **`cli/main.c`** — Full C CLI entry point (~1050 lines). Dogfoods the C FFI for all operations. Includes:
+  - **SHA-256** — Minimal FIPS 180-4 implementation for file change detection hashing.
+  - **HTTP client** — POSIX socket-based HTTP POST for Ollama embedding API (`/api/embed`). Non-blocking connect with timeout.
+  - **JSON extraction** — Minimal parsers for Ollama embedding responses and chunk text extraction.
+  - **Directory walker** — Recursive `opendir`/`readdir` with format filtering (.md, .docx, .pdf, .doc) and noise directory skipping.
+  - **Progress bar** — Terminal-aware progress with rate/ETA display on stderr.
+  - **Commands**: `index <path>`, `update [path]`, `search <query>`, `status`, `config [key] [value]`, `mcp-serve` (stub).
+  - **Flags**: `--help`, `--about`, `--json`, `--limit`, `--exact`, `--similar`, `--model`, `--db`, `--no-color`, `--no-progress`, `--simple`, `--lang`.
+  - **Environment**: `DOCSCAN_MODEL`, `DOCSCAN_DB`, `DOCSCAN_LANG`.
 
 ## Scripts
 
