@@ -7,32 +7,83 @@
  * reporting, and output formatting.
  */
 
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
 
-/* POSIX */
-#include <unistd.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/utsname.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <fcntl.h>
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #include <io.h>
+  #include <direct.h>
+  #pragma comment(lib, "ws2_32.lib")
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  typedef int socklen_t;
+  #ifndef __MINGW32__
+  typedef int ssize_t;
+  #endif
+  #define close(s) closesocket(s)
+  #define isatty(fd) _isatty(fd)
+  #ifndef STDOUT_FILENO
+  #define STDOUT_FILENO 1
+  #endif
+  #ifndef STDERR_FILENO
+  #define STDERR_FILENO 2
+  #endif
+  #define strcasecmp  _stricmp
+  #define strncasecmp _strnicmp
+  #define getcwd      _getcwd
+  #define mkdir(p, m) _mkdir(p)
+  #ifndef S_ISDIR
+  #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
+  #endif
+  #ifndef S_ISREG
+  #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
+  #endif
+  static int g_wsa_init = 0;
+  static void ensure_wsa(void) {
+    if (!g_wsa_init) { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); g_wsa_init = 1; }
+  }
+#else
+  #include <unistd.h>
+  #include <dirent.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #include <sys/select.h>
+  #include <sys/socket.h>
+  #include <sys/utsname.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <netdb.h>
+  #include <fcntl.h>
+  #include <strings.h>
+  static void ensure_wsa(void) {}
+#endif
 
 #include "docscan_core.h"
+
+/* Cross-platform absolute path check */
+static int is_absolute_path(const char* p) {
+#ifdef _WIN32
+	/* C:\ or C:/ or \\ UNC */
+	if (p[0] && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) return 1;
+	if (p[0] == '\\' && p[1] == '\\') return 1;
+	return 0;
+#else
+	return (p[0] == '/');
+#endif
+}
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
@@ -330,6 +381,7 @@ static char* http_post(const char* host, int port, const char* path_url,
                         const char* body, size_t body_len, size_t* out_len,
                         const char* auth_header)
 {
+	ensure_wsa();
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) return NULL;
 
@@ -339,19 +391,32 @@ static char* http_post(const char* host, int port, const char* path_url,
 	addr.sin_port = htons((uint16_t)port);
 
 	if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-		/* Try DNS resolution */
-		struct hostent* he = gethostbyname(host);
-		if (!he) { close(sockfd); return NULL; }
-		memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+		/* DNS resolution via getaddrinfo (portable across musl/glibc/Windows) */
+		struct addrinfo hints, *res;
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) { close(sockfd); return NULL; }
+		memcpy(&addr.sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(addr.sin_addr));
+		freeaddrinfo(res);
 	}
 
 	/* Set a connect timeout via non-blocking + select */
 	{
+#ifdef _WIN32
+		unsigned long nonblock = 1;
+		ioctlsocket(sockfd, FIONBIO, &nonblock);
+#else
 		int flags = fcntl(sockfd, F_GETFL, 0);
 		fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+#endif
 
 		int rc = connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
+#ifdef _WIN32
+		if (rc < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+#else
 		if (rc < 0 && errno != EINPROGRESS) {
+#endif
 			close(sockfd);
 			return NULL;
 		}
@@ -369,14 +434,23 @@ static char* http_post(const char* host, int port, const char* path_url,
 		/* Check for connect error */
 		int err = 0;
 		socklen_t elen = sizeof(err);
+#ifdef _WIN32
+		getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
+#else
 		getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &elen);
+#endif
 		if (err != 0) {
 			close(sockfd);
 			return NULL;
 		}
 
 		/* Back to blocking for read/write */
+#ifdef _WIN32
+		nonblock = 0;
+		ioctlsocket(sockfd, FIONBIO, &nonblock);
+#else
 		fcntl(sockfd, F_SETFL, flags);
+#endif
 	}
 
 	/* Build HTTP request */
@@ -404,10 +478,18 @@ static char* http_post(const char* host, int port, const char* path_url,
 	}
 
 	/* Send header + body */
+#ifdef _WIN32
+	if (send(sockfd, header, hlen, 0) != hlen) { close(sockfd); return NULL; }
+#else
 	if (write(sockfd, header, (size_t)hlen) != hlen) { close(sockfd); return NULL; }
+#endif
 	size_t sent = 0;
 	while (sent < body_len) {
+#ifdef _WIN32
+		ssize_t n = send(sockfd, body + sent, (int)(body_len - sent), 0);
+#else
 		ssize_t n = write(sockfd, body + sent, body_len - sent);
+#endif
 		if (n <= 0) { close(sockfd); return NULL; }
 		sent += (size_t)n;
 	}
@@ -417,7 +499,11 @@ static char* http_post(const char* host, int port, const char* path_url,
 	if (!resp) { close(sockfd); return NULL; }
 	size_t total = 0;
 	for (;;) {
+#ifdef _WIN32
+		ssize_t n = recv(sockfd, resp + total, (int)(HTTP_BUF_SIZE - total - 1), 0);
+#else
 		ssize_t n = read(sockfd, resp + total, HTTP_BUF_SIZE - total - 1);
+#endif
 		if (n <= 0) break;
 		total += (size_t)n;
 		if (total >= HTTP_BUF_SIZE - 1) break;
@@ -764,6 +850,7 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 
 /* Check if the embedding server is reachable by connecting to its port. */
 static int embedding_server_available(void) {
+	ensure_wsa();
 	char host[256];
 	int port;
 	parse_url(g_embedding_url, host, sizeof(host), &port);
@@ -777,19 +864,31 @@ static int embedding_server_available(void) {
 	addr.sin_port = htons((uint16_t)port);
 
 	if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-		/* Try DNS resolution */
-		struct hostent* he = gethostbyname(host);
-		if (!he) { close(sockfd); return 0; }
-		memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+		struct addrinfo hints, *res;
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) { close(sockfd); return 0; }
+		memcpy(&addr.sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(addr.sin_addr));
+		freeaddrinfo(res);
 	}
 
 	/* Non-blocking connect with short timeout */
+#ifdef _WIN32
+	unsigned long nonblock = 1;
+	ioctlsocket(sockfd, FIONBIO, &nonblock);
+#else
 	int flags = fcntl(sockfd, F_GETFL, 0);
 	fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+#endif
 
 	int rc = connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 	if (rc == 0) { close(sockfd); return 1; }
+#ifdef _WIN32
+	if (WSAGetLastError() != WSAEWOULDBLOCK) { close(sockfd); return 0; }
+#else
 	if (errno != EINPROGRESS) { close(sockfd); return 0; }
+#endif
 
 	fd_set wfds;
 	FD_ZERO(&wfds);
@@ -800,7 +899,11 @@ static int embedding_server_available(void) {
 
 	int err = 0;
 	socklen_t elen = sizeof(err);
+#ifdef _WIN32
+	getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
+#else
 	getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &elen);
+#endif
 	close(sockfd);
 	return (err == 0);
 }
@@ -837,6 +940,39 @@ static void file_list_free(file_list* fl) {
 
 /* Recursively collect supported files from a directory. */
 static void walk_dir(const char* dir_path, file_list* fl) {
+#ifdef _WIN32
+	char search_path[MAX_PATH_LEN];
+	snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+
+	WIN32_FIND_DATAA fdata;
+	HANDLE hFind = FindFirstFileA(search_path, &fdata);
+	if (hFind == INVALID_HANDLE_VALUE) return;
+
+	do {
+		const char* name = fdata.cFileName;
+		/* Skip hidden files and . / .. */
+		if (name[0] == '.') continue;
+
+		char full_path[MAX_PATH_LEN];
+		snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, name);
+
+		if (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			/* Skip common noise directories */
+			if (strcmp(name, "node_modules") == 0) continue;
+			if (strcmp(name, "__pycache__") == 0) continue;
+			if (strcmp(name, ".git") == 0) continue;
+			if (strcmp(name, ".jj") == 0) continue;
+			if (strcmp(name, "zig-cache") == 0) continue;
+			if (strcmp(name, "zig-out") == 0) continue;
+			walk_dir(full_path, fl);
+		} else {
+			if (format_for_ext(full_path) != NULL) {
+				file_list_add(fl, full_path);
+			}
+		}
+	} while (FindNextFileA(hFind, &fdata));
+	FindClose(hFind);
+#else
 	DIR* d = opendir(dir_path);
 	if (!d) return;
 
@@ -867,6 +1003,7 @@ static void walk_dir(const char* dir_path, file_list* fl) {
 		}
 	}
 	closedir(d);
+#endif
 }
 
 /* Collect files: if path is a directory, walk it; if a file, add it directly. */
@@ -975,8 +1112,12 @@ static char* resolve_db_path(const char* explicit_db, const char* target_path) {
 	/* If target_path is a file, use its directory */
 	struct stat st;
 	if (stat(target_path, &st) == 0 && S_ISREG(st.st_mode)) {
-		/* Find last / */
+		/* Find last path separator */
 		const char* slash = strrchr(target_path, '/');
+#ifdef _WIN32
+		const char* bslash = strrchr(target_path, '\\');
+		if (!slash || (bslash && bslash > slash)) slash = bslash;
+#endif
 		if (slash) {
 			size_t dlen = (size_t)(slash - target_path);
 			memcpy(dir, target_path, dlen);
@@ -1058,13 +1199,22 @@ static void print_help(void) {
 }
 
 static void print_about(void) {
-	struct utsname uname_buf;
 	const char* os = "unknown";
 	const char* arch = "unknown";
+#ifdef _WIN32
+	os = "windows";
+	#if defined(_M_AMD64) || defined(__x86_64__)
+	arch = "x86_64";
+	#elif defined(_M_ARM64) || defined(__aarch64__)
+	arch = "aarch64";
+	#endif
+#else
+	struct utsname uname_buf;
 	if (uname(&uname_buf) == 0) {
 		os = uname_buf.sysname;
 		arch = uname_buf.machine;
 	}
+#endif
 	/* Normalize: "Darwin" -> "darwin", "x86_64" stays, "arm64" stays */
 	char os_lower[64];
 	for (int i = 0; i < 63 && os[i]; i++) {
@@ -1446,7 +1596,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 	/* Resolve to absolute path */
 	char abs_path[MAX_PATH_LEN];
-	if (target_path[0] != '/') {
+	if (!is_absolute_path(target_path)) {
 		char cwd[MAX_PATH_LEN];
 		if (getcwd(cwd, sizeof(cwd))) {
 			snprintf(abs_path, sizeof(abs_path), "%s/%s", cwd, target_path);
@@ -1459,7 +1609,8 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 	/* Remove trailing slash */
 	size_t plen = strlen(abs_path);
-	if (plen > 1 && abs_path[plen - 1] == '/') abs_path[plen - 1] = '\0';
+	if (plen > 1 && (abs_path[plen - 1] == '/' || abs_path[plen - 1] == '\\'))
+		abs_path[plen - 1] = '\0';
 
 	/* Collect files */
 	file_list fl;
@@ -2096,7 +2247,7 @@ static void mcp_handle_index(docscan_db* db, const char* model,
 
 	/* Resolve to absolute path */
 	char abs_path[MAX_PATH_LEN];
-	if (path[0] != '/') {
+	if (!is_absolute_path(path)) {
 		char cwd[MAX_PATH_LEN];
 		if (getcwd(cwd, sizeof(cwd))) {
 			snprintf(abs_path, sizeof(abs_path), "%s/%s", cwd, path);

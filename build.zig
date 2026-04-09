@@ -65,6 +65,10 @@ pub fn build(b: *std.Build) void {
 	exe.linkLibrary(sqlite3_lib);
 	exe.linkLibrary(vec_static_lib);
 	exe.linkLibC();
+	// Link Windows socket library for networking code
+	if (target.result.os.tag == .windows) {
+		exe.linkSystemLibrary("ws2_32");
+	}
 	b.installArtifact(exe);
 
 	// Unit tests — core modules (direct file imports for test discovery)
