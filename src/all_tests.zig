@@ -14,4 +14,5 @@ test {
 	_ = @import("core/parser_doc.zig");
 	_ = @import("core/chunker.zig");
 	_ = @import("core/storage.zig");
+	_ = @import("core/search.zig");
 }

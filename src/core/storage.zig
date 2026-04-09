@@ -388,6 +388,39 @@ pub fn getDocumentByPath(db: *Db, allocator: std.mem.Allocator, path: []const u8
 	return SqliteError.SqliteError;
 }
 
+/// Retrieve a document by its rowid. Caller owns the record's strings.
+pub fn getDocumentById(db: *Db, allocator: std.mem.Allocator, doc_id: i64) !?DocumentRecord {
+	const stmt = try prepareSql(db.handle,
+		"SELECT id, path, format, title, content_hash, metadata, indexed_at FROM documents WHERE id = ?1;",
+	);
+	defer finalize(stmt);
+	try bindInt64(stmt, 1, doc_id);
+	const rc = c.sqlite3_step(stmt);
+	if (rc == c.SQLITE_ROW) {
+		const rec_path = try columnTextRequired(allocator, stmt, 1);
+		errdefer allocator.free(rec_path);
+		const rec_format = try columnTextRequired(allocator, stmt, 2);
+		errdefer allocator.free(rec_format);
+		const rec_title = try columnText(allocator, stmt, 3);
+		errdefer if (rec_title) |t| allocator.free(t);
+		const rec_hash = try columnTextRequired(allocator, stmt, 4);
+		errdefer allocator.free(rec_hash);
+		const rec_meta = try columnText(allocator, stmt, 5);
+
+		return DocumentRecord{
+			.id = c.sqlite3_column_int64(stmt, 0),
+			.path = rec_path,
+			.format = rec_format,
+			.title = rec_title,
+			.content_hash = rec_hash,
+			.metadata = rec_meta,
+			.indexed_at = c.sqlite3_column_int64(stmt, 6),
+		};
+	}
+	if (rc == c.SQLITE_DONE) return null;
+	return SqliteError.SqliteError;
+}
+
 /// Remove a document by ID (chunks must be removed separately first).
 pub fn removeDocument(db: *Db, doc_id: i64) !void {
 	const stmt = try prepareSql(db.handle, "DELETE FROM documents WHERE id = ?1;");
