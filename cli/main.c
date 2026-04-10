@@ -1080,14 +1080,14 @@ static void progress_update(progress_t* p, int current, const char* filename) {
 		fprintf(stderr, " %s%s%s", color(ANSI_DIM), base, color(ANSI_RESET));
 	}
 
-	/* Pad with spaces to clear previous longer line */
-	fprintf(stderr, "   ");
+	/* Clear to end of line (ANSI escape) to remove previous longer text */
+	fprintf(stderr, "\033[K");
 	fflush(stderr);
 }
 
 static void progress_finish(progress_t* p) {
 	if (!g_show_progress || !p->is_tty) return;
-	fprintf(stderr, "\r");
+	fprintf(stderr, "\r\033[K");
 	/* Clear the line */
 	for (int i = 0; i < 100; i++) fputc(' ', stderr);
 	fprintf(stderr, "\r");
