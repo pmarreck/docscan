@@ -364,10 +364,12 @@ static const char* format_for_ext(const char* path) {
 	if (!dot) return NULL;
 	dot++;
 	if (strcasecmp(dot, "md") == 0 || strcasecmp(dot, "markdown") == 0) return "md";
+	if (strcasecmp(dot, "txt") == 0 || strcasecmp(dot, "text") == 0) return "txt";
 	if (strcasecmp(dot, "docx") == 0) return "docx";
 	if (strcasecmp(dot, "pdf") == 0) return "pdf";
 	if (strcasecmp(dot, "doc") == 0) return "doc";
 	if (strcasecmp(dot, "rtf") == 0) return "rtf";
+	if (strcasecmp(dot, "epub") == 0) return "epub";
 	return NULL;
 }
 

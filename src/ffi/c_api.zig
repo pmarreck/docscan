@@ -299,6 +299,10 @@ fn getParser(format: []const u8) ?struct { parse: ParseFn, free: FreeFn } {
 	if (std.mem.eql(u8, format, "md") or std.mem.eql(u8, format, "markdown")) {
 		return .{ .parse = &parser_md.parse, .free = &parser_md.freeDocument };
 	}
+	if (std.mem.eql(u8, format, "txt") or std.mem.eql(u8, format, "text")) {
+		// Plain text uses the markdown parser (same logic, just no headings expected)
+		return .{ .parse = &parser_md.parse, .free = &parser_md.freeDocument };
+	}
 	if (std.mem.eql(u8, format, "docx")) {
 		return .{ .parse = &parser_docx.parse, .free = &parser_docx.freeDocument };
 	}
@@ -310,6 +314,10 @@ fn getParser(format: []const u8) ?struct { parse: ParseFn, free: FreeFn } {
 	}
 	if (std.mem.eql(u8, format, "rtf")) {
 		return .{ .parse = &parser_rtf.parse, .free = &parser_rtf.freeDocument };
+	}
+	if (std.mem.eql(u8, format, "epub")) {
+		// TODO: EPUB parser not yet implemented — placeholder
+		return null;
 	}
 	return null;
 }

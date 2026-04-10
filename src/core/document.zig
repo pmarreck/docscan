@@ -8,19 +8,23 @@ const std = @import("std");
 /// Supported document formats for parsing and indexing.
 pub const Format = enum {
 	md,
+	txt,
 	docx,
 	pdf,
 	doc,
 	rtf,
+	epub,
 
 	/// Return the file extension string (without dot) for this format.
 	pub fn extension(self: Format) []const u8 {
 		return switch (self) {
 			.md => "md",
+			.txt => "txt",
 			.docx => "docx",
 			.pdf => "pdf",
 			.doc => "doc",
 			.rtf => "rtf",
+			.epub => "epub",
 		};
 	}
 
@@ -28,10 +32,12 @@ pub const Format = enum {
 	pub fn fromExtension(ext: []const u8) ?Format {
 		const lower = ext;
 		if (std.mem.eql(u8, lower, "md") or std.mem.eql(u8, lower, "markdown")) return .md;
+		if (std.mem.eql(u8, lower, "txt") or std.mem.eql(u8, lower, "text")) return .txt;
 		if (std.mem.eql(u8, lower, "docx")) return .docx;
 		if (std.mem.eql(u8, lower, "pdf")) return .pdf;
 		if (std.mem.eql(u8, lower, "doc")) return .doc;
 		if (std.mem.eql(u8, lower, "rtf")) return .rtf;
+		if (std.mem.eql(u8, lower, "epub")) return .epub;
 		return null;
 	}
 };
@@ -98,10 +104,12 @@ pub const SearchResult = struct {
 test "Format.extension round-trips" {
 	const cases = [_]struct { fmt: Format, ext: []const u8 }{
 		.{ .fmt = .md, .ext = "md" },
+		.{ .fmt = .txt, .ext = "txt" },
 		.{ .fmt = .docx, .ext = "docx" },
 		.{ .fmt = .pdf, .ext = "pdf" },
 		.{ .fmt = .doc, .ext = "doc" },
 		.{ .fmt = .rtf, .ext = "rtf" },
+		.{ .fmt = .epub, .ext = "epub" },
 	};
 	for (cases) |c| {
 		try std.testing.expectEqualStrings(c.ext, c.fmt.extension());
@@ -110,8 +118,8 @@ test "Format.extension round-trips" {
 }
 
 test "Format.fromExtension returns null for unknown" {
-	try std.testing.expectEqual(null, Format.fromExtension("txt"));
 	try std.testing.expectEqual(null, Format.fromExtension("xlsx"));
+	try std.testing.expectEqual(null, Format.fromExtension("csv"));
 	try std.testing.expectEqual(null, Format.fromExtension(""));
 }
 
