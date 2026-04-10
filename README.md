@@ -65,7 +65,14 @@ Settings are saved to `.docscan/config.ini` on first index, so subsequent comman
 
 Environment variables: `DOCSCAN_MODEL`, `DOCSCAN_EMBEDDING_API`, `DOCSCAN_EMBEDDING_URL`, `DOCSCAN_EMBEDDING_API_KEY`, `DOCSCAN_DB`
 
-Override precedence: CLI flags > env vars > `.docscan/config.ini` > defaults
+Override precedence: CLI flags > env vars > `.docscan/config.ini` > global `~/.config/docscan/config.ini` > defaults
+
+To see the effective configuration with the source of each value:
+
+```bash
+docscan config debug
+docscan config debug --json  # machine-readable
+```
 
 ## MCP server
 

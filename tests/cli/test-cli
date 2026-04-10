@@ -391,6 +391,67 @@ fi
 rm -rf "$CFG_TEST_DIR" "$CFG_TEST_DIR2"
 
 # ──────────────────────────────────────────────
+# 26. config debug shows sections and source annotations
+# ──────────────────────────────────────────────
+CFG_DEBUG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cfgdbg-XXXXXX")"
+echo "# Debug test" > "$CFG_DEBUG_DIR/doc.md"
+out="" ; err="" ; rc=""
+capture "$BINARY" index "$CFG_DEBUG_DIR" --embedding-api openai --embedding-url http://localhost:8000 --model bge-m3-mlx
+if [ "$rc" -eq 0 ]; then
+	out="" ; err="" ; rc=""
+	capture "$BINARY" config debug --db "$CFG_DEBUG_DIR/.docscan/index.db" --no-color
+	if [ "$rc" -eq 0 ] && \
+	   echo "$out" | grep -q "\[embedding\]" && \
+	   echo "$out" | grep -q "\[search\]" && \
+	   echo "$out" | grep -q "\[index\]" && \
+	   echo "$out" | grep -q "(project:" && \
+	   echo "$out" | grep -q "(default)"; then
+		pass "config debug shows sections and source annotations"
+	else
+		fail "config debug shows sections and source annotations" "rc=$rc, out='$out'"
+	fi
+else
+	fail "config debug shows sections and source annotations" "index failed rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
+# 27. config debug --json produces valid JSON with value+source keys
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" config debug --json --db "$CFG_DEBUG_DIR/.docscan/index.db"
+if [ "$rc" -eq 0 ] && echo "$out" | jq . > /dev/null 2>&1; then
+	has_value=$(echo "$out" | jq 'to_entries[0].value | has("value")')
+	has_source=$(echo "$out" | jq 'to_entries[0].value | has("source")')
+	if [ "$has_value" = "true" ] && [ "$has_source" = "true" ]; then
+		pass "config debug --json produces valid JSON with value+source"
+	else
+		fail "config debug --json produces valid JSON with value+source" "missing value/source keys"
+	fi
+else
+	fail "config debug --json produces valid JSON with value+source" "rc=$rc, not valid JSON: '$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 28. config debug masks api_key
+# ──────────────────────────────────────────────
+# Set an api_key first
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$CFG_DEBUG_DIR/.docscan/index.db" embedding.api_key "sk-test1234567890abcdef"
+if [ "$rc" -eq 0 ]; then
+	out="" ; err="" ; rc=""
+	capture "$BINARY" config debug --db "$CFG_DEBUG_DIR/.docscan/index.db" --no-color
+	if [ "$rc" -eq 0 ] && echo "$out" | grep -q "sk-test1\*\*\*"; then
+		pass "config debug masks api_key (first 8 chars + ***)"
+	else
+		fail "config debug masks api_key" "rc=$rc, out='$out'"
+	fi
+else
+	fail "config debug masks api_key" "config set failed rc=$rc"
+fi
+
+rm -rf "$CFG_DEBUG_DIR"
+
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 echo ""

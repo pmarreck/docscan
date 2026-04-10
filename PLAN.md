@@ -39,9 +39,10 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] Windows directory walking (currently POSIX-only)
 - [ ] i18n translations (groundwork laid: --lang, DOCSCAN_LANG)
 - [ ] Legal embedding model research/fine-tuning
+- [x] `docscan config debug` subcommand — shows effective config with sources (2026-04-08 EST)
 
 ## Stats
 
-- ~12,700 lines across 18 source files
-- ~191 automated tests (159 Zig unit + 18 CLI + 14 MCP)
+- ~12,800 lines across 18 source files
+- ~201 automated tests (159 Zig unit + 28 CLI + 14 MCP)
 - 4 format parsers (md, docx, pdf, doc)

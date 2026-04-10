@@ -45,13 +45,13 @@ All pure computation — no I/O.
   - Recursive directory walker with format filtering
   - Terminal-aware progress bar
   - MCP server (JSON-RPC 2.0 over stdio, 7 tools)
-  - Commands: index, update, search, status, config, mcp-serve
+  - Commands: index, update, search, status, config, config debug, mcp-serve
   - Flags: --help, --about, --json, --limit, --exact, --similar, --model, --db, --no-color, --no-progress, --simple, --lang
 
 ## Tests
 
 - **`src/all_tests.zig`** — Aggregated Zig unit tests (~153 tests across all modules)
-- **`tests/cli/test-cli`** (288 lines) — 18 Bash black-box CLI tests
+- **`tests/cli/test-cli`** — 28 Bash black-box CLI tests
 - **`tests/mcp/test-mcp`** (316 lines) — 14 Bash MCP protocol tests
 - **`tests/integration/`** — Placeholder for Ollama-dependent tests
 - **`tests/unit/`** — Test fixture directory

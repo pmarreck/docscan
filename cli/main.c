@@ -1208,6 +1208,31 @@ typedef struct {
 	int max_chunk_tokens;
 } DocscanConfig;
 
+/* Parallel struct tracking where each config value came from */
+typedef struct {
+	char api[128];
+	char url[128];
+	char model[128];
+	char api_key[128];
+	char dim[128];
+	char limit[128];
+	char weight_vector[128];
+	char weight_lexical[128];
+	char max_chunk_tokens[128];
+} ConfigSources;
+
+static void config_sources_defaults(ConfigSources* src) {
+	snprintf(src->api, sizeof(src->api), "default");
+	snprintf(src->url, sizeof(src->url), "default");
+	snprintf(src->model, sizeof(src->model), "default");
+	snprintf(src->api_key, sizeof(src->api_key), "default");
+	snprintf(src->dim, sizeof(src->dim), "default");
+	snprintf(src->limit, sizeof(src->limit), "default");
+	snprintf(src->weight_vector, sizeof(src->weight_vector), "default");
+	snprintf(src->weight_lexical, sizeof(src->weight_lexical), "default");
+	snprintf(src->max_chunk_tokens, sizeof(src->max_chunk_tokens), "default");
+}
+
 /* Initialize config with defaults */
 static void config_defaults(DocscanConfig* cfg) {
 	snprintf(cfg->embedding_api, sizeof(cfg->embedding_api), "ollama");
@@ -1344,6 +1369,37 @@ static int load_config(const char* config_path, DocscanConfig* cfg) {
 	}
 
 	fclose(f);
+	return 0;
+}
+
+/* Load config from INI file, tracking which fields were set and their source.
+ * source_label should be e.g. "global: ~/.config/docscan/config.ini"
+ * or "project: /path/.docscan/config.ini". */
+static int load_config_tracked(const char* config_path, DocscanConfig* cfg,
+                               ConfigSources* src, const char* source_label) {
+	DocscanConfig before = *cfg;
+	int rc = load_config(config_path, cfg);
+	if (rc != 0) return rc;
+
+	/* Compare each field — if it changed, record the source */
+	if (strcmp(cfg->embedding_api, before.embedding_api) != 0)
+		snprintf(src->api, sizeof(src->api), "%s", source_label);
+	if (strcmp(cfg->embedding_url, before.embedding_url) != 0)
+		snprintf(src->url, sizeof(src->url), "%s", source_label);
+	if (strcmp(cfg->embedding_model, before.embedding_model) != 0)
+		snprintf(src->model, sizeof(src->model), "%s", source_label);
+	if (strcmp(cfg->embedding_api_key, before.embedding_api_key) != 0)
+		snprintf(src->api_key, sizeof(src->api_key), "%s", source_label);
+	if (cfg->embedding_dim != before.embedding_dim)
+		snprintf(src->dim, sizeof(src->dim), "%s", source_label);
+	if (cfg->search_limit != before.search_limit)
+		snprintf(src->limit, sizeof(src->limit), "%s", source_label);
+	if (cfg->weight_vector != before.weight_vector)
+		snprintf(src->weight_vector, sizeof(src->weight_vector), "%s", source_label);
+	if (cfg->weight_lexical != before.weight_lexical)
+		snprintf(src->weight_lexical, sizeof(src->weight_lexical), "%s", source_label);
+	if (cfg->max_chunk_tokens != before.max_chunk_tokens)
+		snprintf(src->max_chunk_tokens, sizeof(src->max_chunk_tokens), "%s", source_label);
 	return 0;
 }
 
@@ -1563,6 +1619,7 @@ static void print_help(void) {
 		"  search <query>        Search indexed documents\n"
 		"  status                Show index statistics\n"
 		"  config [key] [value]  Get/set configuration\n"
+		"  config debug          Show effective config with sources\n"
 		"  mcp-serve             Start MCP server (stdio)\n"
 		"\n"
 		"%sFLAGS%s\n"
@@ -1736,6 +1793,114 @@ static int cmd_config(const char* db_path_arg, const char* key, const char* valu
 		err_msg("could not determine config path");
 		free(db_path);
 		return 1;
+	}
+
+	if (key != NULL && strcmp(key, "debug") == 0) {
+		/* ── config debug: show effective values with sources ── */
+		DocscanConfig cfg;
+		config_defaults(&cfg);
+		ConfigSources src;
+		config_sources_defaults(&src);
+
+		/* Layer 1: global config */
+		char global_cfg[MAX_PATH_LEN];
+		const char* xdg = getenv("XDG_CONFIG_HOME");
+		if (xdg && xdg[0]) {
+			snprintf(global_cfg, sizeof(global_cfg), "%s/docscan/config.ini", xdg);
+		} else {
+			const char* home = getenv("HOME");
+			if (home)
+				snprintf(global_cfg, sizeof(global_cfg), "%s/.config/docscan/config.ini", home);
+			else
+				global_cfg[0] = '\0';
+		}
+		if (global_cfg[0]) {
+			char global_label[MAX_PATH_LEN];
+			snprintf(global_label, sizeof(global_label), "global: %s", global_cfg);
+			load_config_tracked(global_cfg, &cfg, &src, global_label);
+		}
+
+		/* Layer 2: project config */
+		{
+			char project_label[MAX_PATH_LEN];
+			snprintf(project_label, sizeof(project_label), "project: %s", cfg_path);
+			load_config_tracked(cfg_path, &cfg, &src, project_label);
+		}
+
+		/* Layer 3: environment variables */
+		{
+			const char* env_api = getenv("DOCSCAN_EMBEDDING_API");
+			if (env_api && env_api[0]) {
+				snprintf(cfg.embedding_api, sizeof(cfg.embedding_api), "%s", env_api);
+				snprintf(src.api, sizeof(src.api), "env: DOCSCAN_EMBEDDING_API");
+			}
+			const char* env_url = getenv("DOCSCAN_EMBEDDING_URL");
+			if (env_url && env_url[0]) {
+				snprintf(cfg.embedding_url, sizeof(cfg.embedding_url), "%s", env_url);
+				snprintf(src.url, sizeof(src.url), "env: DOCSCAN_EMBEDDING_URL");
+			}
+			const char* env_model = getenv("DOCSCAN_MODEL");
+			if (env_model && env_model[0]) {
+				snprintf(cfg.embedding_model, sizeof(cfg.embedding_model), "%s", env_model);
+				snprintf(src.model, sizeof(src.model), "env: DOCSCAN_MODEL");
+			}
+			const char* env_key = getenv("DOCSCAN_EMBEDDING_API_KEY");
+			if (env_key && env_key[0]) {
+				snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key), "%s", env_key);
+				snprintf(src.api_key, sizeof(src.api_key), "env: DOCSCAN_EMBEDDING_API_KEY");
+			}
+		}
+
+		/* Note: CLI flag sources are not tracked here because cmd_config
+		 * doesn't receive CLI flags — those override the globals before
+		 * dispatch. In the future, a more comprehensive approach could
+		 * thread cli_set_* flags through, but for now this covers the
+		 * config file and env var layers. */
+
+		/* Mask api_key: show first 8 chars + *** */
+		char masked_key[520];
+		if (cfg.embedding_api_key[0]) {
+			size_t klen = strlen(cfg.embedding_api_key);
+			if (klen > 8) {
+				snprintf(masked_key, sizeof(masked_key), "%.8s***", cfg.embedding_api_key);
+			} else {
+				snprintf(masked_key, sizeof(masked_key), "%s", cfg.embedding_api_key);
+			}
+		} else {
+			snprintf(masked_key, sizeof(masked_key), "(not set)");
+		}
+
+		if (g_json_output) {
+			printf("{\n");
+			printf("  \"embedding.api\":{\"value\":\"%s\",\"source\":\"%s\"},\n", cfg.embedding_api, src.api);
+			printf("  \"embedding.url\":{\"value\":\"%s\",\"source\":\"%s\"},\n", cfg.embedding_url, src.url);
+			printf("  \"embedding.model\":{\"value\":\"%s\",\"source\":\"%s\"},\n", cfg.embedding_model, src.model);
+			printf("  \"embedding.api_key\":{\"value\":\"%s\",\"source\":\"%s\"},\n", masked_key, src.api_key);
+			printf("  \"embedding.dim\":{\"value\":%d,\"source\":\"%s\"},\n", cfg.embedding_dim, src.dim);
+			printf("  \"search.limit\":{\"value\":%d,\"source\":\"%s\"},\n", cfg.search_limit, src.limit);
+			printf("  \"search.weight_vector\":{\"value\":%.1f,\"source\":\"%s\"},\n", (double)cfg.weight_vector, src.weight_vector);
+			printf("  \"search.weight_lexical\":{\"value\":%.1f,\"source\":\"%s\"},\n", (double)cfg.weight_lexical, src.weight_lexical);
+			printf("  \"index.max_chunk_tokens\":{\"value\":%d,\"source\":\"%s\"}\n", cfg.max_chunk_tokens, src.max_chunk_tokens);
+			printf("}\n");
+		} else {
+			printf("Configuration debug — showing effective values with sources\n\n");
+			printf("%s[embedding]%s\n", color(ANSI_BOLD), color(ANSI_RESET));
+			printf("  %sapi%s      = %-20s (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_api, src.api);
+			printf("  %surl%s      = %-20s (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_url, src.url);
+			printf("  %smodel%s    = %-20s (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_model, src.model);
+			printf("  %sapi_key%s  = %-20s (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), masked_key, src.api_key);
+			printf("  %sdim%s      = %-20d (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.embedding_dim, src.dim);
+			printf("\n%s[search]%s\n", color(ANSI_BOLD), color(ANSI_RESET));
+			printf("  %slimit%s    = %-20d (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.search_limit, src.limit);
+			printf("  %sweight_vector%s = %-14.1f (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), (double)cfg.weight_vector, src.weight_vector);
+			printf("  %sweight_lexical%s = %-13.1f (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), (double)cfg.weight_lexical, src.weight_lexical);
+			printf("\n%s[index]%s\n", color(ANSI_BOLD), color(ANSI_RESET));
+			printf("  %smax_chunk_tokens%s = %-10d (%s)\n", color(ANSI_CYAN), color(ANSI_RESET), cfg.max_chunk_tokens, src.max_chunk_tokens);
+		}
+
+		free(cfg_path);
+		free(db_path);
+		return 0;
 	}
 
 	if (key == NULL) {
