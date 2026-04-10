@@ -90,10 +90,10 @@ pub const PdfContext = struct {
 
 		if (entry.compressed) {
 			// Object is inside an object stream
-			return self.getCompressedObject(@intCast(entry.offset), entry.gen);
+			return self.getCompressedObject(std.math.cast(u32, entry.offset) orelse return PdfError.InvalidPdf, entry.gen);
 		}
 
-		const offset: usize = @intCast(entry.offset);
+		const offset: usize = std.math.cast(usize, entry.offset) orelse return PdfError.InvalidPdf;
 		if (offset >= self.data.len) return PdfError.InvalidPdf;
 
 		// Skip "N G obj" header
@@ -117,7 +117,7 @@ pub const PdfContext = struct {
 		const objstm_entry = self.xref.get(obj_stream_num) orelse return null;
 		if (!objstm_entry.in_use or objstm_entry.compressed) return null;
 
-		const stm_offset: usize = @intCast(objstm_entry.offset);
+		const stm_offset: usize = std.math.cast(usize, objstm_entry.offset) orelse return null;
 		const obj_body_start = findObjBody(self.data, stm_offset) orelse return null;
 		var dict_pos = obj_body_start;
 		const dict_val = parsePdfValue(self.allocator, self.data, &dict_pos) catch return null;
@@ -128,14 +128,14 @@ pub const PdfContext = struct {
 		const first_offset = getDictInt(dict_val.dict, "First") orelse return null;
 
 		if (index >= n_objects) return null;
-		const first: usize = @intCast(first_offset);
+		const first: usize = std.math.cast(usize, first_offset) orelse return null;
 
 		// Parse the header: N pairs of (obj_num offset) in the stream data
 		var header_pos: usize = 0;
 		var target_offset: ?usize = null;
 
 		var i: usize = 0;
-		const n: usize = @intCast(n_objects);
+		const n: usize = std.math.cast(usize, n_objects) orelse return null;
 		while (i < n) : (i += 1) {
 			// Skip whitespace
 			while (header_pos < stream_data.len and
@@ -192,7 +192,7 @@ pub const PdfContext = struct {
 		// Compressed objects don't have their own streams
 		if (entry.compressed) return null;
 
-		const offset: usize = @intCast(entry.offset);
+		const offset: usize = std.math.cast(usize, entry.offset) orelse return PdfError.InvalidPdf;
 		if (offset >= self.data.len) return PdfError.InvalidPdf;
 
 		const obj_body_start = findObjBody(self.data, offset) orelse return PdfError.MalformedObject;
@@ -216,7 +216,7 @@ pub const PdfContext = struct {
 			return try decompressStream(self.allocator, self.data[stream_start .. stream_start + end_pos], dict_val.dict);
 		};
 
-		const len: usize = @intCast(length);
+		const len: usize = std.math.cast(usize, length) orelse return PdfError.InvalidPdf;
 		if (stream_start + len > self.data.len) return PdfError.InvalidPdf;
 		const stream_data = self.data[stream_start .. stream_start + len];
 
@@ -288,7 +288,7 @@ pub fn findStartxref(data: []const u8) ?u64 {
 /// Parse an xref section at the given offset — dispatches to traditional
 /// xref table or xref stream (PDF 1.5+) depending on what's found.
 fn parseXrefSection(ctx: *PdfContext, offset: u64) PdfError!void {
-	const off: usize = @intCast(offset);
+	const off: usize = std.math.cast(usize, offset) orelse return PdfError.InvalidPdf;
 	if (off + 4 > ctx.data.len) return PdfError.InvalidPdf;
 
 	// Check for "xref" keyword (traditional table)
@@ -321,7 +321,7 @@ fn parseXrefSection(ctx: *PdfContext, offset: u64) PdfError!void {
 					freePdfValue(ctx.allocator, dict_val);
 				}
 				if (prev_offset) |prev_off| {
-					const prev: u64 = @intCast(prev_off);
+					const prev: u64 = std.math.cast(u64, prev_off) orelse return PdfError.InvalidPdf;
 					parseXrefSection(ctx, prev) catch {};
 				}
 			} else {
@@ -390,7 +390,7 @@ fn parseXrefSection(ctx: *PdfContext, offset: u64) PdfError!void {
 			const obj_num: u32 = first_obj + i;
 			ctx.xref.put(obj_num, XrefEntry{
 				.offset = entry_offset,
-				.gen = @intCast(gen),
+				.gen = std.math.cast(u16, gen) orelse return PdfError.InvalidPdf,
 				.in_use = in_use,
 			}) catch return PdfError.OutOfMemory;
 		}
@@ -424,7 +424,10 @@ fn parseXrefStream(ctx: *PdfContext, offset: usize) PdfError!void {
 		freePdfValue(ctx.allocator, dict_val);
 		return PdfError.MalformedObject;
 	};
-	const size: u32 = @intCast(size_val);
+	const size: u32 = std.math.cast(u32, size_val) orelse {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.InvalidPdf;
+	};
 
 	// /W array: field widths [w1 w2 w3]
 	const w_array = getDictArray(dict_val.dict, "W") orelse {
@@ -442,7 +445,10 @@ fn parseXrefStream(ctx: *PdfContext, offset: usize) PdfError!void {
 			freePdfValue(ctx.allocator, dict_val);
 			return PdfError.MalformedObject;
 		}
-		w[i] = @intCast(wv.integer);
+		w[i] = std.math.cast(u8, wv.integer) orelse {
+			freePdfValue(ctx.allocator, dict_val);
+			return PdfError.InvalidPdf;
+		};
 	}
 	const entry_size: usize = @as(usize, w[0]) + @as(usize, w[1]) + @as(usize, w[2]);
 
@@ -472,7 +478,10 @@ fn parseXrefStream(ctx: *PdfContext, offset: usize) PdfError!void {
 		return PdfError.MalformedObject;
 	};
 
-	const slen: usize = @intCast(stream_length);
+	const slen: usize = std.math.cast(usize, stream_length) orelse {
+		freePdfValue(ctx.allocator, dict_val);
+		return PdfError.InvalidPdf;
+	};
 	if (stream_start + slen > ctx.data.len) {
 		freePdfValue(ctx.allocator, dict_val);
 		return PdfError.InvalidPdf;
@@ -491,11 +500,11 @@ fn parseXrefStream(ctx: *PdfContext, offset: usize) PdfError!void {
 	var data_offset: usize = 0;
 	while (pair_idx + 1 < index_pairs.len) {
 		const first_obj: u32 = if (index_pairs[pair_idx] == .integer)
-			@intCast(index_pairs[pair_idx].integer)
+			std.math.cast(u32, index_pairs[pair_idx].integer) orelse break
 		else
 			break;
 		const count: u32 = if (index_pairs[pair_idx + 1] == .integer)
-			@intCast(index_pairs[pair_idx + 1].integer)
+			std.math.cast(u32, index_pairs[pair_idx + 1].integer) orelse break
 		else
 			break;
 
@@ -551,7 +560,7 @@ fn parseXrefStream(ctx: *PdfContext, offset: usize) PdfError!void {
 
 	// Check for /Prev (incremental updates)
 	if (getDictInt(dict_val.dict, "Prev")) |prev_offset| {
-		const prev_off: u64 = @intCast(prev_offset);
+		const prev_off: u64 = std.math.cast(u64, prev_offset) orelse return PdfError.InvalidPdf;
 		parseXrefSection(ctx, prev_off) catch {};
 	}
 
@@ -962,7 +971,7 @@ fn parseNumberOrRef(allocator: Allocator, data: []const u8, pos: *usize) PdfErro
 				// It's a reference!
 				_ = allocator;
 				pos.* = p + 1;
-				return PdfValue{ .reference = ObjRef{ .obj = @intCast(int_part), .gen = gen } };
+				return PdfValue{ .reference = ObjRef{ .obj = std.math.cast(u32, int_part) orelse return PdfError.InvalidPdf, .gen = gen } };
 			}
 		}
 	}
@@ -996,7 +1005,7 @@ fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const
 			if (predictor >= 10) {
 				// PNG predictor (10-14): needs un-prediction
 				const columns_val = getDictInt(parms, "Columns") orelse 1;
-				const columns: usize = @intCast(columns_val);
+				const columns: usize = std.math.cast(usize, columns_val) orelse return PdfError.InvalidPdf;
 				const result = applyPngUnpredict(allocator, decompressed, columns) catch {
 					allocator.free(decompressed);
 					return PdfError.DecompressionFailed;
