@@ -814,8 +814,9 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 		for (const char* s = texts[i]; *s; s++) {
 			if ((size_t)off >= body_cap - 16) {
 				body_cap *= 2;
-				body = realloc(body, body_cap);
-				if (!body) return NULL;
+				char* new_body = realloc(body, body_cap);
+				if (!new_body) { free(body); return NULL; }
+				body = new_body;
 			}
 			switch (*s) {
 				case '"':  body[off++] = '\\'; body[off++] = '"'; break;
