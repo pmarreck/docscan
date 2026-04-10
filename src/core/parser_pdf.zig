@@ -342,7 +342,7 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 }
 
 /// Recursively collect text spans from a page tree node (Pages or Page).
-fn collectPageSpans(allocator: Allocator, ctx: *PdfContext, obj_num: u32, spans: *std.ArrayList(TextSpan), page_counter: u32) PdfError!void {
+fn collectPageSpans(allocator: Allocator, ctx: *PdfContext, obj_num: u64, spans: *std.ArrayList(TextSpan), page_counter: u32) PdfError!void {
 	const obj = (ctx.getObject(obj_num) catch return) orelse return;
 	defer pdf_objects.freePdfValue(allocator, obj);
 
