@@ -68,9 +68,11 @@
   #include <netdb.h>
   #include <fcntl.h>
   #include <strings.h>
+  #include <pthread.h>
   static void ensure_wsa(void) {}
 #endif
 
+#include <stdatomic.h>
 #include "docscan_core.h"
 
 /* Cross-platform absolute path check */
@@ -100,7 +102,8 @@ static int is_absolute_path(const char* p) {
 #define MAX_CHUNKS_PER_FILE   4096
 #define SHA256_DIGEST_LEN     32
 #define SHA256_HEX_LEN        64
-
+#define DEFAULT_THREADS       4
+#define MAX_THREADS           32
 /* ── Embedding API dialect ─────────────────────────────────────────── */
 
 typedef enum {
@@ -118,7 +121,7 @@ static int g_use_color  = 1;
 static int g_use_simple = 0;
 static int g_show_progress = 1;
 static int g_json_output = 0;
-
+static int g_num_threads = DEFAULT_THREADS;
 #define ANSI_RESET   "\033[0m"
 #define ANSI_BOLD    "\033[1m"
 #define ANSI_DIM     "\033[2m"
@@ -1657,6 +1660,7 @@ static void print_help(void) {
 		"  --no-progress         Disable progress bar\n"
 		"  --simple              Plain output (no color, no emoji)\n"
 		"  --lang <code>         Language override\n"
+		"  --threads N           Number of indexing threads (default: 4)\n"
 		"\n"
 		"%sENVIRONMENT%s\n"
 		"  DOCSCAN_MODEL              Default embedding model\n"
@@ -1665,7 +1669,7 @@ static void print_help(void) {
 		"  DOCSCAN_EMBEDDING_URL      Embedding server URL\n"
 		"  DOCSCAN_EMBEDDING_API_KEY  API key for OpenAI-compatible servers\n"
 		"  DOCSCAN_LANG               Language override\n"
-		"\n"
+		"  DOCSCAN_THREADS            Number of indexing threads (default: 4)\n"		"\n"
 		"%sCONFIG FILE%s\n"
 		"  Settings are saved in .docscan/config.ini (created on first index).\n"
 		"  Use dot notation: docscan config embedding.api openai\n"
@@ -2252,8 +2256,162 @@ static int cmd_search(const char* db_path_arg, const char* query,
 	return 0;
 }
 
-/* ── Command: index / update ────────────────────────────────────────── */
+/* ── Parallel indexing infrastructure ──────────────────────────────── */
 
+/*
+ * Per-file result structure for parallel indexing.
+ * Workers fill in: file_data, file_len, hash_hex, embeddings, num_chunks, error.
+ * The main thread uses these to insert into SQLite sequentially.
+ */
+typedef struct {
+	const char*  path;
+	const char*  fmt;
+	uint8_t*     file_data;
+	size_t       file_len;
+	char         hash_hex[SHA256_HEX_LEN + 1];
+	float*       embeddings;
+	uint32_t     num_chunks;
+	int          needs_index; /* 1=process, 0=skip (no format or read error) */
+	int          error;       /* non-zero = failed */
+	char         error_msg[256];
+} IndexResult;
+
+/*
+ * Shared context for worker threads.
+ * Workers atomically grab the next file index, then do I/O-heavy work
+ * (read, hash, parse/chunk, embed). FFI calls and SQLite writes are
+ * serialized via ffi_mutex.
+ */
+typedef struct {
+	/* Input */
+	char**          file_paths;
+	int             file_count;
+	atomic_int      next_file;    /* shared counter — workers grab next atomically */
+	const char*     model;
+	int             have_embedder;
+	docscan_db*     db;           /* database handle for inserts */
+
+	/* Output — pre-allocated array, one slot per file */
+	IndexResult*    results;
+
+	/* Progress */
+	atomic_int      completed;
+
+	/* Synchronization */
+#ifndef _WIN32
+	pthread_mutex_t ffi_mutex;    /* protects docscan_chunk (Zig GPA not thread-safe) */
+#endif
+} IndexWorkerCtx;
+
+#ifndef _WIN32
+static void* index_worker(void* arg) {
+	IndexWorkerCtx* ctx = (IndexWorkerCtx*)arg;
+	char err_buf[ERR_BUF_LEN];
+
+	while (1) {
+		int idx = atomic_fetch_add(&ctx->next_file, 1);
+		if (idx >= ctx->file_count) break;
+
+		IndexResult* r = &ctx->results[idx];
+		r->path = ctx->file_paths[idx];
+		r->error_msg[0] = '\0';
+
+		/* Check format */
+		r->fmt = format_for_ext(r->path);
+		if (!r->fmt) {
+			r->needs_index = 0;
+			atomic_fetch_add(&ctx->completed, 1);
+			continue;
+		}
+
+		/* Read file — thread-safe (independent file handles) */
+		r->file_len = 0;
+		r->file_data = read_file(r->path, &r->file_len);
+		if (!r->file_data) {
+			r->error = 1;
+			r->needs_index = 0;
+			atomic_fetch_add(&ctx->completed, 1);
+			continue;
+		}
+
+		/* Compute hash — thread-safe (stack-local state) */
+		sha256_hex(r->file_data, r->file_len, r->hash_hex);
+
+		/* Check reindex (SQLite read — mutex-protected) */
+		pthread_mutex_lock(&ctx->ffi_mutex);
+		int needs = docscan_needs_reindex(ctx->db, r->path, r->hash_hex);
+		pthread_mutex_unlock(&ctx->ffi_mutex);
+
+		if (needs == 0) {
+			free(r->file_data);
+			r->file_data = NULL;
+			r->needs_index = 0;
+			atomic_fetch_add(&ctx->completed, 1);
+			continue;
+		}
+
+		/* Full pipeline: parse + chunk + embed + insert */
+		float* embeddings = NULL;
+		uint32_t num_chunks = 0;
+
+		if (ctx->have_embedder) {
+			pthread_mutex_lock(&ctx->ffi_mutex);
+			char* chunks_json = docscan_chunk(r->file_data, r->file_len,
+			                                   r->path, r->fmt,
+			                                   DEFAULT_MAX_TOKENS,
+			                                   err_buf, sizeof(err_buf));
+			pthread_mutex_unlock(&ctx->ffi_mutex);
+
+			if (chunks_json) {
+				num_chunks = (uint32_t)count_json_array_objects(chunks_json);
+
+				if (num_chunks > 0) {
+					int text_count = 0;
+					char** texts = extract_chunk_texts(chunks_json, &text_count);
+					if (texts && text_count > 0) {
+						/* embed_texts() is thread-safe — independent sockets */
+						int dim = 0;
+						embeddings = embed_texts(ctx->model, texts,
+						                          text_count, &dim);
+						if (embeddings) num_chunks = (uint32_t)text_count;
+					}
+					if (texts) {
+						for (int t = 0; t < text_count; t++) free(texts[t]);
+						free(texts);
+					}
+				}
+				docscan_free(chunks_json);
+			}
+		}
+
+		/* Remove old + insert new (SQLite write — mutex-protected) */
+		pthread_mutex_lock(&ctx->ffi_mutex);
+		docscan_remove_document(ctx->db, r->path, err_buf, sizeof(err_buf));
+		int rc = docscan_index_file(ctx->db, r->file_data, r->file_len,
+		                             r->path, r->fmt, r->hash_hex,
+		                             embeddings, num_chunks,
+		                             DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
+		pthread_mutex_unlock(&ctx->ffi_mutex);
+
+		/* Free immediately — bounded memory per worker */
+		free(r->file_data);
+		r->file_data = NULL;
+		free(embeddings);
+
+		if (rc == 0) {
+			r->needs_index = 1;
+		} else {
+			r->error = 1;
+			snprintf(r->error_msg, sizeof(r->error_msg), "%s", err_buf);
+		}
+
+		atomic_fetch_add(&ctx->completed, 1);
+	}
+	return NULL;
+}
+#endif /* !_WIN32 */
+
+/* ── Command: index / update ────────────────────────────────────────── */
 static int cmd_index(const char* db_path_arg, const char* target_path,
                       const char* model, int update_only)
 {
@@ -2408,88 +2566,186 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 	int indexed = 0, skipped = 0, errors = 0;
 
-	for (int i = 0; i < fl.count; i++) {
-		progress_update(&prog, i, fl.paths[i]);
+#ifndef _WIN32
+	if (g_num_threads > 1) {
+		/*
+		 * ── Multi-threaded path ──
+		 *
+		 * Workers do: read file, hash, parse/chunk (mutex), embed (parallel).
+		 * Main thread then: check reindex (SQLite), insert (SQLite).
+		 *
+		 * The embedding HTTP calls are the bottleneck (500ms-5s each) and
+		 * run fully in parallel. FFI calls (parse/chunk) are fast (<10ms)
+		 * but serialized via ffi_mutex because Zig's GPA isn't thread-safe.
+		 */
+		int nthreads = g_num_threads;
+		if (nthreads > fl.count) nthreads = fl.count;
 
-		const char* fpath = fl.paths[i];
-		const char* fmt = format_for_ext(fpath);
-		if (!fmt) { skipped++; continue; }
+		info_msg("Indexing with %d threads", nthreads);
 
-		/* Read file */
-		size_t file_len = 0;
-		uint8_t* file_data = read_file(fpath, &file_len);
-		if (!file_data) {
-			warn_msg("could not read: %s", fpath);
-			errors++;
-			continue;
+		/* Allocate results array */
+		IndexResult* results = calloc((size_t)fl.count, sizeof(IndexResult));
+		if (!results) {
+			err_msg("out of memory allocating result array");
+			docscan_close(db);
+			free(db_path);
+			file_list_free(&fl);
+			return 1;
 		}
 
-		/* Compute hash */
-		char hash_hex[SHA256_HEX_LEN + 1];
-		sha256_hex(file_data, file_len, hash_hex);
+		/* Set up shared context */
+		IndexWorkerCtx ctx;
+		ctx.file_paths = fl.paths;
+		ctx.file_count = fl.count;
+		atomic_init(&ctx.next_file, 0);
+		ctx.model = model;
+		ctx.have_embedder = have_embedder;
+		ctx.db = db;
+		ctx.results = results;
+		atomic_init(&ctx.completed, 0);
+		pthread_mutex_init(&ctx.ffi_mutex, NULL);
 
-		/* Check if reindex needed */
-		int needs = docscan_needs_reindex(db, fpath, hash_hex);
-		if (needs == 0) {
-			/* Up to date */
-			free(file_data);
-			skipped++;
-			continue;
+		/* Spawn worker threads */
+		pthread_t* threads = malloc(sizeof(pthread_t) * (size_t)nthreads);
+		if (!threads) {
+			err_msg("out of memory allocating thread array");
+			free(results);
+			docscan_close(db);
+			free(db_path);
+			file_list_free(&fl);
+			return 1;
 		}
-		if (needs < 0) {
-			warn_msg("error checking reindex status for %s", fpath);
-			free(file_data);
-			errors++;
-			continue;
-		}
 
-		/* If update_only mode and document doesn't need reindex, skip.
-		 * (Already handled above — needs_reindex == 0 means skip.) */
-
-		/* Remove old document if it exists (for re-indexing) */
-		docscan_remove_document(db, fpath, err_buf, sizeof(err_buf));
-
-		/* Get chunk count by calling docscan_chunk */
-		float* embeddings = NULL;
-		uint32_t num_chunks = 0;
-
-		if (have_embedder) {
-			char* chunks_json = docscan_chunk(file_data, file_len, fpath, fmt,
-			                                   DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
-			if (chunks_json) {
-				/* Count chunks and extract text for embedding */
-				num_chunks = (uint32_t)count_json_array_objects(chunks_json);
-
-				if (num_chunks > 0) {
-					int text_count = 0;
-					char** texts = extract_chunk_texts(chunks_json, &text_count);
-					if (texts && text_count > 0) {
-						int dim = 0;
-						embeddings = embed_texts(model, texts, text_count, &dim);
-						if (embeddings) {
-							num_chunks = (uint32_t)text_count;
-						}
-						/* Free texts */
-						for (int t = 0; t < text_count; t++) free(texts[t]);
-						free(texts);
-					}
-				}
-				docscan_free(chunks_json);
+		for (int t = 0; t < nthreads; t++) {
+			int rc = pthread_create(&threads[t], NULL, index_worker, &ctx);
+			if (rc != 0) {
+				err_msg("failed to create thread %d: %s", t, strerror(rc));
+				/* Reduce thread count to what we actually created */
+				nthreads = t;
+				break;
 			}
 		}
 
-		/* Index the file */
-		int rc = docscan_index_file(db, file_data, file_len, fpath, fmt,
-		                             hash_hex, embeddings, num_chunks,
-		                             DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
-		free(file_data);
-		free(embeddings);
+		/* Progress updates while workers run */
+		while (atomic_load(&ctx.completed) < fl.count) {
+			int done = atomic_load(&ctx.completed);
+			/* Find a path to show (approximate — pick the done'th file) */
+			const char* show_path = (done < fl.count) ? fl.paths[done] : NULL;
+			progress_update(&prog, done, show_path);
 
-		if (rc == 0) {
-			indexed++;
-		} else {
-			warn_msg("failed to index %s: %s", fpath, err_buf);
-			errors++;
+			/* Brief sleep to avoid busy-spinning (1ms) */
+			struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+			nanosleep(&ts, NULL);
+		}
+
+		/* Wait for all workers to finish */
+		for (int t = 0; t < nthreads; t++) {
+			pthread_join(threads[t], NULL);
+		}
+		free(threads);
+		pthread_mutex_destroy(&ctx.ffi_mutex);
+
+		progress_update(&prog, fl.count, NULL);
+
+		/* ── Phase 2: Tally results (workers already did inserts) ── */
+		for (int i = 0; i < fl.count; i++) {
+			IndexResult* r = &results[i];
+			if (r->error) {
+				warn_msg("failed to index %s%s%s", r->path,
+					r->error_msg[0] ? ": " : "",
+					r->error_msg[0] ? r->error_msg : "");
+				errors++;
+			} else if (r->needs_index) {
+				indexed++;
+			} else {
+				skipped++;
+			}
+		}
+
+		free(results);
+
+	} else
+#endif /* !_WIN32 */
+	{
+		/* ── Single-threaded path (threads == 1 or Windows) ── */
+		for (int i = 0; i < fl.count; i++) {
+			progress_update(&prog, i, fl.paths[i]);
+
+			const char* fpath = fl.paths[i];
+			const char* fmt = format_for_ext(fpath);
+			if (!fmt) { skipped++; continue; }
+
+			/* Read file */
+			size_t file_len = 0;
+			uint8_t* file_data = read_file(fpath, &file_len);
+			if (!file_data) {
+				warn_msg("could not read: %s", fpath);
+				errors++;
+				continue;
+			}
+
+			/* Compute hash */
+			char hash_hex[SHA256_HEX_LEN + 1];
+			sha256_hex(file_data, file_len, hash_hex);
+
+			/* Check if reindex needed */
+			int needs = docscan_needs_reindex(db, fpath, hash_hex);
+			if (needs == 0) {
+				/* Up to date */
+				free(file_data);
+				skipped++;
+				continue;
+			}
+			if (needs < 0) {
+				warn_msg("error checking reindex status for %s", fpath);
+				free(file_data);
+				errors++;
+				continue;
+			}
+
+			/* Remove old document if it exists (for re-indexing) */
+			docscan_remove_document(db, fpath, err_buf, sizeof(err_buf));
+
+			/* Get chunk count by calling docscan_chunk */
+			float* embeddings = NULL;
+			uint32_t num_chunks = 0;
+
+			if (have_embedder) {
+				char* chunks_json = docscan_chunk(file_data, file_len, fpath, fmt,
+				                                   DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
+				if (chunks_json) {
+					num_chunks = (uint32_t)count_json_array_objects(chunks_json);
+
+					if (num_chunks > 0) {
+						int text_count = 0;
+						char** texts = extract_chunk_texts(chunks_json, &text_count);
+						if (texts && text_count > 0) {
+							int dim = 0;
+							embeddings = embed_texts(model, texts, text_count, &dim);
+							if (embeddings) {
+								num_chunks = (uint32_t)text_count;
+							}
+							for (int t = 0; t < text_count; t++) free(texts[t]);
+							free(texts);
+						}
+					}
+					docscan_free(chunks_json);
+				}
+			}
+
+			/* Index the file */
+			int rc = docscan_index_file(db, file_data, file_len, fpath, fmt,
+			                             hash_hex, embeddings, num_chunks,
+			                             DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
+			free(file_data);
+			free(embeddings);
+
+			if (rc == 0) {
+				indexed++;
+			} else {
+				warn_msg("failed to index %s: %s", fpath, err_buf);
+				errors++;
+			}
 		}
 	}
 
@@ -2527,6 +2783,9 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 			printf("\n");
 		}
 		printf("  Database: %s\n", db_path);
+		if (g_num_threads > 1) {
+			printf("  Threads: %d\n", g_num_threads);
+		}
 		if (!have_embedder) {
 			printf("  %sNote: no embeddings stored (embedding server was not running)%s\n",
 				color(ANSI_YELLOW), color(ANSI_RESET));
@@ -2537,7 +2796,6 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 	file_list_free(&fl);
 	return (errors > 0 && indexed == 0) ? 1 : 0;
 }
-
 /* ── Command: mcp-serve — JSON-RPC 2.0 / MCP over stdio ────────────── */
 
 /*
@@ -3374,7 +3632,12 @@ int main(int argc, char** argv) {
 			cli_set_key = 1;
 			continue;
 		}
-
+		if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+			g_num_threads = atoi(argv[++i]);
+			if (g_num_threads < 1) g_num_threads = 1;
+			if (g_num_threads > MAX_THREADS) g_num_threads = MAX_THREADS;
+			continue;
+		}
 		/* Command or positional arg */
 		if (argv[i][0] == '-') {
 			err_msg("unknown flag: %s", argv[i]);
@@ -3509,6 +3772,28 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	/* DOCSCAN_THREADS env var (CLI --threads flag overrides) */
+	{
+		const char* env_threads = getenv("DOCSCAN_THREADS");
+		if (env_threads && env_threads[0]) {
+			/* Only apply if --threads was not explicitly given on CLI.
+			 * We detect this by checking if g_num_threads is still DEFAULT_THREADS.
+			 * This is imperfect (user could explicitly pass --threads 4) but
+			 * matches the precedence convention: CLI > env > default. */
+			int env_t = atoi(env_threads);
+			if (env_t >= 1 && env_t <= MAX_THREADS) {
+				/* Check if --threads was NOT on the command line by rescanning argv.
+				 * This is more correct than guessing from the default value. */
+				int cli_set_threads = 0;
+				for (int i = 1; i < argc; i++) {
+					if (strcmp(argv[i], "--threads") == 0) { cli_set_threads = 1; break; }
+				}
+				if (!cli_set_threads) {
+					g_num_threads = env_t;
+				}
+			}
+		}
+	}
 	/* No command? */
 	if (!command) {
 		print_help();
