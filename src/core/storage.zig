@@ -498,13 +498,17 @@ pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 	try stepExpectDone(stmt);
 	const chunk_id = c.sqlite3_last_insert_rowid(db.handle);
 
-	// Insert into FTS5 index
+	// Insert into FTS5 index — cap text at 512KB to avoid overflowing
+	// SQLite/FTS5 internal 32-bit size fields on very large chunks
+	const max_fts_text: usize = 512 * 1024;
+	const fts_text = if (chunk.text.len > max_fts_text) chunk.text[0..max_fts_text] else chunk.text;
+
 	const fts_stmt = try prepareSql(db.handle,
 		"INSERT INTO chunks_fts (rowid, text, heading, section_path) VALUES (?1, ?2, ?3, ?4);",
 	);
 	defer finalize(fts_stmt);
 	try bindInt64(fts_stmt, 1, chunk_id);
-	try bindText(fts_stmt, 2, chunk.text);
+	try bindText(fts_stmt, 2, fts_text);
 	try bindOptionalText(fts_stmt, 3, chunk.heading);
 	try bindOptionalText(fts_stmt, 4, if (chunk.section_path.len > 0) chunk.section_path else null);
 	try stepExpectDone(fts_stmt);

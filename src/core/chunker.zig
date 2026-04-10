@@ -12,6 +12,9 @@ pub const ChunkOptions = struct {
 	max_chunk_tokens: usize = 1500,
 	min_chunk_tokens: usize = 100,
 	tokens_per_byte: f32 = 0.25, // rough approximation: 1 token ≈ 4 bytes
+	/// Hard byte limit per chunk. Chunks exceeding this are force-split to avoid
+	/// overflowing 32-bit size fields in SQLite/FTS5 internals.
+	max_chunk_bytes: usize = 256 * 1024, // 256 KB
 };
 
 /// Internal proto-chunk: pre-merge, pre-index representation.
@@ -85,6 +88,54 @@ fn splitOnSingleNewline(allocator: std.mem.Allocator, content: []const u8) ![]co
 	}
 
 	return try lines.toOwnedSlice(allocator);
+}
+
+/// Force-split content at max_chunk_bytes boundaries when no line boundaries exist.
+/// Tries to split at space boundaries to avoid breaking words.
+fn forceSplitByBytes(
+	allocator: std.mem.Allocator,
+	content: []const u8,
+	section_path: []const u8,
+	parent_path: []const u8,
+	heading: ?[]const u8,
+	heading_level: u8,
+	options: ChunkOptions,
+	out: *std.ArrayListUnmanaged(ProtoChunk),
+	page: ?u32,
+	source_line: ?u32,
+) !void {
+	var offset: usize = 0;
+	var is_first = true;
+	while (offset < content.len) {
+		var end = @min(offset + options.max_chunk_bytes, content.len);
+		// Try to break at a space to avoid splitting mid-word
+		if (end < content.len) {
+			var scan = end;
+			while (scan > offset + options.max_chunk_bytes / 2) : (scan -= 1) {
+				if (content[scan] == ' ' or content[scan] == '\t') {
+					end = scan;
+					break;
+				}
+			}
+		}
+		const sp = if (is_first) section_path else try allocator.dupe(u8, section_path);
+		const pp = try allocator.dupe(u8, parent_path);
+		try out.append(allocator, .{
+			.section_path = sp,
+			.heading = heading,
+			.text = content[offset..end],
+			.parent_path = pp,
+			.text_allocated = false,
+			.heading_level = heading_level,
+			.page = page,
+			.source_line = source_line,
+		});
+		offset = end;
+		// Skip the space we broke at
+		if (offset < content.len and (content[offset] == ' ' or content[offset] == '\t'))
+			offset += 1;
+		is_first = false;
+	}
 }
 
 fn splitParagraphs(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
@@ -194,19 +245,24 @@ fn emitContentChunks(
 		paragraphs = try splitOnSingleNewline(allocator, content);
 
 		if (paragraphs.len <= 1) {
-			// Can't split further — emit as-is
 			allocator.free(paragraphs);
-			const pp = try allocator.dupe(u8, parent_path);
-			try out.append(allocator, .{
-				.section_path = section_path,
-				.heading = heading,
-				.text = content,
-				.parent_path = pp,
-				.text_allocated = false,
-				.heading_level = heading_level,
-				.page = page,
-				.source_line = source_line,
-			});
+			// No line boundaries at all — force-split at max_chunk_bytes to avoid
+			// overflowing SQLite/FTS5 32-bit internal size fields.
+			if (content.len > options.max_chunk_bytes) {
+				try forceSplitByBytes(allocator, content, section_path, parent_path, heading, heading_level, options, out, page, source_line);
+			} else {
+				const pp = try allocator.dupe(u8, parent_path);
+				try out.append(allocator, .{
+					.section_path = section_path,
+					.heading = heading,
+					.text = content,
+					.parent_path = pp,
+					.text_allocated = false,
+					.heading_level = heading_level,
+					.page = page,
+					.source_line = source_line,
+				});
+			}
 			return;
 		}
 	}
