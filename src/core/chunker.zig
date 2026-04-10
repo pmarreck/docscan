@@ -108,13 +108,29 @@ fn forceSplitByBytes(
 	var is_first = true;
 	while (offset < content.len) {
 		var end = @min(offset + options.max_chunk_bytes, content.len);
-		// Try to break at a space to avoid splitting mid-word
+		// Try to break at a natural boundary (prefer sentence > word)
 		if (end < content.len) {
+			const min_scan = offset + options.max_chunk_bytes / 2;
+			// First pass: look for sentence-ending punctuation followed by space
+			var found = false;
 			var scan = end;
-			while (scan > offset + options.max_chunk_bytes / 2) : (scan -= 1) {
-				if (content[scan] == ' ' or content[scan] == '\t') {
+			while (scan > min_scan) : (scan -= 1) {
+				if ((content[scan - 1] == '.' or content[scan - 1] == '!' or content[scan - 1] == '?') and
+					(content[scan] == ' ' or content[scan] == '\t' or content[scan] == '\n'))
+				{
 					end = scan;
+					found = true;
 					break;
+				}
+			}
+			// Second pass: fall back to word boundary (space)
+			if (!found) {
+				scan = end;
+				while (scan > min_scan) : (scan -= 1) {
+					if (content[scan] == ' ' or content[scan] == '\t') {
+						end = scan;
+						break;
+					}
 				}
 			}
 		}
