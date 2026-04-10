@@ -80,6 +80,7 @@ pub const Chunk = struct {
 	start_byte: u64,
 	end_byte: u64,
 	chunk_index: u32,
+	heading_level: u8 = 0, // 0 = body, 1 = top-level heading, 2 = sub, etc.
 	page: ?u32 = null, // page number (1-based, PDF)
 	source_line: ?u32 = null, // line number (1-based, markdown)
 };

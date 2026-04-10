@@ -27,6 +27,10 @@ pub const SearchOptions = struct {
 	weight_lexical: f32 = 0.3,
 	/// RRF smoothing constant (higher = less sensitivity to rank position).
 	rrf_k: f32 = 60.0,
+	/// Heading boost per level: higher-level headings get a score multiplier.
+	/// Level 1 (h1) gets boost = 1.0 + (6 - 1) * this value.
+	/// Level 0 (body text) and level 6+ get no boost (multiplier = 1.0).
+	heading_boost_per_level: f32 = 0.05,
 	/// If set, only include results from documents with this format (e.g., "pdf").
 	format_filter: ?[]const u8 = null,
 };
@@ -97,7 +101,7 @@ pub fn search(
 		}
 	}
 
-	// Compute fused RRF score for each candidate.
+	// Compute fused RRF score for each candidate, applying heading boost.
 	var candidates: std.ArrayListUnmanaged(ScoredCandidate) = .{};
 	defer candidates.deinit(allocator);
 
@@ -111,6 +115,13 @@ pub fn search(
 		}
 		if (scores.lexical_rank > 0) {
 			fused += options.weight_lexical / (options.rrf_k + @as(f32, @floatFromInt(scores.lexical_rank)));
+		}
+
+		// Apply heading-level boost: higher-level headings get a mild score multiplier.
+		if (options.heading_boost_per_level > 0.0) {
+			const heading_level = try storage.getChunkHeadingLevel(db, entry.key_ptr.*);
+			const boost = computeHeadingBoost(heading_level, options.heading_boost_per_level);
+			fused *= boost;
 		}
 
 		try candidates.append(allocator, .{
@@ -237,6 +248,15 @@ const ScoredCandidate = struct {
 const CachedDoc = struct {
 	record: storage.DocumentRecord,
 };
+
+/// Compute a heading-level boost multiplier.
+/// Level 1 (h1) gets the highest boost; level 0 (body) and level >= max_level get 1.0 (no boost).
+fn computeHeadingBoost(heading_level: i32, boost_per_level: f32) f32 {
+	const max_level: i32 = 6;
+	if (heading_level <= 0 or heading_level >= max_level) return 1.0;
+	const levels_above: f32 = @floatFromInt(max_level - heading_level);
+	return 1.0 + levels_above * boost_per_level;
+}
 
 fn freeResult(allocator: std.mem.Allocator, r: *document.SearchResult) void {
 	allocator.free(r.document_path);
@@ -517,4 +537,97 @@ test "result fields populated correctly" {
 	try testing.expect(r.score > 0.0);
 	try testing.expect(r.vector_score >= 0.0); // distance (lower = closer)
 	try testing.expect(r.lexical_score > 0.0); // BM25 rank (positive)
+}
+
+test "heading boost — h1 chunk scores higher than body chunk with equal base relevance" {
+	var db = try openTestDb();
+	defer storage.closeDb(&db);
+
+	// Two chunks with identical text and embeddings, differing only in heading_level.
+	const doc_id = try storage.insertDocument(&db, "/docs/boost.md", "md", "Boost Test", "hash_boost", null);
+
+	// Chunk A: body text (heading_level = 0)
+	const chunk_body = document.Chunk{
+		.document_path = "/docs/boost.md",
+		.section_path = "Section",
+		.heading = null,
+		.text = "quantum entanglement explanation",
+		.start_byte = 0,
+		.end_byte = 31,
+		.chunk_index = 0,
+		.heading_level = 0,
+	};
+	const body_id = try storage.insertChunk(&db, doc_id, chunk_body);
+	try storage.insertEmbedding(&db, body_id, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+
+	// Chunk B: h1 heading (heading_level = 1)
+	const chunk_h1 = document.Chunk{
+		.document_path = "/docs/boost.md",
+		.section_path = "Title",
+		.heading = "Quantum",
+		.text = "quantum entanglement explanation",
+		.start_byte = 31,
+		.end_byte = 62,
+		.chunk_index = 1,
+		.heading_level = 1,
+	};
+	const h1_id = try storage.insertChunk(&db, doc_id, chunk_h1);
+	try storage.insertEmbedding(&db, h1_id, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+
+	const query_emb = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+	const results = try search(testing.allocator, &db, "quantum", &query_emb, .{
+		.mode = .hybrid,
+		.heading_boost_per_level = 0.05,
+	});
+	defer freeResults(testing.allocator, results);
+
+	try testing.expect(results.len == 2);
+	// The h1 chunk should rank first due to heading boost
+	try testing.expectEqualStrings("Quantum", results[0].heading.?);
+	try testing.expect(results[0].score > results[1].score);
+}
+
+test "heading boost — boost_per_level=0 does not modify scores" {
+	var db = try openTestDb();
+	defer storage.closeDb(&db);
+
+	// Single chunk — verify score is unmodified when boost is disabled.
+	_ = try insertTestData(&db, "/docs/noboost.md", "md", "No Boost", "Sec", "Alpha", "alpha beta content", &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+
+	const query_emb = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+
+	// Compute RRF score with boost disabled
+	const results_off = try search(testing.allocator, &db, "alpha", &query_emb, .{
+		.mode = .hybrid,
+		.heading_boost_per_level = 0.0,
+	});
+	defer freeResults(testing.allocator, results_off);
+
+	// Compute RRF score with boost enabled (but heading_level=0 means boost=1.0)
+	const results_on = try search(testing.allocator, &db, "alpha", &query_emb, .{
+		.mode = .hybrid,
+		.heading_boost_per_level = 0.05,
+	});
+	defer freeResults(testing.allocator, results_on);
+
+	try testing.expect(results_off.len == 1);
+	try testing.expect(results_on.len == 1);
+	// heading_level=0 (body text) gets boost=1.0 regardless of boost_per_level,
+	// so both scores should be identical.
+	try testing.expectApproxEqAbs(results_off[0].score, results_on[0].score, 1e-6);
+}
+
+test "computeHeadingBoost — values" {
+	// Level 0 (body) gets no boost
+	try testing.expectApproxEqAbs(@as(f32, 1.0), computeHeadingBoost(0, 0.05), 1e-6);
+	// Level 1 (h1) gets max boost: 1.0 + (6-1)*0.05 = 1.25
+	try testing.expectApproxEqAbs(@as(f32, 1.25), computeHeadingBoost(1, 0.05), 1e-6);
+	// Level 2 (h2): 1.0 + (6-2)*0.05 = 1.20
+	try testing.expectApproxEqAbs(@as(f32, 1.20), computeHeadingBoost(2, 0.05), 1e-6);
+	// Level 5 (h5): 1.0 + (6-5)*0.05 = 1.05
+	try testing.expectApproxEqAbs(@as(f32, 1.05), computeHeadingBoost(5, 0.05), 1e-6);
+	// Level 6 (h6) gets no boost
+	try testing.expectApproxEqAbs(@as(f32, 1.0), computeHeadingBoost(6, 0.05), 1e-6);
+	// Negative level gets no boost
+	try testing.expectApproxEqAbs(@as(f32, 1.0), computeHeadingBoost(-1, 0.05), 1e-6);
 }

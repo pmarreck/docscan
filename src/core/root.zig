@@ -12,6 +12,7 @@ pub const parser_docx = @import("parser_docx.zig");
 pub const parser_pdf = @import("parser_pdf.zig");
 pub const parser_doc = @import("parser_doc.zig");
 pub const parser_rtf = @import("parser_rtf.zig");
+pub const parser_epub = @import("parser_epub.zig");
 
 // Internal sub-modules re-exported for test discovery
 pub const xml = @import("xml.zig");

@@ -54,6 +54,7 @@ pub const ChunkRecord = struct {
 	text: []const u8,
 	start_byte: i64,
 	end_byte: i64,
+	heading_level: i32 = 0,
 	page: ?u32 = null,
 	source_line: ?u32 = null,
 
@@ -228,6 +229,7 @@ pub fn openDb(allocator: std.mem.Allocator, path: [*:0]const u8, embedding_dim: 
 		\\    text TEXT NOT NULL,
 		\\    start_byte INTEGER NOT NULL,
 		\\    end_byte INTEGER NOT NULL,
+		\\    heading_level INTEGER DEFAULT 0,
 		\\    page INTEGER,
 		\\    source_line INTEGER
 		\\);
@@ -466,7 +468,7 @@ pub fn needsReindex(db: *Db, path: []const u8, content_hash: []const u8) !bool {
 /// Insert a chunk and return its rowid. Also inserts into FTS5 index.
 pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 	const stmt = try prepareSql(db.handle,
-		"INSERT INTO chunks (document_id, chunk_index, section_path, heading, text, start_byte, end_byte, page, source_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+		"INSERT INTO chunks (document_id, chunk_index, section_path, heading, text, start_byte, end_byte, heading_level, page, source_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
 	);
 	defer finalize(stmt);
 	try bindInt64(stmt, 1, doc_id);
@@ -476,8 +478,9 @@ pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 	try bindText(stmt, 5, chunk.text);
 	try bindInt64(stmt, 6, @intCast(chunk.start_byte));
 	try bindInt64(stmt, 7, @intCast(chunk.end_byte));
-	try bindOptionalInt32(stmt, 8, if (chunk.page) |p| @as(i32, @intCast(p)) else null);
-	try bindOptionalInt32(stmt, 9, if (chunk.source_line) |l| @as(i32, @intCast(l)) else null);
+	try bindInt32(stmt, 8, @intCast(chunk.heading_level));
+	try bindOptionalInt32(stmt, 9, if (chunk.page) |p| @as(i32, @intCast(p)) else null);
+	try bindOptionalInt32(stmt, 10, if (chunk.source_line) |l| @as(i32, @intCast(l)) else null);
 	try stepExpectDone(stmt);
 	const chunk_id = c.sqlite3_last_insert_rowid(db.handle);
 
@@ -498,7 +501,7 @@ pub fn insertChunk(db: *Db, doc_id: i64, chunk: document.Chunk) !i64 {
 /// Retrieve a chunk by its ID. Caller owns the record's strings.
 pub fn getChunk(db: *Db, allocator: std.mem.Allocator, chunk_id: i64) !?ChunkRecord {
 	const stmt = try prepareSql(db.handle,
-		"SELECT id, document_id, chunk_index, section_path, heading, text, start_byte, end_byte, page, source_line FROM chunks WHERE id = ?1;",
+		"SELECT id, document_id, chunk_index, section_path, heading, text, start_byte, end_byte, heading_level, page, source_line FROM chunks WHERE id = ?1;",
 	);
 	defer finalize(stmt);
 	try bindInt64(stmt, 1, chunk_id);
@@ -510,10 +513,11 @@ pub fn getChunk(db: *Db, allocator: std.mem.Allocator, chunk_id: i64) !?ChunkRec
 		errdefer if (heading) |h| allocator.free(h);
 		const text = try columnTextRequired(allocator, stmt, 5);
 
-		const raw_page = c.sqlite3_column_int(stmt, 8);
-		const page_val: ?u32 = if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL) null else @intCast(raw_page);
-		const raw_line = c.sqlite3_column_int(stmt, 9);
-		const line_val: ?u32 = if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) null else @intCast(raw_line);
+		const raw_heading_level = c.sqlite3_column_int(stmt, 8);
+		const raw_page = c.sqlite3_column_int(stmt, 9);
+		const page_val: ?u32 = if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) null else @intCast(raw_page);
+		const raw_line = c.sqlite3_column_int(stmt, 10);
+		const line_val: ?u32 = if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) null else @intCast(raw_line);
 
 		return ChunkRecord{
 			.id = c.sqlite3_column_int64(stmt, 0),
@@ -524,12 +528,28 @@ pub fn getChunk(db: *Db, allocator: std.mem.Allocator, chunk_id: i64) !?ChunkRec
 			.text = text,
 			.start_byte = c.sqlite3_column_int64(stmt, 6),
 			.end_byte = c.sqlite3_column_int64(stmt, 7),
+			.heading_level = raw_heading_level,
 			.page = page_val,
 			.source_line = line_val,
 		};
 	}
 	if (rc == c.SQLITE_DONE) return null;
 	return SqliteError.SqliteError;
+}
+
+/// Retrieve just the heading_level for a chunk by its ID.
+/// Returns 0 (body text) if the chunk is not found.
+pub fn getChunkHeadingLevel(db: *Db, chunk_id: i64) !i32 {
+	const stmt = try prepareSql(db.handle,
+		"SELECT heading_level FROM chunks WHERE id = ?1;",
+	);
+	defer finalize(stmt);
+	try bindInt64(stmt, 1, chunk_id);
+	const rc = c.sqlite3_step(stmt);
+	if (rc == c.SQLITE_ROW) {
+		return c.sqlite3_column_int(stmt, 0);
+	}
+	return 0;
 }
 
 /// Remove all chunks for a document, including FTS5 and embedding entries.
@@ -801,6 +821,56 @@ test "insert and retrieve chunk — round-trip" {
 	try std.testing.expectEqualStrings("Lorem ipsum dolor sit amet.", rec.text);
 	try std.testing.expectEqual(@as(i64, 0), rec.start_byte);
 	try std.testing.expectEqual(@as(i64, 27), rec.end_byte);
+	try std.testing.expectEqual(@as(i32, 0), rec.heading_level); // default
+}
+
+test "heading_level stored and retrieved — round-trip" {
+	var db = try openTestDb();
+	defer closeDb(&db);
+
+	const doc_id = try insertDocument(&db, "/test/headings.md", "md", null, "hhash", null);
+
+	const chunk_h1 = document.Chunk{
+		.document_path = "/test/headings.md",
+		.section_path = "Title",
+		.heading = "Main Title",
+		.text = "Title content.",
+		.start_byte = 0,
+		.end_byte = 14,
+		.chunk_index = 0,
+		.heading_level = 1,
+	};
+	const h1_id = try insertChunk(&db, doc_id, chunk_h1);
+
+	const chunk_h3 = document.Chunk{
+		.document_path = "/test/headings.md",
+		.section_path = "Sub",
+		.heading = "Subsection",
+		.text = "Sub content.",
+		.start_byte = 14,
+		.end_byte = 26,
+		.chunk_index = 1,
+		.heading_level = 3,
+	};
+	const h3_id = try insertChunk(&db, doc_id, chunk_h3);
+
+	// Verify via getChunk
+	{
+		const rec = (try getChunk(&db, std.testing.allocator, h1_id)).?;
+		defer rec.deinit(std.testing.allocator);
+		try std.testing.expectEqual(@as(i32, 1), rec.heading_level);
+	}
+	{
+		const rec = (try getChunk(&db, std.testing.allocator, h3_id)).?;
+		defer rec.deinit(std.testing.allocator);
+		try std.testing.expectEqual(@as(i32, 3), rec.heading_level);
+	}
+
+	// Verify via lightweight getChunkHeadingLevel
+	try std.testing.expectEqual(@as(i32, 1), try getChunkHeadingLevel(&db, h1_id));
+	try std.testing.expectEqual(@as(i32, 3), try getChunkHeadingLevel(&db, h3_id));
+	// Non-existent chunk returns 0
+	try std.testing.expectEqual(@as(i32, 0), try getChunkHeadingLevel(&db, 99999));
 }
 
 test "needsReindex — unchanged file returns false" {

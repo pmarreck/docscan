@@ -21,6 +21,7 @@ const ProtoChunk = struct {
 	text: []const u8, // borrowed from section content or allocated during merge
 	parent_path: []const u8, // always allocated
 	text_allocated: bool, // true if text was allocated (merged text)
+	heading_level: u8 = 0, // section level: 0 = body, 1 = top heading, etc.
 	page: ?u32 = null, // page number from section (PDF)
 	source_line: ?u32 = null, // line number from section (markdown)
 };
@@ -132,7 +133,7 @@ fn chunkSection(
 	if (has_children) {
 		// Parent with preamble: emit preamble as its own chunk
 		if (has_content) {
-			try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, options, out, section.page, section.source_line);
+			try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, section.level, options, out, section.page, section.source_line);
 		}
 		// Recurse into children
 		for (section.children) |child| {
@@ -146,7 +147,7 @@ fn chunkSection(
 		}
 	} else if (has_content) {
 		// Leaf section with content
-		try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, options, out, section.page, section.source_line);
+		try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, section.level, options, out, section.page, section.source_line);
 	} else {
 		// Empty leaf — skip, free path
 		allocator.free(my_path);
@@ -160,6 +161,7 @@ fn emitContentChunks(
 	section_path: []const u8,
 	parent_path: []const u8,
 	heading: ?[]const u8,
+	heading_level: u8,
 	options: ChunkOptions,
 	out: *std.ArrayListUnmanaged(ProtoChunk),
 	page: ?u32,
@@ -176,6 +178,7 @@ fn emitContentChunks(
 			.text = content,
 			.parent_path = pp,
 			.text_allocated = false,
+			.heading_level = heading_level,
 			.page = page,
 			.source_line = source_line,
 		});
@@ -200,6 +203,7 @@ fn emitContentChunks(
 				.text = content,
 				.parent_path = pp,
 				.text_allocated = false,
+				.heading_level = heading_level,
 				.page = page,
 				.source_line = source_line,
 			});
@@ -228,6 +232,7 @@ fn emitContentChunks(
 				.text = buildGroupText(paragraphs[group_start..idx]),
 				.parent_path = pp,
 				.text_allocated = false,
+				.heading_level = heading_level,
 				.page = page,
 				.source_line = source_line,
 			});
@@ -251,6 +256,7 @@ fn emitContentChunks(
 			.text = buildGroupText(paragraphs[group_start..]),
 			.parent_path = pp,
 			.text_allocated = false,
+			.heading_level = heading_level,
 			.page = page,
 			.source_line = source_line,
 		});
@@ -341,6 +347,7 @@ fn mergeSmallChunks(
 				.text = merged_text,
 				.parent_path = current.parent_path,
 				.text_allocated = true,
+				.heading_level = current.heading_level,
 				.page = current.page,
 				.source_line = current.source_line,
 			});
@@ -394,6 +401,7 @@ pub fn chunk(allocator: std.mem.Allocator, doc: document.Document, options: Chun
 			.start_byte = byte_offset,
 			.end_byte = byte_offset + text_owned.len,
 			.chunk_index = @intCast(idx),
+			.heading_level = pc.heading_level,
 			.page = pc.page,
 			.source_line = pc.source_line,
 		};
@@ -646,4 +654,50 @@ test "null headings in breadcrumb are skipped" {
 	try testing.expectEqual(@as(usize, 1), chunks.len);
 	// The null heading should NOT appear in the breadcrumb
 	try testing.expectEqualStrings("Visible", chunks[0].section_path);
+}
+
+test "heading_level propagated from section level to chunk" {
+	const sections = &[_]document.Section{
+		.{ .heading = "Title", .level = 1, .content = "Top-level content.", .children = &.{} },
+		.{ .heading = "Subtitle", .level = 2, .content = "Sub-level content.", .children = &.{} },
+		.{ .heading = null, .level = 0, .content = "Body content.", .children = &.{} },
+	};
+	const doc = makeDoc(sections);
+	const chunks = try chunk(testing.allocator, doc, .{ .min_chunk_tokens = 1 });
+	defer freeChunks(testing.allocator, chunks);
+
+	try testing.expectEqual(@as(usize, 3), chunks.len);
+	try testing.expectEqual(@as(u8, 1), chunks[0].heading_level);
+	try testing.expectEqual(@as(u8, 2), chunks[1].heading_level);
+	try testing.expectEqual(@as(u8, 0), chunks[2].heading_level);
+}
+
+test "heading_level propagated through nested sections" {
+	const leaf = document.Section{
+		.heading = "Deep",
+		.level = 3,
+		.content = "Deeply nested.",
+		.children = &.{},
+	};
+	const mid = document.Section{
+		.heading = "Mid",
+		.level = 2,
+		.content = "Mid content.",
+		.children = &.{leaf},
+	};
+	const top = document.Section{
+		.heading = "Top",
+		.level = 1,
+		.content = "Top content.",
+		.children = &.{mid},
+	};
+	const doc = makeDoc(&.{top});
+	const chunks = try chunk(testing.allocator, doc, .{ .min_chunk_tokens = 1 });
+	defer freeChunks(testing.allocator, chunks);
+
+	// Should produce 3 chunks: top preamble (level 1), mid preamble (level 2), leaf (level 3)
+	try testing.expectEqual(@as(usize, 3), chunks.len);
+	try testing.expectEqual(@as(u8, 1), chunks[0].heading_level);
+	try testing.expectEqual(@as(u8, 2), chunks[1].heading_level);
+	try testing.expectEqual(@as(u8, 3), chunks[2].heading_level);
 }

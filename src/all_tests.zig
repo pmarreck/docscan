@@ -18,6 +18,7 @@ test {
 	_ = @import("core/ole2.zig");
 	_ = @import("core/parser_doc.zig");
 	_ = @import("core/parser_rtf.zig");
+	_ = @import("core/parser_epub.zig");
 	_ = @import("core/chunker.zig");
 	_ = @import("core/storage.zig");
 	_ = @import("core/search.zig");

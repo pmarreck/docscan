@@ -17,6 +17,7 @@ const parser_docx = core.parser_docx;
 const parser_pdf = core.parser_pdf;
 const parser_doc = core.parser_doc;
 const parser_rtf = core.parser_rtf;
+const parser_epub = core.parser_epub;
 
 // ── Allocator ─────────────────────────────────────────────────────────
 
@@ -316,8 +317,7 @@ fn getParser(format: []const u8) ?struct { parse: ParseFn, free: FreeFn } {
 		return .{ .parse = &parser_rtf.parse, .free = &parser_rtf.freeDocument };
 	}
 	if (std.mem.eql(u8, format, "epub")) {
-		// TODO: EPUB parser not yet implemented — placeholder
-		return null;
+		return .{ .parse = &parser_epub.parse, .free = &parser_epub.freeDocument };
 	}
 	return null;
 }
