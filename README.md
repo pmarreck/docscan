@@ -3,7 +3,7 @@
 [![CI](https://github.com/pmarreck/docscan/actions/workflows/ci.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/docscan/actions/workflows/ci.yml)
 [![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Fdocscan%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/docscan)
 
-Document indexing and semantic search for `.md`, `.docx`, `.pdf`, and `.doc` files.
+Document indexing and semantic search for `.md`, `.docx`, `.pdf`, `.doc`, and `.rtf` files.
 
 ## What it does
 
@@ -13,7 +13,7 @@ docscan indexes a collection of documents, extracts structured text with heading
 
 ```
 C CLI (I/O, Ollama/oMLX, files) → C FFI → Zig Core (pure computation)
-                                             ├── Parsers (md, docx, pdf, doc)
+                                             ├── Parsers (md, docx, pdf, doc, rtf)
                                              ├── Chunker (structure-aware)
                                              ├── Storage (SQLite + sqlite-vec + FTS5)
                                              └── Search (hybrid vector + BM25 with RRF)
@@ -61,7 +61,11 @@ docscan index ~/docs/ \
   --model bge-m3-mlx-fp16
 ```
 
+Settings are saved to `.docscan/config.ini` on first index, so subsequent commands pick them up automatically.
+
 Environment variables: `DOCSCAN_MODEL`, `DOCSCAN_EMBEDDING_API`, `DOCSCAN_EMBEDDING_URL`, `DOCSCAN_EMBEDDING_API_KEY`, `DOCSCAN_DB`
+
+Override precedence: CLI flags > env vars > `.docscan/config.ini` > defaults
 
 ## MCP server
 
@@ -82,12 +86,13 @@ Exposes 7 tools: `docscan_search`, `docscan_status`, `docscan_read_chunk`, `docs
 
 ## Document format support
 
-| Format | Extraction | Structure detection |
-|--------|-----------|-------------------|
-| `.md` | Full text | ATX headings (`#` through `######`) |
-| `.docx` | Full text + metadata | Word heading styles (Heading1-6, Title) |
-| `.pdf` | Full text via content stream operators | Font-size heuristics + ToUnicode CMap |
-| `.doc` | Full text via OLE2/Piece Table | Heuristic (ALL CAPS, numbered sections) |
+| Format | Extraction | Structure detection | Location info |
+|--------|-----------|-------------------|---------------|
+| `.md` | Full text | ATX headings (`#` through `######`) | Line number |
+| `.docx` | Full text + metadata | Word heading styles (Heading1-6, Title) | Page (from `lastRenderedPageBreak`) |
+| `.pdf` | Full text via content stream operators | Font-size heuristics + ToUnicode CMap | Page number |
+| `.doc` | Full text via OLE2/Piece Table | Heuristic (ALL CAPS, numbered sections) | — |
+| `.rtf` | Full text with Unicode/Windows-1252 decoding | Font-size heuristics, `\page` breaks | Page (hard breaks) |
 
 ## Building from source
 
