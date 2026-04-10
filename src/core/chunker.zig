@@ -108,31 +108,24 @@ fn forceSplitByBytes(
 	var is_first = true;
 	while (offset < content.len) {
 		var end = @min(offset + options.max_chunk_bytes, content.len);
-		// Try to break at a natural boundary (prefer sentence > word)
+		// Single backward scan: find best break point (sentence > word)
 		if (end < content.len) {
 			const min_scan = offset + options.max_chunk_bytes / 2;
-			// First pass: look for sentence-ending punctuation followed by space
-			var found = false;
+			var best_word: usize = end; // stays at `end` if no word boundary found
+			var found_sentence = false;
 			var scan = end;
 			while (scan > min_scan) : (scan -= 1) {
-				if ((content[scan - 1] == '.' or content[scan - 1] == '!' or content[scan - 1] == '?') and
-					(content[scan] == ' ' or content[scan] == '\t' or content[scan] == '\n'))
-				{
-					end = scan;
-					found = true;
-					break;
-				}
-			}
-			// Second pass: fall back to word boundary (space)
-			if (!found) {
-				scan = end;
-				while (scan > min_scan) : (scan -= 1) {
-					if (content[scan] == ' ' or content[scan] == '\t') {
+				const ch = content[scan];
+				if (ch == ' ' or ch == '\t') {
+					if (best_word == end) best_word = scan;
+					if (content[scan - 1] == '.' or content[scan - 1] == '!' or content[scan - 1] == '?') {
 						end = scan;
+						found_sentence = true;
 						break;
 					}
 				}
 			}
+			if (!found_sentence) end = best_word;
 		}
 		const sp = if (is_first) section_path else try allocator.dupe(u8, section_path);
 		const pp = try allocator.dupe(u8, parent_path);
