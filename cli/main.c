@@ -714,7 +714,7 @@ static char** extract_chunk_texts(const char* json, int* out_count) {
 		/* Find end of string, handling escapes */
 		size_t cap = 4096;
 		char* text = malloc(cap);
-		if (!text) break;
+		if (!text) goto cleanup_on_error;
 		size_t len = 0;
 
 		while (*p && *p != '"') {
@@ -729,10 +729,20 @@ static char** extract_chunk_texts(const char* json, int* out_count) {
 					case '\\': ch = '\\'; break;
 					default: ch = *p; break;
 				}
-				if (len + 1 >= cap) { cap *= 2; text = realloc(text, cap); }
+				if (len + 1 >= cap) {
+					cap *= 2;
+					char* nt = realloc(text, cap);
+					if (!nt) { free(text); goto cleanup_on_error; }
+					text = nt;
+				}
 				text[len++] = ch;
 			} else {
-				if (len + 1 >= cap) { cap *= 2; text = realloc(text, cap); }
+				if (len + 1 >= cap) {
+					cap *= 2;
+					char* nt = realloc(text, cap);
+					if (!nt) { free(text); goto cleanup_on_error; }
+					text = nt;
+				}
 				text[len++] = *p;
 			}
 			p++;
@@ -741,12 +751,20 @@ static char** extract_chunk_texts(const char* json, int* out_count) {
 
 		if (*out_count >= capacity) {
 			capacity *= 2;
-			texts = realloc(texts, sizeof(char*) * (size_t)capacity);
+			char** nt = realloc(texts, sizeof(char*) * (size_t)capacity);
+			if (!nt) { free(text); goto cleanup_on_error; }
+			texts = nt;
 		}
 		texts[(*out_count)++] = text;
 	}
 
 	return texts;
+
+cleanup_on_error:
+	for (int i = 0; i < *out_count; i++) free(texts[i]);
+	free(texts);
+	*out_count = 0;
+	return NULL;
 }
 
 /* ── Embedding (Ollama / OpenAI-compatible) ────────────────────────── */
