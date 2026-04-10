@@ -48,6 +48,17 @@ fn writeZigError(err_buf: ?[*]u8, err_buf_len: usize, err: anyerror) void {
 	writeError(err_buf, err_buf_len, @errorName(err));
 }
 
+/// Write a SQLite-specific error: "SqliteError: <actual message from sqlite3_errmsg>"
+fn writeSqliteError(err_buf: ?[*]u8, err_buf_len: usize, db: *const storage.Db) void {
+	const msg = db.lastError();
+	var buf: [1024]u8 = undefined;
+	const formatted = std.fmt.bufPrint(&buf, "SqliteError: {s}", .{msg}) catch {
+		writeError(err_buf, err_buf_len, "SqliteError: (message too long)");
+		return;
+	};
+	writeError(err_buf, err_buf_len, formatted);
+}
+
 /// Duplicate a Zig string as a null-terminated C string allocated via GPA.
 /// Caller must free with docscan_free().
 fn dupeToC(s: []const u8) ?[*:0]u8 {
@@ -531,15 +542,15 @@ export fn docscan_index_file(
 		if (doc.title) |t| t else null,
 		hash_slice,
 		null,
-	) catch |e| {
-		writeZigError(err_buf, err_buf_len, e);
+	) catch {
+		writeSqliteError(err_buf, err_buf_len, &d.db);
 		return -1;
 	};
 
 	// Insert chunks + embeddings
 	for (chunks, 0..) |chunk, idx| {
-		const chunk_id = storage.insertChunk(&d.db, doc_id, chunk) catch |e| {
-			writeZigError(err_buf, err_buf_len, e);
+		const chunk_id = storage.insertChunk(&d.db, doc_id, chunk) catch {
+			writeSqliteError(err_buf, err_buf_len, &d.db);
 			return -1;
 		};
 
@@ -549,8 +560,8 @@ export fn docscan_index_file(
 				const dim = d.db.embedding_dim;
 				const offset = idx * dim;
 				const emb_slice = emb_ptr[offset .. offset + dim];
-				storage.insertEmbedding(&d.db, chunk_id, emb_slice) catch |e| {
-					writeZigError(err_buf, err_buf_len, e);
+				storage.insertEmbedding(&d.db, chunk_id, emb_slice) catch {
+					writeSqliteError(err_buf, err_buf_len, &d.db);
 					return -1;
 				};
 			}

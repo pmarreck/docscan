@@ -14,6 +14,9 @@ const c = @cImport({
 /// SQLite error type returned when a C API call fails.
 pub const SqliteError = error{
 	SqliteError,
+	SqliteOpen,
+	SqliteVecInit,
+	SqliteSchema,
 	SqliteBusy,
 	SqliteNotFound,
 };
@@ -23,6 +26,13 @@ pub const Db = struct {
 	handle: *c.sqlite3,
 	embedding_dim: u32,
 	allocator: std.mem.Allocator,
+
+	/// Last SQLite error message (points into SQLite's internal buffer, valid until next API call).
+	pub fn lastError(self: *const Db) []const u8 {
+		const msg = c.sqlite3_errmsg(self.handle);
+		if (msg) |m| return std.mem.span(m);
+		return "unknown error";
+	}
 };
 
 /// A persisted document record.
@@ -176,14 +186,18 @@ fn finalize(stmt: *c.sqlite3_stmt) void {
 pub fn openDb(allocator: std.mem.Allocator, path: [*:0]const u8, embedding_dim: u32) !Db {
 	var db_handle: ?*c.sqlite3 = null;
 	var rc = c.sqlite3_open(path, &db_handle);
-	if (rc != c.SQLITE_OK) return SqliteError.SqliteError;
-	const handle = db_handle orelse return SqliteError.SqliteError;
+	if (rc != c.SQLITE_OK) {
+		if (db_handle) |h| _ = c.sqlite3_close(h);
+		return SqliteError.SqliteOpen;
+	}
+	const handle = db_handle orelse return SqliteError.SqliteOpen;
 
 	// Register sqlite-vec extension
-	rc = c.sqlite3_vec_init(handle, null, null);
+	var vec_err_msg: [*c]u8 = null;
+	rc = c.sqlite3_vec_init(handle, &vec_err_msg, null);
 	if (rc != c.SQLITE_OK) {
 		_ = c.sqlite3_close(handle);
-		return SqliteError.SqliteError;
+		return SqliteError.SqliteVecInit;
 	}
 
 	// WAL mode for concurrency

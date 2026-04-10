@@ -2124,12 +2124,45 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		return 1;
 	}
 
-	/* Check embedding server availability and detect dimension */
+	/* Check embedding server availability — try configured, then Ollama, then oMLX */
 	int have_embedder = embedding_server_available();
 	int embedding_dim = DEFAULT_EMBEDDING_DIM;
+
 	if (!have_embedder) {
-		warn_msg("Embedding server is not running at %s", g_embedding_url);
-		warn_msg("Documents will be indexed without embeddings (text search only).");
+		/* Try Ollama default if not already configured for it */
+		if (strcmp(g_embedding_url, "http://127.0.0.1:11434") != 0) {
+			info_msg("Configured embedding server at %s is not running, trying Ollama (localhost:11434)...", g_embedding_url);
+			snprintf(g_embedding_url, sizeof(g_embedding_url), "http://127.0.0.1:11434");
+			g_api_dialect = API_OLLAMA;
+			have_embedder = embedding_server_available();
+		}
+	}
+	if (!have_embedder) {
+		/* Try oMLX default */
+		info_msg("Ollama not running, trying oMLX (localhost:8000)...");
+		snprintf(g_embedding_url, sizeof(g_embedding_url), "http://127.0.0.1:8000");
+		g_api_dialect = API_OPENAI;
+		have_embedder = embedding_server_available();
+		if (have_embedder) {
+			info_msg("Found oMLX at localhost:8000");
+		}
+	}
+
+	if (!have_embedder) {
+		warn_msg("No embedding server found (tried configured, Ollama:11434, oMLX:8000).");
+		if (isatty(STDERR_FILENO)) {
+			fprintf(stderr, "Index without embeddings (text search only)? [y/N] ");
+			fflush(stderr);
+			int ch = getchar();
+			if (ch != 'y' && ch != 'Y') {
+				info_msg("Aborted. Start an embedding server and try again.");
+				free(db_path);
+				file_list_free(&fl);
+				return 1;
+			}
+		} else {
+			warn_msg("No interactive terminal — proceeding without embeddings.");
+		}
 	} else {
 		/* Probe the embedding server to detect actual dimension */
 		int probe_dim = 0;
@@ -2137,6 +2170,10 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		float* probe = embed_texts(model, probe_texts, 1, &probe_dim);
 		if (probe && probe_dim > 0) {
 			embedding_dim = probe_dim;
+			info_msg("Embedding server: %s (dialect: %s, model: %s, dim: %d)",
+				g_embedding_url,
+				g_api_dialect == API_OPENAI ? "openai" : "ollama",
+				model, embedding_dim);
 			free(probe);
 		}
 	}
@@ -3170,7 +3207,44 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	/* ── Load .docscan/config.ini (lowest priority after hardcoded defaults) ── */
+	/* ── Load global config (~/.config/docscan/config.ini) first ── */
+	{
+		char global_cfg[MAX_PATH_LEN];
+		const char* xdg = getenv("XDG_CONFIG_HOME");
+		if (xdg && xdg[0]) {
+			snprintf(global_cfg, sizeof(global_cfg), "%s/docscan/config.ini", xdg);
+		} else {
+			const char* home = getenv("HOME");
+			if (home)
+				snprintf(global_cfg, sizeof(global_cfg), "%s/.config/docscan/config.ini", home);
+			else
+				global_cfg[0] = '\0';
+		}
+		if (global_cfg[0]) {
+			DocscanConfig gcfg;
+			config_defaults(&gcfg);
+			if (load_config(global_cfg, &gcfg) == 0) {
+				/* Apply global config as base defaults */
+				if (!cli_set_api && strcasecmp(gcfg.embedding_api, "ollama") != 0) {
+					if (strcasecmp(gcfg.embedding_api, "openai") == 0)
+						g_api_dialect = API_OPENAI;
+				}
+				if (!cli_set_url && gcfg.embedding_url[0] &&
+				    strcmp(gcfg.embedding_url, "http://127.0.0.1:11434") != 0)
+					snprintf(g_embedding_url, sizeof(g_embedding_url), "%s", gcfg.embedding_url);
+				if (!cli_set_model && !model && gcfg.embedding_model[0] &&
+				    strcmp(gcfg.embedding_model, "nomic-embed-text") != 0) {
+					static char global_model[256];
+					snprintf(global_model, sizeof(global_model), "%s", gcfg.embedding_model);
+					model = global_model;
+				}
+				if (!cli_set_key && !g_api_key[0] && gcfg.embedding_api_key[0])
+					snprintf(g_api_key, sizeof(g_api_key), "%s", gcfg.embedding_api_key);
+			}
+		}
+	}
+
+	/* ── Load project .docscan/config.ini (overrides global) ── */
 	/* Try to determine the .docscan/ dir for config loading.
 	 * Priority: --db path > first positional for index/update > cwd */
 	{
