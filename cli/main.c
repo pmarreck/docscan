@@ -2299,7 +2299,8 @@ typedef struct {
 
 	/* Synchronization */
 #ifndef _WIN32
-	pthread_mutex_t ffi_mutex;    /* protects docscan_chunk (Zig GPA not thread-safe) */
+	pthread_mutex_t ffi_mutex;    /* protects docscan_chunk + SQLite (Zig GPA not thread-safe) */
+	pthread_mutex_t embed_mutex;  /* serializes embedding HTTP calls (oMLX chokes on concurrency) */
 #endif
 } IndexWorkerCtx;
 
@@ -2369,10 +2370,12 @@ static void* index_worker(void* arg) {
 					int text_count = 0;
 					char** texts = extract_chunk_texts(chunks_json, &text_count);
 					if (texts && text_count > 0) {
-						/* embed_texts() is thread-safe — independent sockets */
+						/* Serialize embedding calls — oMLX freezes under concurrency */
+						pthread_mutex_lock(&ctx->embed_mutex);
 						int dim = 0;
 						embeddings = embed_texts(ctx->model, texts,
 						                          text_count, &dim);
+						pthread_mutex_unlock(&ctx->embed_mutex);
 						if (embeddings) num_chunks = (uint32_t)text_count;
 					}
 					if (texts) {
@@ -2604,6 +2607,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		ctx.results = results;
 		atomic_init(&ctx.completed, 0);
 		pthread_mutex_init(&ctx.ffi_mutex, NULL);
+		pthread_mutex_init(&ctx.embed_mutex, NULL);
 
 		/* Spawn worker threads */
 		pthread_t* threads = malloc(sizeof(pthread_t) * (size_t)nthreads);
@@ -2644,6 +2648,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		}
 		free(threads);
 		pthread_mutex_destroy(&ctx.ffi_mutex);
+		pthread_mutex_destroy(&ctx.embed_mutex);
 
 		progress_update(&prog, fl.count, NULL);
 
