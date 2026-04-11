@@ -752,7 +752,7 @@ fn extractStreamString(allocator: Allocator, data: []const u8, pos: *usize) ![]c
 					p += 1;
 				},
 				'0'...'7' => {
-					var octal: u8 = data[p] - '0';
+					var octal: u16 = data[p] - '0';
 					p += 1;
 					if (p < data.len and data[p] >= '0' and data[p] <= '7') {
 						octal = octal * 8 + (data[p] - '0');
@@ -762,7 +762,7 @@ fn extractStreamString(allocator: Allocator, data: []const u8, pos: *usize) ![]c
 							p += 1;
 						}
 					}
-					try buf.append(allocator, octal);
+					try buf.append(allocator, @truncate(octal));
 				},
 				else => {
 					try buf.append(allocator, data[p]);

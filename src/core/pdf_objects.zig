@@ -743,7 +743,7 @@ fn parseStringLiteral(allocator: Allocator, data: []const u8, pos: *usize) PdfEr
 				},
 				'0'...'7' => {
 					// Octal escape: 1-3 digits
-					var octal: u8 = esc - '0';
+					var octal: u16 = esc - '0';
 					p += 1;
 					if (p < data.len and data[p] >= '0' and data[p] <= '7') {
 						octal = octal * 8 + (data[p] - '0');
@@ -753,7 +753,7 @@ fn parseStringLiteral(allocator: Allocator, data: []const u8, pos: *usize) PdfEr
 							p += 1;
 						}
 					}
-					buf.append(allocator, octal) catch return PdfError.OutOfMemory;
+					buf.append(allocator, @as(u8, @truncate(octal))) catch return PdfError.OutOfMemory;
 				},
 				'\r' => {
 					// Backslash + CR (+ optional LF) = line continuation
