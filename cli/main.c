@@ -98,7 +98,7 @@ static int is_absolute_path(const char* p) {
 #define DEFAULT_DB_FILENAME   "index.db"
 #define ERR_BUF_LEN           1024
 #define MAX_PATH_LEN          4096
-#define HTTP_BUF_SIZE         (4 * 1024 * 1024)  /* 4 MiB response buffer */
+#define HTTP_BUF_SIZE         (16 * 1024 * 1024)  /* 16 MiB response buffer */
 #define MAX_CHUNKS_PER_FILE   4096
 #define SHA256_DIGEST_LEN     32
 #define SHA256_HEX_LEN        64
@@ -524,7 +524,6 @@ static char* http_post(const char* host, int port, const char* path_url,
 
 	/* Check for HTTP 200 */
 	if (strncmp(resp, "HTTP/1.1 200", 12) != 0 && strncmp(resp, "HTTP/1.0 200", 12) != 0) {
-		/* Try to extract error message for user */
 		free(resp);
 		return NULL;
 	}
@@ -813,7 +812,7 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 	for (int i = 0; i < num_texts; i++) {
 		if (i > 0) body[off++] = ',';
 		body[off++] = '"';
-		/* Escape the text */
+		/* Escape the text for JSON, handling invalid UTF-8 gracefully */
 		for (const char* s = texts[i]; *s; s++) {
 			if ((size_t)off >= body_cap - 16) {
 				body_cap *= 2;
@@ -821,6 +820,7 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 				if (!new_body) { free(body); return NULL; }
 				body = new_body;
 			}
+			unsigned char uc = (unsigned char)*s;
 			switch (*s) {
 				case '"':  body[off++] = '\\'; body[off++] = '"'; break;
 				case '\\': body[off++] = '\\'; body[off++] = '\\'; break;
@@ -828,9 +828,42 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 				case '\r': body[off++] = '\\'; body[off++] = 'r'; break;
 				case '\t': body[off++] = '\\'; body[off++] = 't'; break;
 				default:
-					if ((unsigned char)*s < 0x20) {
+					if (uc < 0x20) {
+						/* Control character */
 						off += snprintf(body + off, body_cap - (size_t)off,
-						                "\\u%04x", (unsigned char)*s);
+						                "\\u%04x", uc);
+					} else if (uc >= 0x80) {
+						/* High byte — validate UTF-8 sequence */
+						int seq_len = 0;
+						if ((uc & 0xE0) == 0xC0) seq_len = 2;
+						else if ((uc & 0xF0) == 0xE0) seq_len = 3;
+						else if ((uc & 0xF8) == 0xF0) seq_len = 4;
+
+						int valid = (seq_len >= 2);
+						if (valid) {
+							for (int k = 1; k < seq_len; k++) {
+								if (((unsigned char)s[k] & 0xC0) != 0x80) {
+									valid = 0;
+									break;
+								}
+							}
+						}
+						if (valid) {
+							/* Valid UTF-8 multi-byte — copy through */
+							if ((size_t)off + (size_t)seq_len >= body_cap - 4) {
+								body_cap *= 2;
+								char* new_body = realloc(body, body_cap);
+								if (!new_body) { free(body); return NULL; }
+								body = new_body;
+							}
+							for (int k = 0; k < seq_len; k++)
+								body[off++] = s[k];
+							s += seq_len - 1; /* -1 because loop increments */
+						} else {
+							/* Invalid/lone high byte — escape as \uXXXX */
+							off += snprintf(body + off, body_cap - (size_t)off,
+							                "\\u%04x", uc);
+						}
 					} else {
 						body[off++] = *s;
 					}
@@ -851,7 +884,8 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 	if (!resp) return NULL;
 
 	/* Parse embeddings from response — dialect-specific */
-	int max_floats = num_texts * DEFAULT_EMBEDDING_DIM * 2; /* generous */
+	int max_dim = DEFAULT_EMBEDDING_DIM > 1024 ? DEFAULT_EMBEDDING_DIM : 1024;
+	int max_floats = num_texts * max_dim * 2; /* generous */
 	float* embeddings = malloc(sizeof(float) * (size_t)max_floats);
 	if (!embeddings) { free(resp); return NULL; }
 
@@ -2278,6 +2312,9 @@ typedef struct {
 	int          needs_index; /* 1=process, 0=skip (no format or read error) */
 	int          error;       /* non-zero = failed */
 	char         error_msg[256];
+	/* Phase 1 output: chunk texts for batched embedding */
+	char**       chunk_texts;      /* extracted chunk text array */
+	int          chunk_text_count; /* number of chunk texts */
 } IndexResult;
 
 /*
@@ -2304,7 +2341,6 @@ typedef struct {
 	/* Synchronization */
 #ifndef _WIN32
 	pthread_mutex_t ffi_mutex;    /* protects docscan_chunk + SQLite (Zig GPA not thread-safe) */
-	pthread_mutex_t embed_mutex;  /* serializes embedding HTTP calls (oMLX chokes on concurrency) */
 #endif
 } IndexWorkerCtx;
 
@@ -2320,6 +2356,8 @@ static void* index_worker(void* arg) {
 		IndexResult* r = &ctx->results[idx];
 		r->path = ctx->file_paths[idx];
 		r->error_msg[0] = '\0';
+		r->chunk_texts = NULL;
+		r->chunk_text_count = 0;
 
 		/* Check format */
 		r->fmt = format_for_ext(r->path);
@@ -2355,10 +2393,13 @@ static void* index_worker(void* arg) {
 			continue;
 		}
 
-		/* Full pipeline: parse + chunk + embed + insert */
-		float* embeddings = NULL;
-		uint32_t num_chunks = 0;
+		r->needs_index = 1;
 
+		/*
+		 * Phase 1: Parse + chunk + extract texts.
+		 * Embedding is deferred to Phase 2 (batched on main thread).
+		 * file_data is kept alive for Phase 3 insertion.
+		 */
 		if (ctx->have_embedder) {
 			pthread_mutex_lock(&ctx->ffi_mutex);
 			char* chunks_json = docscan_chunk(r->file_data, r->file_len,
@@ -2368,48 +2409,17 @@ static void* index_worker(void* arg) {
 			pthread_mutex_unlock(&ctx->ffi_mutex);
 
 			if (chunks_json) {
-				num_chunks = (uint32_t)count_json_array_objects(chunks_json);
-
-				if (num_chunks > 0) {
-					int text_count = 0;
-					char** texts = extract_chunk_texts(chunks_json, &text_count);
-					if (texts && text_count > 0) {
-						/* Serialize embedding calls — oMLX freezes under concurrency */
-						pthread_mutex_lock(&ctx->embed_mutex);
-						int dim = 0;
-						embeddings = embed_texts(ctx->model, texts,
-						                          text_count, &dim);
-						pthread_mutex_unlock(&ctx->embed_mutex);
-						if (embeddings) num_chunks = (uint32_t)text_count;
-					}
-					if (texts) {
-						for (int t = 0; t < text_count; t++) free(texts[t]);
-						free(texts);
-					}
+				int text_count = 0;
+				char** texts = extract_chunk_texts(chunks_json, &text_count);
+				if (texts && text_count > 0) {
+					r->chunk_texts = texts;
+					r->chunk_text_count = text_count;
+					r->num_chunks = (uint32_t)text_count;
+				} else {
+					r->num_chunks = (uint32_t)count_json_array_objects(chunks_json);
 				}
 				docscan_free(chunks_json);
 			}
-		}
-
-		/* Remove old + insert new (SQLite write — mutex-protected) */
-		pthread_mutex_lock(&ctx->ffi_mutex);
-		docscan_remove_document(ctx->db, r->path, err_buf, sizeof(err_buf));
-		int rc = docscan_index_file(ctx->db, r->file_data, r->file_len,
-		                             r->path, r->fmt, r->hash_hex,
-		                             embeddings, num_chunks,
-		                             DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
-		pthread_mutex_unlock(&ctx->ffi_mutex);
-
-		/* Free immediately — bounded memory per worker */
-		free(r->file_data);
-		r->file_data = NULL;
-		free(embeddings);
-
-		if (rc == 0) {
-			r->needs_index = 1;
-		} else {
-			r->error = 1;
-			snprintf(r->error_msg, sizeof(r->error_msg), "%s", err_buf);
 		}
 
 		atomic_fetch_add(&ctx->completed, 1);
@@ -2577,14 +2587,17 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 #ifndef _WIN32
 	if (g_num_threads > 1) {
 		/*
-		 * ── Multi-threaded path ──
+		 * ── Multi-threaded path (3-phase pipeline) ──
 		 *
-		 * Workers do: read file, hash, parse/chunk (mutex), embed (parallel).
-		 * Main thread then: check reindex (SQLite), insert (SQLite).
+		 * Phase 1 (parallel): Workers read files, hash, check reindex,
+		 *   parse+chunk (mutex-protected FFI). Store chunk texts in results.
 		 *
-		 * The embedding HTTP calls are the bottleneck (500ms-5s each) and
-		 * run fully in parallel. FFI calls (parse/chunk) are fast (<10ms)
-		 * but serialized via ffi_mutex because Zig's GPA isn't thread-safe.
+		 * Phase 2 (batched): Main thread collects ALL chunk texts from all
+		 *   files into one flat array. Embeds in batches of up to 256 texts
+		 *   per HTTP call. Reduces ~N HTTP calls to ceil(total_chunks/256).
+		 *
+		 * Phase 3 (sequential): Main thread inserts each file into SQLite
+		 *   with its pre-computed embedding slice from the global array.
 		 */
 		int nthreads = g_num_threads;
 		if (nthreads > fl.count) nthreads = fl.count;
@@ -2612,7 +2625,6 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		ctx.results = results;
 		atomic_init(&ctx.completed, 0);
 		pthread_mutex_init(&ctx.ffi_mutex, NULL);
-		pthread_mutex_init(&ctx.embed_mutex, NULL);
 
 		/* Spawn worker threads */
 		pthread_t* threads = malloc(sizeof(pthread_t) * (size_t)nthreads);
@@ -2635,7 +2647,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 			}
 		}
 
-		/* Progress updates while workers run */
+		/* Progress updates while Phase 1 workers run */
 		while (atomic_load(&ctx.completed) < fl.count) {
 			int done = atomic_load(&ctx.completed);
 			/* Find a path to show (approximate — pick the done'th file) */
@@ -2653,25 +2665,154 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		}
 		free(threads);
 		pthread_mutex_destroy(&ctx.ffi_mutex);
-		pthread_mutex_destroy(&ctx.embed_mutex);
 
-		progress_update(&prog, fl.count, NULL);
+		progress_finish(&prog);
 
-		/* ── Phase 2: Tally results (workers already did inserts) ── */
+		/* ── Phase 2: Batched embedding ──────────────────────────── */
+
+		/* Count total chunks across all files that need indexing */
+		int total_chunks = 0;
+		int files_to_index = 0;
+		for (int i = 0; i < fl.count; i++) {
+			if (results[i].needs_index && !results[i].error)
+				total_chunks += results[i].chunk_text_count;
+			if (results[i].needs_index) files_to_index++;
+		}
+
+		float* all_embeddings = NULL;
+		int emb_dim = 0;
+
+		if (have_embedder && total_chunks > 0) {
+			/* Build flat array of ALL chunk texts */
+			char** all_texts = malloc(sizeof(char*) * (size_t)total_chunks);
+			if (!all_texts) {
+				err_msg("out of memory allocating text array for embedding");
+				/* Fall through — will insert without embeddings */
+			} else {
+				/* Also track where each file's chunks start in the global array */
+				int* file_chunk_offsets = calloc((size_t)fl.count, sizeof(int));
+				int running_offset = 0;
+				for (int i = 0; i < fl.count; i++) {
+					file_chunk_offsets[i] = running_offset;
+					if (results[i].needs_index && !results[i].error) {
+						for (int j = 0; j < results[i].chunk_text_count; j++) {
+							all_texts[running_offset++] = results[i].chunk_texts[j];
+						}
+					}
+				}
+
+				/* Embed in batches of up to EMBED_BATCH_SIZE texts per HTTP call.
+				 * Reduces HTTP overhead (one call per batch vs per file) and
+				 * lets the embedding server batch internally on the GPU. */
+				#define EMBED_BATCH_SIZE 256
+				all_embeddings = malloc(sizeof(float) * (size_t)total_chunks * (size_t)embedding_dim);
+				if (!all_embeddings) {
+					err_msg("out of memory allocating embedding array");
+				} else {
+					int total_batches = (total_chunks + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE;
+
+					info_msg("Embedding %d chunks in %d batch%s...",
+						total_chunks, total_batches, total_batches == 1 ? "" : "es");
+
+					progress_init(&prog, total_chunks);
+
+					/* Serialize embedding calls to avoid overloading the server.
+					 * The server handles batching internally on the GPU. */
+					for (int batch_start = 0; batch_start < total_chunks; batch_start += EMBED_BATCH_SIZE) {
+						int batch_size = total_chunks - batch_start;
+						if (batch_size > EMBED_BATCH_SIZE) batch_size = EMBED_BATCH_SIZE;
+						int batch_idx = batch_start / EMBED_BATCH_SIZE;
+
+						int dim = 0;
+						float* batch_emb = embed_texts(model, &all_texts[batch_start],
+						                                batch_size, &dim);
+						if (batch_emb && dim > 0) {
+							emb_dim = dim;
+							memcpy(&all_embeddings[batch_start * dim],
+							       batch_emb,
+							       (size_t)batch_size * (size_t)dim * sizeof(float));
+							free(batch_emb);
+						} else {
+							/* Batch failed — zero-fill so indices stay aligned */
+							if (emb_dim > 0) {
+								memset(&all_embeddings[batch_start * emb_dim], 0,
+								       (size_t)batch_size * (size_t)emb_dim * sizeof(float));
+							}
+							warn_msg("embedding batch %d/%d failed", batch_idx + 1, total_batches);
+						}
+						progress_update(&prog, batch_start + batch_size, NULL);
+					}
+
+					progress_finish(&prog);
+				}
+
+				free(file_chunk_offsets);
+				free(all_texts);
+			}
+		}
+
+		/* ── Phase 3: Sequential insertion + tally ───────────────── */
+		int emb_global_offset = 0;
+		info_msg("Inserting %d file%s into database...",
+			files_to_index, files_to_index == 1 ? "" : "s");
+		progress_init(&prog, fl.count);
+
 		for (int i = 0; i < fl.count; i++) {
 			IndexResult* r = &results[i];
+			progress_update(&prog, i, r->path);
+
 			if (r->error) {
 				warn_msg("failed to index %s%s%s", r->path,
 					r->error_msg[0] ? ": " : "",
 					r->error_msg[0] ? r->error_msg : "");
 				errors++;
-			} else if (r->needs_index) {
+				continue;
+			}
+
+			if (!r->needs_index) {
+				skipped++;
+				continue;
+			}
+
+			/* Get this file's embedding slice */
+			float* file_embeddings = NULL;
+			uint32_t file_num_chunks = r->num_chunks;
+			if (all_embeddings && emb_dim > 0 && r->chunk_text_count > 0) {
+				file_embeddings = &all_embeddings[emb_global_offset * emb_dim];
+				file_num_chunks = (uint32_t)r->chunk_text_count;
+				emb_global_offset += r->chunk_text_count;
+			}
+
+			/* Remove old + insert new */
+			docscan_remove_document(db, r->path, err_buf, sizeof(err_buf));
+			int rc = docscan_index_file(db, r->file_data, r->file_len,
+			                             r->path, r->fmt, r->hash_hex,
+			                             file_embeddings, file_num_chunks,
+			                             DEFAULT_MAX_TOKENS, err_buf, sizeof(err_buf));
+
+			if (rc == 0) {
 				indexed++;
 			} else {
-				skipped++;
+				warn_msg("failed to index %s: %s", r->path, err_buf);
+				errors++;
+			}
+
+			/* Free file data after insertion */
+			free(r->file_data);
+			r->file_data = NULL;
+
+			/* Free chunk texts */
+			if (r->chunk_texts) {
+				for (int t = 0; t < r->chunk_text_count; t++)
+					free(r->chunk_texts[t]);
+				free(r->chunk_texts);
+				r->chunk_texts = NULL;
 			}
 		}
 
+		progress_update(&prog, fl.count, NULL);
+
+		free(all_embeddings);
 		free(results);
 
 	} else
