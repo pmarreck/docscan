@@ -1099,16 +1099,17 @@ fn applyPngUnpredict(allocator: Allocator, data: []const u8, columns: usize) ![]
 	return result;
 }
 
+/// Max decompressed stream size (64 MB) — matches validate project's limit.
+/// Prevents zip-bomb-style expansion from exhausting memory.
+const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
 /// Decompress zlib-wrapped deflate data (PDF FlateDecode).
+/// Capped at MAX_DECOMPRESSED_SIZE to prevent zip-bomb expansion.
 fn inflateZlib(allocator: Allocator, compressed: []const u8) PdfError![]const u8 {
 	var reader: std.Io.Reader = .fixed(compressed);
-	var aw: std.Io.Writer.Allocating = .init(allocator);
-	errdefer aw.deinit();
-
 	var decompress: std.compress.flate.Decompress = .init(&reader, .zlib, &.{});
-	_ = decompress.reader.streamRemaining(&aw.writer) catch return PdfError.DecompressionFailed;
 
-	return aw.toOwnedSlice() catch return PdfError.OutOfMemory;
+	return decompress.reader.allocRemaining(allocator, @enumFromInt(MAX_DECOMPRESSED_SIZE)) catch return PdfError.DecompressionFailed;
 }
 
 // ── Dictionary Helpers ─────────────────────────────────────────────

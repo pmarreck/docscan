@@ -128,7 +128,12 @@ fn parseBfCharSection(allocator: Allocator, data: []const u8, pos: *usize, cmap:
 
 		// Convert dst hex to UTF-8 string
 		const utf8 = hexToUtf8(allocator, dst) catch continue;
-		cmap.char_map.put(hexToU16(src), utf8) catch continue;
+		const gop = cmap.char_map.fetchPut(hexToU16(src), utf8) catch {
+			allocator.free(utf8);
+			continue;
+		};
+		// Free old value if key already existed (prevents leak)
+		if (gop) |old_entry| allocator.free(old_entry.value);
 	}
 }
 
@@ -378,7 +383,10 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 		}
 		font_maps.deinit();
 	}
-	buildFontMaps(allocator, ctx, page_dict, &font_maps);
+	// TODO: CMap/ToUnicode parsing disabled — causes segfault on some PDFs
+	// with compressed object streams containing font data. Needs investigation
+	// of getStream/getCompressedObject decompression path.
+	// buildFontMaps(allocator, ctx, page_dict, &font_maps);
 
 	// Get the content stream reference
 	// /Contents can be a single reference or an array of references
@@ -447,7 +455,10 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 	defer if (owned_font_dict) |v| pdf_objects.freePdfValue(allocator, v);
 
 	// For each font in /Font dict, check for /ToUnicode
+	
 	for (font_dict) |font_entry| {
+		
+		
 		const font_name = font_entry.key; // e.g. "F1"
 
 		// Get the font object (may be direct dict or reference)
@@ -473,6 +484,9 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 		const tounicode_ref = pdf_objects.getDictRef(font_obj_dict, "ToUnicode") orelse continue;
 		const cmap_data = (ctx.getStream(tounicode_ref.obj) catch continue) orelse continue;
 		defer allocator.free(cmap_data);
+
+		// Skip oversized or empty CMap streams (likely corrupt)
+		if (cmap_data.len == 0 or cmap_data.len > 4 * 1024 * 1024) continue;
 
 		var cmap = parseCMap(allocator, cmap_data);
 		font_maps.put(font_name, cmap) catch {
