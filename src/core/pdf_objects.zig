@@ -55,6 +55,7 @@ pub const PdfContext = struct {
 	xref: std.AutoHashMap(u64, XrefEntry),
 	trailer_dict: ?[]const DictEntry,
 	allocator: Allocator,
+	stream_cache: std.AutoHashMap(u64, []const u8), // obj_num -> decompressed stream data
 
 	/// Parse a PDF byte buffer: locate startxref, parse xref table, store trailer.
 	pub fn init(allocator: Allocator, data: []const u8) PdfError!PdfContext {
@@ -63,6 +64,7 @@ pub const PdfContext = struct {
 			.xref = std.AutoHashMap(u64, XrefEntry).init(allocator),
 			.trailer_dict = null,
 			.allocator = allocator,
+			.stream_cache = std.AutoHashMap(u64, []const u8).init(allocator),
 		};
 		errdefer ctx.xref.deinit();
 
@@ -72,6 +74,13 @@ pub const PdfContext = struct {
 	}
 
 	pub fn deinit(self: *PdfContext) void {
+		// Free all cached decompressed streams
+		var cache_iter = self.stream_cache.iterator();
+		while (cache_iter.next()) |entry| {
+			self.allocator.free(entry.value_ptr.*);
+		}
+		self.stream_cache.deinit();
+
 		if (self.trailer_dict) |dict| {
 			for (dict) |entry| {
 				freePdfValue(self.allocator, entry.value);
@@ -185,8 +194,14 @@ pub const PdfContext = struct {
 	}
 
 	/// Get decompressed stream data for an object (must be a stream object).
-	/// Caller owns the returned slice.
+	/// Caller owns the returned slice. Decompressed data is cached internally
+	/// so repeated calls for the same object avoid redundant decompression.
 	pub fn getStream(self: *PdfContext, obj_num: u64) PdfError!?[]const u8 {
+		// Check cache first — return a dupe so caller can free independently
+		if (self.stream_cache.get(obj_num)) |cached| {
+			return self.allocator.dupe(u8, cached) catch return PdfError.OutOfMemory;
+		}
+
 		const entry = self.xref.get(obj_num) orelse return null;
 		if (!entry.in_use) return null;
 		// Compressed objects don't have their own streams
@@ -213,14 +228,25 @@ pub const PdfContext = struct {
 			// Try to find endstream
 			const end_pos = std.mem.indexOf(u8, self.data[stream_start..], "endstream") orelse
 				return PdfError.MalformedObject;
-			return try decompressStream(self.allocator, self.data[stream_start .. stream_start + end_pos], dict_val.dict);
+			const decompressed = try decompressStream(self.allocator, self.data[stream_start .. stream_start + end_pos], dict_val.dict);
+			// Cache the decompressed data, return a dupe to the caller
+			self.stream_cache.put(obj_num, decompressed) catch {
+				// Cache insertion failed — caller still gets the data, just uncached
+				return decompressed;
+			};
+			return self.allocator.dupe(u8, decompressed) catch return PdfError.OutOfMemory;
 		};
 
 		const len: usize = std.math.cast(usize, length) orelse return PdfError.InvalidPdf;
 		if (stream_start + len > self.data.len) return PdfError.InvalidPdf;
 		const stream_data = self.data[stream_start .. stream_start + len];
 
-		return try decompressStream(self.allocator, stream_data, dict_val.dict);
+		const decompressed = try decompressStream(self.allocator, stream_data, dict_val.dict);
+		// Cache the decompressed data, return a dupe to the caller
+		self.stream_cache.put(obj_num, decompressed) catch {
+			return decompressed;
+		};
+		return self.allocator.dupe(u8, decompressed) catch return PdfError.OutOfMemory;
 	}
 
 	/// Follow a reference to get the target object's value.
@@ -1482,6 +1508,7 @@ test "parse xref table — traditional format" {
 		.xref = std.AutoHashMap(u64, XrefEntry).init(testing.allocator),
 		.trailer_dict = null,
 		.allocator = testing.allocator,
+		.stream_cache = std.AutoHashMap(u64, []const u8).init(testing.allocator),
 	};
 	defer ctx.deinit();
 

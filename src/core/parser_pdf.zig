@@ -378,15 +378,13 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 	defer {
 		var iter = font_maps.iterator();
 		while (iter.next()) |entry| {
+			allocator.free(entry.key_ptr.*);
 			var cm = entry.value_ptr.*;
 			cm.deinit();
 		}
 		font_maps.deinit();
 	}
-	// TODO: CMap/ToUnicode parsing disabled — causes segfault on some PDFs
-	// with compressed object streams containing font data. Needs investigation
-	// of getStream/getCompressedObject decompression path.
-	// buildFontMaps(allocator, ctx, page_dict, &font_maps);
+	buildFontMaps(allocator, ctx, page_dict, &font_maps);
 
 	// Get the content stream reference
 	// /Contents can be a single reference or an array of references
@@ -489,7 +487,12 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 		if (cmap_data.len == 0 or cmap_data.len > 4 * 1024 * 1024) continue;
 
 		var cmap = parseCMap(allocator, cmap_data);
-		font_maps.put(font_name, cmap) catch {
+		const owned_name = allocator.dupe(u8, font_name) catch {
+			cmap.deinit();
+			continue;
+		};
+		font_maps.put(owned_name, cmap) catch {
+			allocator.free(owned_name);
 			cmap.deinit();
 			continue;
 		};

@@ -30,6 +30,7 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] DIFAT chain support in OLE2 (>7MB .doc files)
 - [x] Xref stream support in PDF parser (2026-04-08 EST)
 - [x] CIDFont/ToUnicode mapping in PDF (2026-04-08 EST)
+- [x] Object stream decompression cache + re-enable CMap/ToUnicode parsing (2026-04-10 EST)
 - [x] Object stream support in PDF parser (2026-04-08 EST)
 - [x] PNG predictor decompression for xref streams (2026-04-08 EST)
 - [x] Incremental update /Prev chain following in PDF xref (2026-04-08 EST)
