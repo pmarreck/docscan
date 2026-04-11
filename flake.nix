@@ -24,12 +24,22 @@
 					hash = "sha256-CFZAditwPGoWpAK7AG8BaxksfxjEzyGdlMvuZPsJ7CQ=";
 				};
 
+				uchardetz-src = pkgs.fetchgit {
+					url = "https://github.com/pmarreck/uchardetz.git";
+					rev = "c8e00e37f2b1d615e59df4158d1245d28c4d16b5";
+					hash = "sha256-KON5YWftYlcqaou1PlHJYsM+k6OOKbHyOQ6AunN2Fns=";
+				};
+
 				# Create a directory matching Zig's package cache layout
 				# so we can pass it via --system to avoid network fetches
 				zigPkgCache = pkgs.linkFarm "zig-pkg-cache" [
 					{
 						name = "sqlite_vec-0.1.7-alpha.2-4Cdt0OvwBACYsEQvfmbSw0sUHuXhcwD5PgjGyslHXU2q";
 						path = sqlite-vec-src;
+					}
+					{
+						name = "uchardetz-0.0.6-koAyw7NFCwDRxaKK3hCecnFZVHhvUcs5HCfrJlrRmTzr";
+						path = uchardetz-src;
 					}
 				];
 

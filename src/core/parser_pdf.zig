@@ -15,6 +15,7 @@ const pdf_objects = @import("pdf_objects.zig");
 const PdfContext = pdf_objects.PdfContext;
 const PdfValue = pdf_objects.PdfValue;
 const PdfError = pdf_objects.PdfError;
+const encoding = @import("encoding.zig");
 
 /// ToUnicode CMap: maps glyph IDs (as u16) to Unicode text.
 /// Built from PDF font /ToUnicode streams.
@@ -423,6 +424,33 @@ fn buildFontMaps(allocator: Allocator, ctx: *PdfContext, page_dict: []const pdf_
 	buildFontMapsFromResources(allocator, ctx, resources, font_maps);
 }
 
+/// Build a CMap from a 256-entry byte-to-Unicode encoding table.
+/// Populates char_map with UTF-8 strings for each byte value where the
+/// encoding differs from a simple ASCII identity mapping or is a high byte.
+fn buildCMapFromEncodingTable(allocator: Allocator, table: *const [256]u21) CMap {
+    var cmap = CMap.init(allocator);
+
+    // Populate mappings for bytes 0x80-0xFF (and any non-identity mappings below)
+    for (0..256) |i| {
+        const byte_val: u16 = @intCast(i);
+        const cp = table[i];
+        // Skip replacement character (undefined mapping)
+        if (cp == 0xFFFD) continue;
+        // Skip identity mappings for printable ASCII — these don't need CMap entries
+        if (i < 0x80 and cp == i) continue;
+        // Encode the Unicode codepoint to UTF-8 and store in char_map
+        var utf8_buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch continue;
+        const owned = allocator.dupe(u8, utf8_buf[0..len]) catch continue;
+        cmap.char_map.put(byte_val, owned) catch {
+            allocator.free(owned);
+            continue;
+        };
+    }
+
+    return cmap;
+}
+
 fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources: []const pdf_objects.DictEntry, font_maps: *FontMap) void {
 	// Find /Font dict within resources
 	const font_dict_or_ref = blk: {
@@ -478,24 +506,45 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 		}
 		defer if (owned_font_obj) |v| pdf_objects.freePdfValue(allocator, v);
 
-		// Check for /ToUnicode stream reference
-		const tounicode_ref = pdf_objects.getDictRef(font_obj_dict, "ToUnicode") orelse continue;
-		const cmap_data = (ctx.getStream(tounicode_ref.obj) catch continue) orelse continue;
-		defer allocator.free(cmap_data);
+		// Check for /ToUnicode stream reference (highest priority)
+		const tounicode_ref = pdf_objects.getDictRef(font_obj_dict, "ToUnicode");
+		if (tounicode_ref) |tu_ref| {
+			const cmap_data = (ctx.getStream(tu_ref.obj) catch null) orelse null;
+			if (cmap_data) |cd| {
+				defer allocator.free(cd);
+				// Skip oversized or empty CMap streams (likely corrupt)
+				if (cd.len > 0 and cd.len <= 4 * 1024 * 1024) {
+					var cmap = parseCMap(allocator, cd);
+					const owned_name = allocator.dupe(u8, font_name) catch {
+						cmap.deinit();
+						continue;
+					};
+					font_maps.put(owned_name, cmap) catch {
+						allocator.free(owned_name);
+						cmap.deinit();
+						continue;
+					};
+					continue; // successfully built CMap from ToUnicode
+				}
+			}
+		}
 
-		// Skip oversized or empty CMap streams (likely corrupt)
-		if (cmap_data.len == 0 or cmap_data.len > 4 * 1024 * 1024) continue;
-
-		var cmap = parseCMap(allocator, cmap_data);
-		const owned_name = allocator.dupe(u8, font_name) catch {
-			cmap.deinit();
-			continue;
-		};
-		font_maps.put(owned_name, cmap) catch {
-			allocator.free(owned_name);
-			cmap.deinit();
-			continue;
-		};
+		// Fallback: check /Encoding name for a known encoding table
+		const enc_name = pdf_objects.getDictName(font_obj_dict, "Encoding");
+		if (enc_name) |ename| {
+			if (encoding.getEncodingTable(ename)) |table| {
+				var cmap = buildCMapFromEncodingTable(allocator, table);
+				const owned_name = allocator.dupe(u8, font_name) catch {
+					cmap.deinit();
+					continue;
+				};
+				font_maps.put(owned_name, cmap) catch {
+					allocator.free(owned_name);
+					cmap.deinit();
+					continue;
+				};
+			}
+		}
 	}
 }
 

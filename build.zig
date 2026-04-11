@@ -16,6 +16,26 @@ pub fn build(b: *std.Build) void {
 	const sqlite3_lib = sqlite_vec_dep.artifact("sqlite3");
 	const vec_static_lib = sqlite_vec_dep.artifact("sqlite_vec0");
 
+	// uchardet encoding detection (C++ with C API)
+	// The uchardetz package exposes both static and shared "uchardet" artifacts,
+	// so we can't use artifact() which panics on ambiguity. Find the static one.
+	const uchardetz_dep = b.dependency("uchardetz", .{
+		.target = target,
+		.optimize = optimize,
+	});
+	const uchardet_lib = blk: {
+		for (uchardetz_dep.builder.install_tls.step.dependencies.items) |dep_step| {
+			const inst = dep_step.cast(std.Build.Step.InstallArtifact) orelse continue;
+			if (std.mem.eql(u8, inst.artifact.name, "uchardet")) {
+				if (inst.artifact.linkage) |lm| {
+					if (lm != .static) continue;
+				}
+				break :blk inst.artifact;
+			}
+		}
+		@panic("unable to find static uchardet artifact");
+	};
+
 	// Core module — root.zig re-exports all sub-modules
 	const core_mod = b.createModule(.{
 		.root_source_file = b.path("src/core/root.zig"),
@@ -26,6 +46,8 @@ pub fn build(b: *std.Build) void {
 	core_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 	core_mod.linkLibrary(sqlite3_lib);
 	core_mod.linkLibrary(vec_static_lib);
+	// encoding.zig uses uchardet for heuristic encoding detection
+	core_mod.linkLibrary(uchardet_lib);
 
 	// Static library for C FFI
 	const ffi_mod = b.createModule(.{
@@ -42,6 +64,7 @@ pub fn build(b: *std.Build) void {
 	});
 	lib.linkLibrary(sqlite3_lib);
 	lib.linkLibrary(vec_static_lib);
+	lib.linkLibrary(uchardet_lib);
 	ffi_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 	lib.installHeader(b.path("ffi/docscan_core.h"), "docscan_core.h");
 	b.installArtifact(lib);
@@ -64,6 +87,7 @@ pub fn build(b: *std.Build) void {
 	exe.linkLibrary(lib);
 	exe.linkLibrary(sqlite3_lib);
 	exe.linkLibrary(vec_static_lib);
+	exe.linkLibrary(uchardet_lib);
 	exe.linkLibC();
 	// Link Windows socket library for networking code
 	if (target.result.os.tag == .windows) {
@@ -83,6 +107,7 @@ pub fn build(b: *std.Build) void {
 	});
 	unit_tests.linkLibrary(sqlite3_lib);
 	unit_tests.linkLibrary(vec_static_lib);
+	unit_tests.linkLibrary(uchardet_lib);
 	test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 
 	const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -100,6 +125,7 @@ pub fn build(b: *std.Build) void {
 	});
 	ffi_tests.linkLibrary(sqlite3_lib);
 	ffi_tests.linkLibrary(vec_static_lib);
+	ffi_tests.linkLibrary(uchardet_lib);
 	ffi_test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 
 	const run_ffi_tests = b.addRunArtifact(ffi_tests);

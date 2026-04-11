@@ -23,4 +23,5 @@ test {
 	_ = @import("core/storage.zig");
 	_ = @import("core/search.zig");
 	_ = @import("core/ignore.zig");
+	_ = @import("core/encoding.zig");
 }

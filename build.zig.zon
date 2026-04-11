@@ -15,6 +15,11 @@
 			.url = "git+https://github.com/pmarreck/sqlite-vec.git#742ac1607d5490c71758c9fde80820387391910d",
 			.hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0OvwBACYsEQvfmbSw0sUHuXhcwD5PgjGyslHXU2q",
 		},
+		// uchardet encoding detection (C++ library with C API)
+		.uchardetz = .{
+			.url = "git+https://github.com/pmarreck/uchardetz.git#c8e00e37f2b1d615e59df4158d1245d28c4d16b5",
+			.hash = "uchardetz-0.0.6-koAyw7NFCwDRxaKK3hCecnFZVHhvUcs5HCfrJlrRmTzr",
+		},
 	},
 	.fingerprint = 0x20526b286e1fcb24,
 }
