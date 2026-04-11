@@ -941,6 +941,10 @@ typedef struct {
 	int     capacity;
 } file_list;
 
+static int file_list_cmp(const void* a, const void* b) {
+	return strcmp(*(const char**)a, *(const char**)b);
+}
+
 static void file_list_init(file_list* fl) {
 	fl->count = 0;
 	fl->capacity = 256;
@@ -2447,6 +2451,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 	file_list fl;
 	file_list_init(&fl);
 	collect_files(abs_path, &fl);
+	if (fl.count > 1) qsort(fl.paths, (size_t)fl.count, sizeof(char*), file_list_cmp);
 
 	if (fl.count == 0) {
 		if (g_json_output) {
@@ -3260,6 +3265,7 @@ static void mcp_handle_index(docscan_db* db, const char* model,
 	file_list fl;
 	file_list_init(&fl);
 	collect_files(abs_path, &fl);
+	if (fl.count > 1) qsort(fl.paths, (size_t)fl.count, sizeof(char*), file_list_cmp);
 
 	if (fl.count == 0) {
 		mcp_write_result_text(id_str, "No supported files found");
