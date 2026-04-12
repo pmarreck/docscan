@@ -85,13 +85,12 @@ This is a separate project-scale feature — the translation model is a heavy de
 - ~240+ automated tests (227 Zig unit + CLI + MCP)
 - 7 format parsers (md, txt, docx, pdf, doc, rtf, epub)
 
-## Known text extraction artifacts (to fix)
+## Known text extraction artifacts (remaining)
 
-- Soft hyphens (U+00AD `­`) used for line breaks not handled by normalizer — "over­turn" should become "overturn"
 - OCR-like corruption: "wo1,1ld" — commas/digits substituted for letters, can't fix without OCR correction
-- Comma spacing: ",heard" ",inside" — comma immediately followed by word without space (PDF layout artifact)
-- "Citi­group" — soft hyphen line break preserved instead of rejoined
-- Greenberg still split in some instances where it appears mid-line with unusual spacing
+- Email/URL boundaries: "Nakamotosatoshin@gmx.comwww.bitcoin.org" — need URL/email pattern detection to insert spaces
+- Encoding replacement chars: "�" in some PDFs (Berkshire letter) — need better fallback encoding handling
+- Stray isolated ligature expansions: lone "ff" on a line from a PDF ligature with no surrounding context
 
 ## Planned: Logical page numbers
 
@@ -105,4 +104,24 @@ restarts. All major formats support this:
 - **RTF**: `\pgnstart N` control word — sets starting page number
 - **EPUB**: `<pageList>` in navigation document (maps reading positions to printed pages, optional)
 
-Implementation: store both `page` (physical, 1-indexed from file start) and `page_label` (string, what the reader sees — "iv", "42", etc.) on each section/chunk. `--from`/`--to` should match logical page labels by default, with `--physical-page` flag for physical.
+### Data model
+
+Rename existing `page` to `page_physical` (u32, 1-indexed, always present for PDFs).
+
+New fields per section/chunk:
+- `page_logical: ?u32` — logical page number (null if no page labels metadata)
+- `page_section: u32` — numbering section (1-based, increments on each restart)
+- `page_roman: bool` — true = display as roman numeral, false = arabic
+
+Unique constraint: `(page_logical, page_section, page_roman)` per document.
+
+Roman numeral conversion: implement and test `romanToArabic()`/`arabicToRoman()` functions.
+
+DB: add indexes on `page_physical` and `(page_logical, page_section)` in chunks table.
+
+### CLI behavior
+
+- `--from N` / `--to N` default to `--physical` (whole document, no section filtering)
+- If `--physical` is defaulted to, stderr hint: "Using physical page numbers. Use --logical if document metadata supports it."
+- `--logical` flag switches to logical page matching
+- Cross-section ambiguity (same logical page in multiple sections): not handled for v1 — use physical pages. Document this limitation.
