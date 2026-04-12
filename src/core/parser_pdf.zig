@@ -276,8 +276,8 @@ const TextSpan = struct {
 	font_size: f32,
 	page: u32,
 	y_position: f32,
+	x_position: f32,
 };
-
 /// A flat section before nesting is applied.
 const FlatSection = struct {
 	heading: ?[]const u8, // owned
@@ -557,8 +557,8 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 	var current_font_name: ?[]const u8 = null; // e.g., "F1" — points into stream data
 	var last_name: ?[]const u8 = null; // last /Name token seen (for Tf matching)
 	var y_pos: f32 = 0;
+	var x_pos: f32 = 0;
 	var in_text_block = false;
-
 	while (pos < stream.len) {
 		pos = skipStreamWhitespace(stream, pos);
 		if (pos >= stream.len) break;
@@ -579,6 +579,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							.font_size = current_font_size,
 							.page = page_num,
 							.y_position = y_pos,
+							.x_position = x_pos,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -590,6 +591,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							.font_size = current_font_size,
 							.page = page_num,
 							.y_position = y_pos,
+							.x_position = x_pos,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -612,6 +614,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							.font_size = current_font_size,
 							.page = page_num,
 							.y_position = y_pos,
+							.x_position = x_pos,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -623,6 +626,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							.font_size = current_font_size,
 							.page = page_num,
 							.y_position = y_pos,
+							.x_position = x_pos,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -644,8 +648,9 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 						.font_size = current_font_size,
 						.page = page_num,
 						.y_position = y_pos,
+						.x_position = x_pos,
 					}) catch return PdfError.OutOfMemory;
-					continue;
+						continue;
 				}
 			}
 			allocator.free(arr_text);
@@ -659,8 +664,8 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 				// Per PDF spec, BT resets the text matrix and text line matrix
 				// to identity. Td offsets are relative within a BT block.
 				y_pos = 0;
-				pos += 2;
-				continue;
+				x_pos = 0;
+				pos += 2;				continue;
 			}
 		}
 
@@ -727,9 +732,9 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 				const ws2 = skipStreamWhitespace(stream, peek_pos);
 				if (ws2 < stream.len and stream[ws2] == 'T' and ws2 + 1 < stream.len and (stream[ws2 + 1] == 'd' or stream[ws2 + 1] == 'D')) {
 					if (ws2 + 2 >= stream.len or isDelimiter(stream[ws2 + 2])) {
+						x_pos += num; // num is tx (first operand)
 						y_pos += num2;
-						pos = ws2 + 2;
-						continue;
+						pos = ws2 + 2;						continue;
 					}
 				}
 
@@ -749,14 +754,15 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 					const ws3 = skipStreamWhitespace(stream, tm_pos);
 					if (ws3 < stream.len and stream[ws3] == 'T' and ws3 + 1 < stream.len and stream[ws3 + 1] == 'm') {
 						if (ws3 + 2 >= stream.len or isDelimiter(stream[ws3 + 2])) {
-							// Matrix [a b c d e f] — d is y-scale (font size), f is y-position
+							// Matrix [a b c d e f] — d is y-scale (font size), e is x-position, f is y-position
 							const d_val = tm_nums[1]; // [a,b,c,d,e,f] = [num, num2, tm[0], tm[1], tm[2], tm[3]]
+							const e_val = tm_nums[2];
 							const f_val = tm_nums[3];
 							if (@abs(d_val) > 0.1) current_font_size = @abs(d_val);
+							x_pos = e_val;
 							y_pos = f_val;
 							pos = ws3 + 2;
-							continue;
-						}
+							continue;						}
 					}
 				}
 			}
@@ -1090,6 +1096,8 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 
 	var current: ?usize = null;
 	var prev_y: f32 = 0;
+	var prev_x: f32 = 0;
+	var prev_text_len: usize = 0;
 	var prev_page: u32 = 0;
 	var prev_font_size: f32 = 12.0;
 	var has_prev_body: bool = false;
@@ -1097,7 +1105,27 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 	for (spans) |span| {
 		if (span.text.len == 0) continue;
 
-		if (span.font_size >= size_threshold) {
+		// Check if this span qualifies as a heading by font size
+		const is_heading = span.font_size >= size_threshold and blk: {
+			// Filter micro-headings: short spans in marginally-larger
+			// fonts are usually body text, not headings.
+			const trimmed = std.mem.trim(u8, span.text, " \t\n\r");
+			if (trimmed.len < 3) break :blk false;
+			// Single-word spans need stricter checks
+			const has_space = std.mem.indexOfScalar(u8, trimmed, ' ') != null;
+			if (!has_space) {
+				// Single word: require either all-caps or significantly
+				// larger font (>1.5x dominant) to be a heading
+				const is_all_caps = for (trimmed) |c| {
+					if (c >= 'a' and c <= 'z') break false;
+				} else true;
+				if (!is_all_caps and span.font_size < dominant_size * 2.0)
+					break :blk false;
+			}
+			break :blk true;
+		};
+
+		if (is_heading) {
 			// This span is a heading
 			const level = headingLevelForSize(span.font_size, heading_sizes.items);
 			try flat_sections.append(allocator, FlatSection{
@@ -1127,8 +1155,21 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 					const y_diff = @abs(span.y_position - prev_y);
 					const line_threshold = prev_font_size * 1.2;
 					if (y_diff < line_threshold) {
-						try fs.content_buf.append(allocator, ' ');
+						// Same line — only add space if needed
+						const buf_len = fs.content_buf.items.len;
+						const last_is_space = buf_len > 0 and fs.content_buf.items[buf_len - 1] == ' ';
+						const cur_starts_space = span.text.len > 0 and span.text[0] == ' ';
+						if (!last_is_space and !cur_starts_space) {
+							// No existing space — check x gap to decide
+							const estimated_prev_width = @as(f32, @floatFromInt(prev_text_len)) * prev_font_size * 0.4;
+							const gap = span.x_position - (prev_x + estimated_prev_width);
+							const space_threshold = prev_font_size * 0.25;
+							if (gap > space_threshold) {
+								try fs.content_buf.append(allocator, ' ');
+							}
+						}
 					} else {
+						// Different line — use newline
 						try fs.content_buf.append(allocator, '\n');
 					}
 				} else {
@@ -1137,12 +1178,13 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 			}
 			try fs.content_buf.appendSlice(allocator, span.text);
 			prev_y = span.y_position;
+			prev_x = span.x_position;
+			prev_text_len = span.text.len;
 			prev_page = span.page;
 			prev_font_size = span.font_size;
 			has_prev_body = true;
 		}
 	}
-
 	// Build hierarchical section tree
 	if (flat_sections.items.len == 0) return try allocator.alloc(Section, 0);
 	return try buildTree(allocator, flat_sections.items, 0, flat_sections.items.len);
@@ -1295,8 +1337,7 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 		for (page.text_items) |item| {
 			try stream_buf.appendSlice(allocator, "BT\n");
 			try std.fmt.format(stream_buf.writer(allocator), "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
-			try std.fmt.format(stream_buf.writer(allocator), "0 {d} Td\n", .{@as(i32, @intFromFloat(item.y_pos))});
-			try stream_buf.appendSlice(allocator, "(");
+			try std.fmt.format(stream_buf.writer(allocator), "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });			try stream_buf.appendSlice(allocator, "(");
 			try stream_buf.appendSlice(allocator, item.text);
 			try stream_buf.appendSlice(allocator, ") Tj\n");
 			try stream_buf.appendSlice(allocator, "ET\n");
@@ -1354,8 +1395,8 @@ const TestTextItem = struct {
 	text: []const u8,
 	font_size: f32,
 	y_pos: f32,
+	x_pos: f32 = 0,
 };
-
 // ── Tests ──────────────────────────────────────────────────────────
 
 test "extract text from single-page PDF" {
@@ -1531,15 +1572,14 @@ test "TJ array — large kerning inserts space between words" {
 	try testing.expectEqualStrings("Hello World", spans.items[0].text);
 }
 
-test "same-line spans get space separator, not newline" {
-	// When two Tj operations have the same Y position, they should be
-	// joined with a space, not a newline.
+test "same-line spans with word gaps get space separator" {
+	// When Tj operations have the same Y position and a significant
+	// horizontal gap, they should be joined with a space.
 	const pdf = try buildTestPdf(testing.allocator, &.{
 		.{ .text_items = &.{
-			.{ .text = "The", .font_size = 12, .y_pos = 700 },
-			.{ .text = "dominant", .font_size = 12, .y_pos = 700 },
-			.{ .text = "sequence", .font_size = 12, .y_pos = 700 },
-		} },
+			.{ .text = "The", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "dominant", .font_size = 12, .y_pos = 700, .x_pos = 28 },
+			.{ .text = "sequence", .font_size = 12, .y_pos = 700, .x_pos = 84 },		} },
 	});
 	defer testing.allocator.free(pdf);
 
@@ -1553,7 +1593,6 @@ test "same-line spans get space separator, not newline" {
 	// Must contain "The dominant sequence" with spaces
 	try testing.expect(std.mem.indexOf(u8, content, "The dominant sequence") != null);
 }
-
 test "different-line spans get newline separator" {
 	// When spans have different Y positions (different lines), they should be
 	// joined with a newline.
@@ -1650,4 +1689,52 @@ test "invalid PDF returns empty document" {
 	try testing.expectEqual(@as(usize, 0), doc.sections.len);
 	try testing.expectEqual(@as(?[]const u8, null), doc.title);
 	try testing.expectEqual(Format.pdf, doc.format);
+}
+
+test "intra-word kerning spans concatenate without space" {
+	// When Tj operations are close together on the same line (small x gap),
+	// they should concatenate directly — no space inserted.
+	// This prevents "tw enty-four" from being split into "tw" + " " + "enty-four".
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			// "tw" at x=0, "enty-four" immediately after (x=12, which is 2 chars * 6pt)
+			.{ .text = "tw", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "enty-four", .font_size = 12, .y_pos = 700, .x_pos = 12 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/kerning.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// Should be "twenty-four" without a space in the middle
+	try testing.expect(std.mem.indexOf(u8, content, "twenty-four") != null);
+	// Must NOT contain "tw enty"
+	try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, content, "tw enty"));
+}
+
+test "micro-headings treated as body text" {
+	// Single short words in a slightly larger font should NOT become headings.
+	// e.g., "to" at 14pt when body is 12pt should stay body text.
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "to", .font_size = 16, .y_pos = 750, .x_pos = 0 },
+			.{ .text = "Normal body text here.", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "More body text.", .font_size = 12, .y_pos = 680, .x_pos = 0 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/microheading.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	// "to" should NOT be a heading — it's too short
+	for (doc.sections) |s| {
+		if (s.heading) |h| {
+			// No heading should be just "to"
+			try testing.expect(!std.mem.eql(u8, h, "to"));
+		}
+	}
 }

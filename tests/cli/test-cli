@@ -452,6 +452,130 @@ fi
 rm -rf "$CFG_DEBUG_DIR"
 
 # ──────────────────────────────────────────────
+# 29. extract plaintext from a markdown file
+# ──────────────────────────────────────────────
+cat > "$TEST_DIR/extract-test.md" << 'FIXTURE'
+# Hello
+
+World
+FIXTURE
+out="" ; err="" ; rc=""
+capture "$BINARY" extract "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "World"; then
+	pass "extract plaintext from markdown"
+else
+	fail "extract plaintext from markdown" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 30. extract plaintext includes heading text
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Hello"; then
+	pass "extract plaintext includes heading text"
+else
+	fail "extract plaintext includes heading text" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 31. extract --markdown preserves headings
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --markdown "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "# Hello"; then
+	pass "extract --markdown preserves headings"
+else
+	fail "extract --markdown preserves headings" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 32. extract --json has sections array
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --json "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && echo "$out" | jq -e '.sections' > /dev/null 2>&1; then
+	pass "extract --json has sections array"
+else
+	fail "extract --json has sections array" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 33. extract --json has format field
+# ──────────────────────────────────────────────
+if echo "$out" | jq -e '.format' > /dev/null 2>&1; then
+	pass "extract --json has format field"
+else
+	fail "extract --json has format field" "out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 34. extract --json has path field
+# ──────────────────────────────────────────────
+if echo "$out" | jq -e '.path' > /dev/null 2>&1; then
+	pass "extract --json has path field"
+else
+	fail "extract --json has path field" "out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 35. extract from stdin via -
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo '# Stdin Test
+Content here' | \"$BINARY\" extract --format md -"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Content here"; then
+	pass "extract from stdin via -"
+else
+	fail "extract from stdin via -" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 36. extract with no file shows error
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract
+if [ "$rc" -ne 0 ]; then
+	pass "extract with no file shows error"
+else
+	fail "extract with no file shows error" "rc=$rc (expected non-zero)"
+fi
+
+# ──────────────────────────────────────────────
+# 37. extract unsupported format shows error
+# ──────────────────────────────────────────────
+echo "not a doc" > "$TEST_DIR/test.xyz"
+out="" ; err="" ; rc=""
+capture "$BINARY" extract "$TEST_DIR/test.xyz"
+if [ "$rc" -ne 0 ]; then
+	pass "extract unsupported format shows error"
+else
+	fail "extract unsupported format shows error" "rc=$rc (expected non-zero)"
+fi
+
+# ──────────────────────────────────────────────
+# 38. extract from stdin via @stdin
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'stdin alias test' | \"$BINARY\" extract --format txt @stdin"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "stdin alias test"; then
+	pass "extract from stdin via @stdin"
+else
+	fail "extract from stdin via @stdin" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 39. extract with path containing spaces
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract "$TEST_DIR/path with spaces/spaced.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "path with spaces"; then
+	pass "extract with path containing spaces"
+else
+	fail "extract with path containing spaces" "rc=$rc, out='$out', err='$err'"
+fi
+
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 echo ""
