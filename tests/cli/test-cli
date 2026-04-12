@@ -740,6 +740,51 @@ else
 	fail "normalize preserves decimal points" "rc=$rc, out='$out'"
 fi
 # ──────────────────────────────────────────────
+# 55. extract --from/--to flags are accepted
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --from 1 --to 1 "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ]; then
+	pass "extract --from/--to flags accepted"
+else
+	fail "extract --from/--to flags accepted" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 56. extract --from filters out earlier sections
+# ──────────────────────────────────────────────
+cat > "$TEST_DIR/pages-test.md" << 'FIXTURE'
+# Section One
+
+Content one.
+
+# Section Two
+
+Content two.
+
+# Section Three
+
+Content three.
+FIXTURE
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --from 2 "$TEST_DIR/pages-test.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "two" && echo "$out" | grep -q "three" && ! echo "$out" | grep -q "one"; then
+	pass "extract --from 2 filters earlier sections"
+else
+	fail "extract --from filters sections" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 57. extract --to filters out later sections
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --to 1 "$TEST_DIR/pages-test.md"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "one" && ! echo "$out" | grep -q "two" && ! echo "$out" | grep -q "three"; then
+	pass "extract --to 1 filters later sections"
+else
+	fail "extract --to filters sections" "rc=$rc, out='$out'"
+fi
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 echo ""

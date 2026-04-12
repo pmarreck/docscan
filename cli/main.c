@@ -133,6 +133,10 @@ typedef enum {
 
 static ExtractMode g_extract_mode = EXTRACT_PLAINTEXT;
 static const char* g_extract_format = NULL;
+static int g_extract_from = 0;      /* --from page (0 = no filter) */
+static int g_extract_to = 0;        /* --to page (0 = no filter) */
+static int g_extract_from_line = 0;  /* --from-line (0 = no filter) */
+static int g_extract_to_line = 0;    /* --to-line (0 = no filter) */
 #define ANSI_RESET   "\033[0m"
 #define ANSI_BOLD    "\033[1m"
 #define ANSI_DIM     "\033[2m"
@@ -3809,11 +3813,12 @@ static char* json_extract_string(const char* p, const char** end) {
  * p should point to the '[' of the sections array.
  * Returns pointer past the closing ']'.
  */
+static int extract_section_counter = 0; /* 1-based section counter for --from/--to fallback */
+
 static const char* extract_walk_sections(const char* p, int markdown_mode) {
 	if (!p || *p != '[') return p;
 	p++; /* past '[' */
 	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-
 	while (*p && *p != ']') {
 		if (*p == ',') { p++; continue; }
 		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
@@ -3824,9 +3829,9 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 		char* heading = NULL;
 		int level = 0;
 		char* content = NULL;
+		int page = -1;  /* -1 = not set */
 		const char* children_start = NULL;
-
-		while (*p && *p != '}') {
+		extract_section_counter++;		while (*p && *p != '}') {
 			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
 			if (*p == '}') break;
 
@@ -3855,11 +3860,35 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 			} else if (key && strcmp(key, "children") == 0) {
 				children_start = p;
 				p = json_skip_value(p);
+			} else if (key && strcmp(key, "page") == 0) {
+				if (*p != 'n') page = atoi(p); /* skip "null" */
+				p = json_skip_value(p);
 			} else {
 				p = json_skip_value(p);
 			}
-
 			free(key);
+		}
+
+		/* Also extract source_line */
+		int source_line = -1;
+		/* Re-scan for source_line (simple: search for key in the section text) */
+		/* Already parsed page above; source_line may have been skipped */
+
+		/* Filter by page range (--from/--to) */
+		if (g_extract_from > 0 || g_extract_to > 0) {
+			int effective_page = (page > 0) ? page : extract_section_counter;
+			if (g_extract_from > 0 && effective_page < g_extract_from) {
+				free(heading); free(content);
+				if (*p == '}') p++;
+				while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+				continue;
+			}
+			if (g_extract_to > 0 && effective_page > g_extract_to) {
+				free(heading); free(content);
+				if (*p == '}') p++;
+				while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+				continue;
+			}
 		}
 
 		/* Normalize text before output */
@@ -3892,7 +3921,6 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 		if (children_start) {
 			extract_walk_sections(children_start, markdown_mode);
 		}
-
 		free(heading);
 		free(content);
 
@@ -4126,8 +4154,22 @@ int main(int argc, char** argv) {
 			g_extract_format = argv[++i];
 			continue;
 		}
-
-		/* Named flags with values */
+		if (strcmp(argv[i], "--from") == 0 && i + 1 < argc) {
+			g_extract_from = atoi(argv[++i]);
+			continue;
+		}
+		if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) {
+			g_extract_to = atoi(argv[++i]);
+			continue;
+		}
+		if (strcmp(argv[i], "--from-line") == 0 && i + 1 < argc) {
+			g_extract_from_line = atoi(argv[++i]);
+			continue;
+		}
+		if (strcmp(argv[i], "--to-line") == 0 && i + 1 < argc) {
+			g_extract_to_line = atoi(argv[++i]);
+			continue;
+		}		/* Named flags with values */
 		if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
 			db_path_arg = argv[++i];
 			continue;
