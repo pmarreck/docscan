@@ -43,6 +43,12 @@ docscan search "liability protection provisions"
 
 # Check index status
 docscan status
+
+# Extract text from a document (no database needed)
+docscan extract document.pdf
+docscan extract --markdown report.docx
+docscan extract --json contract.md
+cat file.md | docscan extract --format md -
 ```
 
 ## Embedding backends

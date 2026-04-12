@@ -492,8 +492,155 @@ fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
 
 	return try result.toOwnedSlice(allocator);
 }
+/// Expand PDF ligature placeholders and fix punctuation spacing.
+/// Control chars 0x01→"fl", 0x02→"fi", 0x03→"ff"; other control chars
+/// (except \n \r \t) are stripped. Also inserts a space after '.' when
+/// preceded by a lowercase letter and followed by an uppercase letter
+/// (but not in abbreviations like "U.S." or decimals like "3.14"), and
+/// after ',', ';', ':' when followed by a letter (but not digits like "1,000").
+fn normalizeText(allocator: Allocator, text: []const u8) ![]const u8 {
+	var result = std.ArrayList(u8){};
+	errdefer result.deinit(allocator);
+
+	var i: usize = 0;
+	while (i < text.len) {
+		// 1a. Handle literal escape sequences from PDF parser: "u0002" → "fi" etc.
+		if (i + 4 < text.len and text[i] == 0x75 and text[i+1] == 0x30 and text[i+2] == 0x30 and text[i+3] == 0x30) {
+			switch (text[i+4]) {
+				0x31 => { try result.appendSlice(allocator, "fl"); i += 5; continue; },
+				0x32 => { try result.appendSlice(allocator, "fi"); i += 5; continue; },
+				0x33 => { try result.appendSlice(allocator, "ff"); i += 5; continue; },
+				0x36 => { try result.appendSlice(allocator, "ffi"); i += 5; continue; },
+				else => { i += 5; continue; },
+			}
+		}
+
+		// 1. Ligature expansion / control char stripping
+		if (text[i] < 0x20 and text[i] != '\n' and text[i] != '\r' and text[i] != '\t') {
+			switch (text[i]) {
+				0x01 => try result.appendSlice(allocator, "fl"),
+				0x02 => try result.appendSlice(allocator, "fi"),
+				0x03 => try result.appendSlice(allocator, "ff"),
+				else => {}, // strip other control chars
+			}
+			i += 1;
+			continue;
+
+		}
+
+		// 2. Period + uppercase: "spirit.Winston" → "spirit. Winston"
+		//    Exception: don't touch if prev is uppercase (abbreviation "U.S.")
+		//    or digit (decimal "3.14")
+		if (text[i] == '.' and i > 0 and i + 1 < text.len) {
+			const prev = text[i - 1];
+			const next = text[i + 1];
+			if (std.ascii.isLower(prev) and std.ascii.isUpper(next)) {
+				try result.append(allocator, '.');
+				try result.append(allocator, ' ');
+				i += 1;
+				continue;
+			}
+		}
+
+		// 3. Comma/semicolon/colon + letter: "what,inside" → "what, inside"
+		//    Exception: digit before comma (number formatting "1,000")
+		if ((text[i] == ',' or text[i] == ';' or text[i] == ':') and
+			i + 1 < text.len and std.ascii.isAlphabetic(text[i + 1]))
+		{
+			if (text[i] == ',' and i > 0 and std.ascii.isDigit(text[i - 1])) {
+				// Keep as-is (number formatting like "1,000")
+			} else {
+				try result.append(allocator, text[i]);
+				try result.append(allocator, ' ');
+				i += 1;
+				continue;
+			}
+		}
+
+		try result.append(allocator, text[i]);
+		i += 1;
+	}
+
+	return try result.toOwnedSlice(allocator);
+}
+
+/// Split concatenated words that are not in the dictionary.
+/// Handles both camelCase boundaries (lowercase→uppercase) and all-lowercase
+/// concatenations from EPUB/PDF span boundaries.
+/// E.g. "placeimpossible" → "place impossible", "McDonald" stays intact.
+/// Strategy: if the token is not a known word, try splitting at every position
+/// where both halves are real standalone words. Prefer the longest left part
+/// (greedy) to avoid spurious short-word splits.
+fn splitCamelBoundaries(allocator: Allocator, text: []const u8) ![]const u8 {
+	var result = std.ArrayList(u8){};
+	errdefer result.deinit(allocator);
+
+	var i: usize = 0;
+	while (i < text.len) {
+		// Copy non-alpha characters (spaces, newlines, punctuation between words)
+		if (!std.ascii.isAlphabetic(text[i])) {
+			try result.append(allocator, text[i]);
+			i += 1;
+			continue;
+		}
+
+		// Find end of this word token (contiguous alphabetic chars)
+		var word_end = i;
+		while (word_end < text.len and std.ascii.isAlphabetic(text[word_end])) {
+			word_end += 1;
+		}
+		const token = text[i..word_end];
+
+		// If the whole token is already a known word, don't split
+		if (isWord(token)) {
+			try result.appendSlice(allocator, token);
+			i = word_end;
+			continue;
+		}
+
+		// Try splitting: scan from longest-left to shortest-left.
+		// Require both halves to be >=3 chars AND dictionary words.
+		// This avoids false splits like "Greenbe" → "Green"+"be" where
+		// "be" is a function word that happens to match. Short fragments
+		// at word boundaries are almost always PDF split artifacts, not
+		// real word boundaries.
+		var split_pos: ?usize = null;
+		if (token.len >= 8) { // minimum: 4+4 chars
+			// Scan right-to-left for longest left match
+			var j: usize = token.len - 4;
+			while (j >= 4) : (j -= 1) {
+				const left = token[0..j];
+				const right = token[j..];
+				if (isWord(left) and isWord(right)) {
+					split_pos = j;
+					break;
+				}
+			}
+		}
+
+		if (split_pos) |sp| {
+			try result.appendSlice(allocator, token[0..sp]);
+			try result.append(allocator, ' ');
+			try result.appendSlice(allocator, token[sp..]);
+		} else {
+			try result.appendSlice(allocator, token);
+		}
+		i = word_end;
+	}
+
+	return try result.toOwnedSlice(allocator);
+}
+
 pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	ensureInit();
+
+	// Phase 0-pre-a: expand ligatures and fix punctuation spacing
+	const normalized = try normalizeText(allocator, text);
+	defer allocator.free(normalized);
+
+	// Phase 0-pre-b: split at lowercase-uppercase word boundaries
+	const camel_split = try splitCamelBoundaries(allocator, normalized);
+	defer allocator.free(camel_split);
 
 	// Phase 0a: strip soft hyphens (U+00AD = 0xC2 0xAD in UTF-8)
 	// These are line-break hints, not real hyphens.
@@ -501,13 +648,13 @@ pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	defer stripped.deinit(allocator);
 	{
 		var j: usize = 0;
-		while (j < text.len) {
-			if (j + 1 < text.len and text[j] == 0xC2 and text[j + 1] == 0xAD) {
+		while (j < camel_split.len) {
+			if (j + 1 < camel_split.len and camel_split[j] == 0xC2 and camel_split[j + 1] == 0xAD) {
 				j += 2;
 				// Also skip newline after soft hyphen (it was a line break)
-				while (j < text.len and (text[j] == 0x0A or text[j] == 0x0D or text[j] == 0x20)) : (j += 1) {}
+				while (j < camel_split.len and (camel_split[j] == 0x0A or camel_split[j] == 0x0D or camel_split[j] == 0x20)) : (j += 1) {}
 			} else {
-				try stripped.append(allocator, text[j]);
+				try stripped.append(allocator, camel_split[j]);
 				j += 1;
 			}
 		}
@@ -524,6 +671,23 @@ pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	return try rejoinPass(allocator, pass1);
 }
 
+
+const document = @import("document.zig");
+
+/// Walk all sections recursively and apply text normalization.
+pub fn applySections(allocator: Allocator, sections: []const document.Section) void {
+	const mutable: []document.Section = @constCast(sections);
+	for (mutable) |*section| {
+		if (section.content.len > 0) {
+			const fixed = rejoinWords(allocator, section.content) catch continue;
+			allocator.free(@constCast(section.content));
+			section.content = fixed;
+		}
+		if (section.children.len > 0) {
+			applySections(allocator, section.children);
+		}
+	}
+}
 // ── Tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -712,6 +876,82 @@ test "dictionary loads and contains key words for normalization" {
 	try testing.expect(!isWord("foran")); // proper noun, not capitalized
 }
 
+test "normalizeText: ligature expansion 0x02 → fi" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "Arti\x02cial Intelligence");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("Artificial Intelligence", result);
+}
 
+test "normalizeText: ligature expansion 0x01 → fl, 0x03 → ff" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "\x01ower o\x03er");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("flower offer", result);
+}
 
+test "normalizeText: strips other control chars" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "he\x04llo\x00 world");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("hello world", result);
+}
 
+test "normalizeText: space after period before capital" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "spirit.Winston poured");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("spirit. Winston poured", result);
+}
+
+test "normalizeText: preserves U.S. abbreviation" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "U.S. stock market");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("U.S. stock market", result);
+}
+
+test "normalizeText: preserves decimal 3.14" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "costs 3.14 dollars");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("costs 3.14 dollars", result);
+}
+
+test "normalizeText: space after comma before letter" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "what,inside the");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("what, inside the", result);
+}
+
+test "normalizeText: preserves number formatting 1,000" {
+	const alloc = testing.allocator;
+	const result = try normalizeText(alloc, "about 1,000 items");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("about 1,000 items", result);
+}
+
+test "splitCamelBoundaries: placeimpossible → place impossible" {
+	const alloc = testing.allocator;
+	// Must init dictionary first
+	ensureInit();
+	const result = try splitCamelBoundaries(alloc, "placeimpossible to enter");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("place impossible to enter", result);
+}
+
+test "splitCamelBoundaries: preserves McDonald" {
+	const alloc = testing.allocator;
+	ensureInit();
+	const result = try splitCamelBoundaries(alloc, "McDonald went to YouTube");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("McDonald went to YouTube", result);
+}
+
+test "rejoinWords: full pipeline ligature + punctuation + camel" {
+	const alloc = testing.allocator;
+	const result = try rejoinWords(alloc, "Arti\x02cial Intelligence");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("Artificial Intelligence", result);
+}

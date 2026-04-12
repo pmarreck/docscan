@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const wordfix = @import("wordfix.zig");
 const document = @import("document.zig");
 const Document = document.Document;
 const Section = document.Section;
@@ -587,6 +588,9 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 		}
 	}
 
+	// Normalize extracted text
+	wordfix.applySections(gpa, sections);
+
 	const path_dupe = try gpa.dupe(u8, path);
 
 	return Document{
@@ -791,7 +795,7 @@ test "heading detection in EPUB" {
 		\\<h1>Chapter One</h1>
 		\\<p>First chapter content.</p>
 		\\<h2>Section 1.1</h2>
-		\\<p>Sub-section content.</p>
+		\\<p>Subsection content.</p>
 		\\</body>
 		\\</html>
 	;
@@ -813,7 +817,7 @@ test "heading detection in EPUB" {
 	try testing.expectEqual(@as(usize, 1), doc.sections[0].children.len);
 	try testing.expectEqualStrings("Section 1.1", doc.sections[0].children[0].heading.?);
 	try testing.expectEqual(@as(u8, 2), doc.sections[0].children[0].level);
-	try testing.expect(std.mem.indexOf(u8, doc.sections[0].children[0].content, "Sub-section content.") != null);
+	try testing.expect(std.mem.indexOf(u8, doc.sections[0].children[0].content, "Subsection content.") != null);
 }
 
 test "multi-chapter EPUB" {

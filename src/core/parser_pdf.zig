@@ -330,7 +330,7 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	}
 
 	// Post-process: rejoin falsely-split words using dictionary lookup
-	try applySectionWordfix(allocator, sections);
+	wordfix.applySections(allocator, sections);
 
 	// Extract title from first heading or first text
 	var title: ?[]const u8 = null;
@@ -1044,20 +1044,6 @@ fn isDelimiter(c: u8) bool {
 
 /// Walk all sections (recursively into children) and apply dictionary-based
 /// word rejoining to fix false splits from PDF text extraction.
-fn applySectionWordfix(allocator: Allocator, sections: []const Section) !void {
-	// Cast away const to modify content in-place (we own these allocations)
-	const mutable: []Section = @constCast(sections);
-	for (mutable) |*section| {
-		if (section.content.len > 0) {
-			const fixed = try wordfix.rejoinWords(allocator, section.content);
-			allocator.free(@constCast(section.content));
-			section.content = fixed;
-		}
-		if (section.children.len > 0) {
-			try applySectionWordfix(allocator, section.children);
-		}
-	}
-}
 
 // ── Structure Inference ────────────────────────────────────────────
 

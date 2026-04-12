@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const wordfix = @import("wordfix.zig");
 const document = @import("document.zig");
 const Document = document.Document;
 const Section = document.Section;

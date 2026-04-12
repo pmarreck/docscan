@@ -663,6 +663,83 @@ if [ "$rc" -eq 0 ] && [ "$out" = "overturn" ]; then
 else
 	fail "normalize removes soft hyphen" "rc=$rc, out='$out'"
 fi
+
+# ──────────────────────────────────────────────
+# 48. normalize: space after period before capital letter
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'spirit.Winston poured' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "spirit. Winston poured" ]; then
+	pass "normalize adds space after period before capital"
+else
+	fail "normalize adds space after period before capital" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 49. normalize: space after comma before lowercase
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'what,inside the' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "what, inside the" ]; then
+	pass "normalize adds space after comma before letter"
+else
+	fail "normalize adds space after comma before letter" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 50. normalize: strip control characters (U+0002 etc)
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "printf 'Arti\x02cial Intelligence' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "Artificial Intelligence" ]; then
+	pass "normalize strips control chars and rejoins"
+else
+	fail "normalize strips control chars and rejoins" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 51. normalize: space between lowercase-uppercase boundary
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'placeimpossible to enter' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "place impossible to enter" ]; then
+	pass "normalize adds space at camelCase word boundary"
+else
+	fail "normalize adds space at camelCase word boundary" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 52. normalize: don't break real camelCase or proper nouns
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'McDonald went to YouTube' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "McDonald went to YouTube" ]; then
+	pass "normalize preserves proper nouns like McDonald"
+else
+	fail "normalize preserves proper nouns" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 53. normalize: don't add space after period in abbreviations
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'U.S. stock market' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "U.S. stock market" ]; then
+	pass "normalize preserves abbreviation periods"
+else
+	fail "normalize preserves abbreviation periods" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 54. normalize: don't add space after period in decimals
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'costs 3.14 dollars' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "costs 3.14 dollars" ]; then
+	pass "normalize preserves decimal points"
+else
+	fail "normalize preserves decimal points" "rc=$rc, out='$out'"
+fi
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
