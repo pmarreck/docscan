@@ -127,6 +127,11 @@ int docscan_config_set(docscan_db* db, const char* key, const char* value,
 /* ── Memory ──────────────────────────────────────────────────────── */
 
 /* Free any string returned by docscan_* functions (NULL-safe). */
+/* Normalize text: apply word rejoining and dehyphenation heuristics.
+ * Returns cleaned text. Caller must free with docscan_free(). */
+char* docscan_normalize(const char* text, size_t len,
+                         char* err_buf, size_t err_buf_len);
+
 void docscan_free(char* ptr);
 
 #ifdef __cplusplus

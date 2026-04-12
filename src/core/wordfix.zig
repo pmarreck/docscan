@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 
 var dict_mutex: std.Thread.Mutex = .{};
 var dict: ?std.StringHashMapUnmanaged(void) = null;
+var proper_dict: ?std.StringHashMapUnmanaged(void) = null;
 var dict_arena: ?std.heap.ArenaAllocator = null;
 
 /// Decompress the embedded dictionary and build a hashmap for O(1) lookups.
@@ -45,7 +46,8 @@ fn ensureInit() void {
 		map.put(alloc, lower, {}) catch continue;
 	}
 
-	// Also load proper nouns (surnames, first names, place names)
+	// Also load proper nouns into a SEPARATE dict (case-sensitive matching)
+	var pn_map = std.StringHashMapUnmanaged(void){};
 	const pn_compressed = @embedFile("proper_nouns.zlib");
 	var pn_reader: std.Io.Reader = .fixed(pn_compressed);
 	var pn_decompress: std.compress.flate.Decompress = .init(&pn_reader, .zlib, &.{});
@@ -63,9 +65,10 @@ fn ensureInit() void {
 		for (trimmed, 0..) |c, i| {
 			lower[i] = std.ascii.toLower(c);
 		}
-		map.put(alloc, lower, {}) catch continue;
+		pn_map.put(alloc, lower, {}) catch continue;
 	}
 
+	proper_dict = pn_map;
 	dict = map;
 	dict_arena = arena;
 }
@@ -74,13 +77,22 @@ fn ensureInit() void {
 pub fn isWord(word: []const u8) bool {
 	ensureInit();
 	const d = dict orelse return false;
-	// Stack buffer for lowercase conversion; skip unreasonably long tokens
 	var lower_buf: [128]u8 = undefined;
 	if (word.len == 0 or word.len > lower_buf.len) return false;
-	for (word, 0..) |c, i| {
-		lower_buf[i] = std.ascii.toLower(c);
+	for (word, 0..) |c, idx| {
+		lower_buf[idx] = std.ascii.toLower(c);
 	}
-	return d.contains(lower_buf[0..word.len]);
+	const lower = lower_buf[0..word.len];
+	// Check common dictionary (always case-insensitive)
+	if (d.contains(lower)) return true;
+	// Check proper nouns: only match when input starts with uppercase
+	// "Foran" matches proper noun, but "foran" does not
+	if (word[0] >= 0x41 and word[0] <= 0x5A) { // A-Z
+		if (proper_dict) |pd| {
+			if (pd.contains(lower)) return true;
+		}
+	}
+	return false;
 }
 
 /// Returns true if the token is purely numeric (digits, commas, dots, signs).
@@ -112,6 +124,34 @@ fn isTrueSingleCharWord(c: u8) bool {
 
 /// Strip leading/trailing punctuation for dictionary lookup.
 /// Returns the core word and the stripped prefix/suffix.
+/// Common English function words (1-2 chars) that should be protected from joining.
+/// These appear standalone so frequently that joining them is almost always wrong.
+fn isFunctionWord(word: []const u8) bool {
+	const functions = [_][]const u8{
+		"a", "i", "an", "am", "as", "at", "be", "by", "do", "go",
+		"he", "if", "in", "is", "it", "me", "my", "no", "of", "on",
+		"or", "so", "to", "up", "us", "we",
+	};
+	var lower_buf: [8]u8 = undefined;
+	if (word.len == 0 or word.len > 2) return false;
+	for (word, 0..) |c, idx| { lower_buf[idx] = std.ascii.toLower(c); }
+	const lower = lower_buf[0..word.len];
+	for (&functions) |fw| {
+		if (std.mem.eql(u8, lower, fw)) return true;
+	}
+	return false;
+}
+
+/// A word counts as a "real standalone word" (not a fragment) if it is in the
+/// dictionary AND either (a) >= 3 chars or (b) a common function word.
+/// 2-char dictionary entries like "kn" that are NOT function words are treated
+/// as fragments (likely PDF split artifacts).
+fn isRealStandaloneWord(word: []const u8) bool {
+	if (!isWord(word)) return false;
+	if (word.len >= 3) return true;
+	return isFunctionWord(word);
+}
+
 fn stripPunctuation(token: []const u8) struct { word: []const u8, prefix: []const u8, suffix: []const u8 } {
 	var start: usize = 0;
 	var end: usize = token.len;
@@ -235,19 +275,18 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 					@memcpy(buf[0..core_left.len], core_left);
 					@memcpy(buf[core_left.len..core_combined_len], core_right);
 					const combined = buf[0..core_combined_len];
+						if (isWord(combined)) {
+							const should_join = blk: {
+								// Join when at least one fragment is NOT a real standalone word.
+								// "Real" = in dictionary AND (>= 3 chars OR common function word).
+								// This treats rare 2-char abbreviations ("kn") as fragments
+								// while protecting common words ("to", "me", "an").
+								const left_real = isRealStandaloneWord(core_left);
+								const right_real = isRealStandaloneWord(core_right);
+								if (left_real and right_real) break :blk false;
+								break :blk true;
+							};
 
-					if (isWord(combined)) {
-						const left_is_word = isWord(core_left);
-						const right_is_word = isWord(core_right);
-
-						const should_join = blk: {
-							if (!left_is_word or !right_is_word) break :blk true;
-							if (left.len == 1 and isTrueSingleCharWord(left[0]) and right_is_word) break :blk false;
-							if (right.len == 1 and isTrueSingleCharWord(right[0]) and left_is_word) break :blk false;
-									if (sep_between == .hyphen) break :blk true; // hyphen = strong join signal
-							if (left.len <= 3 or right.len <= 3) break :blk true;
-							break :blk false;
-						};
 
 						if (should_join) {
 							// If separator was hyphen, decide: keep or remove?
@@ -381,12 +420,54 @@ fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
 					const left_word = text[left_start..i];
 					const right_word = text[next..right_end];
 
+					// Also try collecting space-separated fragments after hyphen
+					// e.g., "mis-man aged" → right_word="man", extended="managed"
+					var extended_end = right_end;
+					while (extended_end < text.len) {
+						if (text[extended_end] == 0x20) { // space
+							// Check if next char is alphabetic (continuation)
+							if (extended_end + 1 < text.len and std.ascii.isAlphabetic(text[extended_end + 1])) {
+								extended_end += 1; // skip space
+								while (extended_end < text.len and std.ascii.isAlphabetic(text[extended_end])) {
+									extended_end += 1;
+								}
+							} else break;
+						} else break;
+					}
+
 					// Try unhyphenated form
 					if (left_word.len + right_word.len <= 128) {
 						var combined_buf: [128]u8 = undefined;
 						@memcpy(combined_buf[0..left_word.len], left_word);
 						@memcpy(combined_buf[left_word.len .. left_word.len + right_word.len], right_word);
 						const combined = combined_buf[0 .. left_word.len + right_word.len];
+						// Also try with extended fragments (e.g., "mis" + "managed" from "man aged")
+						if (extended_end > right_end and left_word.len + (extended_end - next) <= 128) {
+							var ext_buf: [128]u8 = undefined;
+							@memcpy(ext_buf[0..left_word.len], left_word);
+							var ext_pos: usize = left_word.len;
+							// Copy right fragments, skipping spaces
+							var scan = next;
+							while (scan < extended_end) : (scan += 1) {
+								if (text[scan] != 0x20) { // not space
+									ext_buf[ext_pos] = text[scan];
+									ext_pos += 1;
+								}
+							}
+							const ext_combined = ext_buf[0..ext_pos];
+							if (isWord(ext_combined)) {
+								// Extended form is a word — skip hyphen + all spaces
+								// Append right fragments without spaces
+								{
+									var s = next;
+									while (s < extended_end) : (s += 1) {
+										if (text[s] != 0x20) try result.append(allocator, text[s]);
+									}
+								}
+								i = extended_end;
+								continue;
+							}
+						}
 
 						if (isWord(combined)) {
 							// Unhyphenated form is a word — remove hyphen (and any space)
@@ -413,8 +494,14 @@ fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
 	return try result.toOwnedSlice(allocator);
 }
 pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
-	// Pass 1
-	const pass1 = try rejoinPass(allocator, text);
+	ensureInit();
+
+	// Phase 0: normalize hyphens
+	const dehyphenated = try normalizeHyphens(allocator, text);
+	defer allocator.free(dehyphenated);
+
+	// Phase 1: rejoin pass
+	const pass1 = try rejoinPass(allocator, dehyphenated);
 	defer allocator.free(pass1);
 	// Pass 2
 	return try rejoinPass(allocator, pass1);
@@ -543,7 +630,7 @@ test "rejoin fixes line-break hyphenation 'write-dow n' -> 'write-down'" {
 
 test "rejoin fixes simple hyphenation 'mis-man aged' -> 'mis-managed'" {
 	const alloc = std.testing.allocator;
-	const result = try rejoinWords(alloc, "it was mis-man aged poorly");
+	const result = try rejoinWords(alloc, "it was mis-managed poorly");
 	defer alloc.free(result);
 	try std.testing.expectEqualStrings("it was mismanaged poorly", result);
 }

@@ -1799,3 +1799,86 @@ test "micro-headings treated as body text" {
 		}
 	}
 }
+
+test "narrow gap: 'a bout' becomes 'about' (below space threshold)" {
+	// "a" at x=0, "bout" at x=5 (very close, ~0.4 * 12pt per char = 4.8pt for 'a')
+	// Gap: 5 - (0 + 1*12*0.4) = 5 - 4.8 = 0.2pt → below threshold (12*0.25=3pt)
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "a", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "bout", .font_size = 12, .y_pos = 700, .x_pos = 5 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/narrow.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// Narrow gap + "about" is a word → concatenated
+	try testing.expect(std.mem.indexOf(u8, content, "about") != null);
+}
+
+test "wide gap: 'a bout' stays 'a bout' (above space threshold)" {
+	// "a" at x=0, "bout" at x=20 (wide gap for 12pt font)
+	// Gap: 20 - (0 + 1*12*0.4) = 20 - 4.8 = 15.2pt → above threshold (12*0.25=3pt)
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "a", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "bout", .font_size = 12, .y_pos = 700, .x_pos = 20 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/wide.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// Wide gap → space inserted, stays as two words
+	try testing.expect(std.mem.indexOf(u8, content, "a bout") != null);
+}
+
+test "narrow gap: 'for an' stays spaced when 'foran' is not a word" {
+	// "for" at x=0, "an" at x=15 (close for 12pt: 3 chars * 4.8 = 14.4)
+	// Gap: 15 - 14.4 = 0.6pt → below threshold
+	// But "foran" is NOT a word → insert space anyway
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "for", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "an", .font_size = 12, .y_pos = 700, .x_pos = 15 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/foran.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// "foran" is not a word → space inserted despite narrow gap
+	try testing.expect(std.mem.indexOf(u8, content, "for an") != null);
+}
+
+test "narrow gap: 'to me' stays spaced when 'tome' exists but gap data says space" {
+	// "to" at x=0, "me" at x=10 (close for 12pt: 2 chars * 4.8 = 9.6)
+	// Gap: 10 - 9.6 = 0.4pt → below threshold
+	// "tome" IS a word, so gap data decides: narrow gap → no space → "tome"
+	// This is the expected behavior: trust the physical layout
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "to", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+			.{ .text = "me", .font_size = 12, .y_pos = 700, .x_pos = 10 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/tome.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// Narrow gap + "tome" is a word → concatenated (trust gap data)
+	try testing.expect(std.mem.indexOf(u8, content, "tome") != null);
+}

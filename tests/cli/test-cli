@@ -576,6 +576,72 @@ else
 fi
 
 # ──────────────────────────────────────────────
+# 40. normalize subcommand fixes split words
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'kn own' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "known" ]; then
+	pass "normalize fixes 'kn own' -> 'known'"
+else
+	fail "normalize fixes 'kn own' -> 'known'" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 41. normalize preserves valid word boundaries
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'to me' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "to me" ]; then
+	pass "normalize preserves 'to me'"
+else
+	fail "normalize preserves 'to me'" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 42. normalize dehyphenates mis-managed
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'mis-managed' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "mismanaged" ]; then
+	pass "normalize dehyphenates 'mis-managed'"
+else
+	fail "normalize dehyphenates 'mis-managed'" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 43. normalize keeps twenty-four hyphenated
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'twenty-four' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "twenty-four" ]; then
+	pass "normalize keeps 'twenty-four' hyphenated"
+else
+	fail "normalize keeps 'twenty-four' hyphenated" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 44. normalize fixes nob ody with comma
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'a nob ody, indeed' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "a nobody, indeed" ]; then
+	pass "normalize fixes 'nob ody,' -> 'nobody,'"
+else
+	fail "normalize fixes 'nob ody,' -> 'nobody,'" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 45. normalize fixes Greenbe rg (proper noun)
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'Ace Greenbe rg' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "Ace Greenberg" ]; then
+	pass "normalize fixes 'Greenbe rg' -> 'Greenberg'"
+else
+	fail "normalize fixes 'Greenbe rg' -> 'Greenberg'" "rc=$rc, out='$out'"
+fi
+
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 echo ""

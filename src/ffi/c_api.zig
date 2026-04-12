@@ -808,6 +808,27 @@ export fn docscan_config_set(
 	return 0;
 }
 
+
+/// Normalize text: apply word rejoining and dehyphenation heuristics.
+export fn docscan_normalize(
+	text: ?[*]const u8,
+	len: usize,
+	err_buf: ?[*]u8,
+	err_buf_len: usize,
+) ?[*:0]u8 {
+	const input = if (text) |t| t[0..len] else {
+		writeError(err_buf, err_buf_len, "null text pointer");
+		return null;
+	};
+
+	const result = core.wordfix.rejoinWords(gpa, input) catch {
+		writeError(err_buf, err_buf_len, "normalize failed");
+		return null;
+	};
+	defer gpa.free(result);
+
+	return dupeToC(result);
+}
 /// Free a string returned by any docscan_* function.
 export fn docscan_free(ptr: ?[*:0]u8) void {
 	if (ptr) |p| {

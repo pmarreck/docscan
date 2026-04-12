@@ -1688,7 +1688,8 @@ static void print_help(void) {
 		"  index <path>          Index a directory or file\n"
 		"  update [path]         Re-index changed files only\n"
 		"  search <query>        Search indexed documents\n"
-		"  extract <file>        Extract text from a document\n"
+		"  normalize              Normalize text from stdin (word rejoining, dehyphenation)\n"
+	"  extract <file>        Extract text from a document\n"
 		"  status                Show index statistics\n"
 		"  config [key] [value]  Get/set configuration\n"
 		"  config debug          Show effective config with sources\n"
@@ -3995,6 +3996,48 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 
 /* ── Main: argument parsing ─────────────────────────────────────────── */
 
+/* ── Command: normalize ───────────────────────────────────────────── */
+
+/*
+ * cmd_normalize — read text from stdin, apply word-rejoining heuristics,
+ * output cleaned text to stdout. For testing the wordfix pipeline.
+ */
+static int cmd_normalize(void) {
+	/* Read all of stdin */
+	size_t cap = 4096;
+	size_t len = 0;
+	char* buf = malloc(cap);
+	if (!buf) { err_msg("out of memory"); return 1; }
+
+	int ch;
+	while ((ch = getchar()) != EOF) {
+		if (len + 1 >= cap) {
+			cap *= 2;
+			char* nb = realloc(buf, cap);
+			if (!nb) { free(buf); err_msg("out of memory"); return 1; }
+			buf = nb;
+		}
+		buf[len++] = (char)ch;
+	}
+	/* Trim trailing newline */
+	while (len > 0 && (buf[len-1] == 0x0a || buf[len-1] == 0x0d)) len--;
+	buf[len] = 0;
+
+	/* Call FFI normalize (which calls wordfix.rejoinWords) */
+	char err_buf[ERR_BUF_LEN];
+	char* result = docscan_normalize(buf, len, err_buf, sizeof(err_buf));
+	free(buf);
+
+	if (!result) {
+		err_msg("normalize failed: %s", err_buf);
+		return 1;
+	}
+
+	printf("%s\n", result);
+	docscan_free(result);
+	return 0;
+}
+
 int main(int argc, char** argv) {
 #ifndef NDEBUG
 	fprintf(stderr, "\033[33mDEBUG BUILD\033[0m\n");
@@ -4322,6 +4365,10 @@ int main(int argc, char** argv) {
 
 	if (strcmp(command, "mcp-serve") == 0) {
 		return cmd_mcp_serve(db_path_arg, model);
+	}
+
+	if (strcmp(command, "normalize") == 0) {
+		return cmd_normalize();
 	}
 
 	if (strcmp(command, "extract") == 0) {
