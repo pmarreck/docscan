@@ -41,9 +41,54 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] i18n translations (groundwork laid: --lang, DOCSCAN_LANG)
 - [ ] Legal embedding model research/fine-tuning
 - [x] `docscan config debug` subcommand — shows effective config with sources (2026-04-08 EST)
+- [x] `docscan extract` command — parse-and-output with plaintext/markdown/JSON modes, stdin support (2026-04-10 EST)
+
+## Future: `docscan translate`
+
+Local document translation using open-source models. Potential architecture:
+
+- **Bulk translation**: NLLB-200 (Meta, MIT, 200 languages, 600M-3.3B params) or Madlad-400 (Google, Apache 2.0, 400 languages). MLX versions exist for Apple Silicon.
+- **Cross-lingual indexing**: index both original text AND English translation per chunk, enabling FTS5 exact search across languages (not just vector search)
+- **Cross-lingual search**: `docscan search "financial crisis" --translate es` — translates results
+- **Full document translation**: `docscan translate --from auto --to es document.pdf > documento_es.md`
+
+### Translation metadata / translator's notes
+
+Local translation models (NLLB, OpusMT, Madlad) produce raw translations without cultural context. Frontier LLMs produce *annotated* translations with notes on idioms, cultural references, and ambiguities. A hybrid approach:
+
+1. Local model does bulk translation (fast, cheap)
+2. Reasoning model (cloud API or local 7B+ instruct) does a second pass flagging:
+   - Idioms that don't translate literally
+   - Cultural references that need context
+   - Ambiguous terms with multiple valid translations
+   - Register/formality mismatches
+
+Inline format for translation notes (inspired by published translator's notes):
+```markdown
+He kicked the bucket [TN: "cassé sa pipe" — lit. "broke his pipe," French idiom for dying]
+```
+
+Structured format for downstream processing:
+```json
+{
+  "original": "Il a cassé sa pipe",
+  "translation": "He kicked the bucket",
+  "notes": [{"type": "idiom", "span": "cassé sa pipe", "literal": "broke his pipe", "note": "French idiom for dying, informal register"}]
+}
+```
+
+This is a separate project-scale feature — the translation model is a heavy dependency (600M-3B params), quality bar is high, and the annotation pass requires LLM reasoning.
 
 ## Stats
 
-- ~12,800 lines across 18 source files
-- ~201 automated tests (159 Zig unit + 28 CLI + 14 MCP)
-- 4 format parsers (md, docx, pdf, doc)
+- ~16,000+ lines across 20+ source files
+- ~240+ automated tests (227 Zig unit + CLI + MCP)
+- 7 format parsers (md, txt, docx, pdf, doc, rtf, epub)
+
+## Known text extraction artifacts (to fix)
+
+- Soft hyphens (U+00AD `­`) used for line breaks not handled by normalizer — "over­turn" should become "overturn"
+- OCR-like corruption: "wo1,1ld" — commas/digits substituted for letters, can't fix without OCR correction
+- Comma spacing: ",heard" ",inside" — comma immediately followed by word without space (PDF layout artifact)
+- "Citi­group" — soft hyphen line break preserved instead of rejoined
+- Greenberg still split in some instances where it appears mid-line with unusual spacing
