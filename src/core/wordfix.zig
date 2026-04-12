@@ -347,6 +347,71 @@ fn rejoinPass(allocator: Allocator, text: []const u8) ![]const u8 {
 /// Rejoin falsely-split words in text. Applies two passes to catch
 /// chained splits (e.g., "un know n" -> "un known" -> "unknown").
 /// Returns a new string owned by the provided allocator.
+/// Phase 0: Hyphen normalization.
+/// 1. "mis- managed" → "mis-managed" (remove space after intra-word hyphen)
+/// 2. "mis-managed" → "mismanaged" (remove hyphen if unhyphenated form is in dictionary)
+/// 3. "twenty-four" → "twenty-four" (keep hyphen if unhyphenated form is NOT in dictionary)
+fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
+	var result = std.ArrayList(u8){};
+	errdefer result.deinit(allocator);
+
+	var i: usize = 0;
+	while (i < text.len) {
+		// Look for pattern: word-fragment or word- fragment
+		if (text[i] == '-') {
+			// Check if this hyphen is between word characters
+			if (i > 0 and i + 1 < text.len and std.ascii.isAlphabetic(text[i - 1])) {
+				// Skip optional space after hyphen
+				var next = i + 1;
+				if (next < text.len and text[next] == ' ') next += 1;
+
+				if (next < text.len and std.ascii.isAlphabetic(text[next])) {
+					// Found "word-word" or "word- word" pattern
+					// Find the full left word (scan back to last space/newline/start)
+					var left_start = i;
+					while (left_start > 0 and text[left_start - 1] != ' ' and text[left_start - 1] != '\n') {
+						left_start -= 1;
+					}
+					// Find the full right word (scan forward to next space/newline/end/hyphen)
+					var right_end = next;
+					while (right_end < text.len and text[right_end] != ' ' and text[right_end] != '\n' and text[right_end] != '-') {
+						right_end += 1;
+					}
+
+					const left_word = text[left_start..i];
+					const right_word = text[next..right_end];
+
+					// Try unhyphenated form
+					if (left_word.len + right_word.len <= 128) {
+						var combined_buf: [128]u8 = undefined;
+						@memcpy(combined_buf[0..left_word.len], left_word);
+						@memcpy(combined_buf[left_word.len .. left_word.len + right_word.len], right_word);
+						const combined = combined_buf[0 .. left_word.len + right_word.len];
+
+						if (isWord(combined)) {
+							// Unhyphenated form is a word — remove hyphen (and any space)
+							// Replace the left word + hyphen + optional space with just the left word
+							// (right word will be appended naturally by the loop)
+							// Actually: we already appended left_word chars up to the hyphen.
+							// Just skip the hyphen and optional space.
+							i = next; // skip past hyphen and optional space
+							continue;
+						}
+					}
+
+					// Unhyphenated form NOT a word — keep hyphen, but remove space if "word- word"
+					try result.append(allocator, '-');
+					i = next; // skip past hyphen and optional space (join "word- word" → "word-word")
+					continue;
+				}
+			}
+		}
+		try result.append(allocator, text[i]);
+		i += 1;
+	}
+
+	return try result.toOwnedSlice(allocator);
+}
 pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	// Pass 1
 	const pass1 = try rejoinPass(allocator, text);
@@ -496,4 +561,32 @@ test "rejoin fixes proper noun split 'Greenbe rg' -> 'Greenberg'" {
 	const result = try rejoinWords(alloc, "met Ace Greenbe rg at the");
 	defer alloc.free(result);
 	try std.testing.expectEqualStrings("met Ace Greenberg at the", result);
+}
+
+test "hyphen normalization: mis-managed → mismanaged" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "it was mis-managed poorly");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("it was mismanaged poorly", result);
+}
+
+test "hyphen normalization: mis- managed → mismanaged" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "it was mis- managed poorly");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("it was mismanaged poorly", result);
+}
+
+test "hyphen normalization: twenty-four stays hyphenated" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "she was twenty-four years old");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("she was twenty-four years old", result);
+}
+
+test "hyphen normalization: over- come → overcome" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "to over- come the obstacle");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("to overcome the obstacle", result);
 }
