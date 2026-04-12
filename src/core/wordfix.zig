@@ -495,8 +495,26 @@ fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
 pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	ensureInit();
 
-	// Phase 0: normalize hyphens
-	const dehyphenated = try normalizeHyphens(allocator, text);
+	// Phase 0a: strip soft hyphens (U+00AD = 0xC2 0xAD in UTF-8)
+	// These are line-break hints, not real hyphens.
+	var stripped = std.ArrayList(u8){};
+	defer stripped.deinit(allocator);
+	{
+		var j: usize = 0;
+		while (j < text.len) {
+			if (j + 1 < text.len and text[j] == 0xC2 and text[j + 1] == 0xAD) {
+				j += 2;
+				// Also skip newline after soft hyphen (it was a line break)
+				while (j < text.len and (text[j] == 0x0A or text[j] == 0x0D or text[j] == 0x20)) : (j += 1) {}
+			} else {
+				try stripped.append(allocator, text[j]);
+				j += 1;
+			}
+		}
+	}
+
+	// Phase 0b: normalize hyphens
+	const dehyphenated = try normalizeHyphens(allocator, stripped.items);
 	defer allocator.free(dehyphenated);
 
 	// Phase 1: rejoin pass

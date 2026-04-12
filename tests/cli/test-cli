@@ -652,6 +652,17 @@ if [ "$rc" -eq 0 ] && [ "$out" = "it was mismanaged poorly" ]; then
 else
 	fail "normalize handles hyphenated split with prefix" "rc=$rc, out='$out'"
 fi
+
+# ──────────────────────────────────────────────
+# 47. normalize removes soft hyphens and rejoins
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "printf 'over\xc2\xadturn' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "overturn" ]; then
+	pass "normalize removes soft hyphen: over­turn -> overturn"
+else
+	fail "normalize removes soft hyphen" "rc=$rc, out='$out'"
+fi
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
