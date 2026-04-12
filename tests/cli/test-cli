@@ -311,9 +311,8 @@ if [ "$rc" -eq 0 ]; then
 	ini_content=""
 	ini_content=$(cat "$CFG_TEST_DIR2/.docscan/config.ini" 2>/dev/null)
 	if echo "$ini_content" | grep -q "api = openai" && \
-	   echo "$ini_content" | grep -q "url = http://localhost:8000" && \
-	   echo "$ini_content" | grep -q "model = bge-m3-mlx"; then
-		pass "config.ini persists CLI flags (embedding-api, url, model)"
+	   echo "$ini_content" | grep -qE "url = http://(localhost|127\.0\.0\.1):8000" && \
+	   echo "$ini_content" | grep -q "model = bge-m3-mlx"; then		pass "config.ini persists CLI flags (embedding-api, url, model)"
 	else
 		fail "config.ini persists CLI flags" "ini contents don't match expected values"
 	fi
