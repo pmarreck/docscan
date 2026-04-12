@@ -122,6 +122,17 @@ static int g_use_simple = 0;
 static int g_show_progress = 1;
 static int g_json_output = 0;
 static int g_num_threads = DEFAULT_THREADS;
+
+/* ── Extract command state ─────────────────────────────────────────────── */
+
+typedef enum {
+	EXTRACT_PLAINTEXT = 0,
+	EXTRACT_MARKDOWN  = 1,
+	/* EXTRACT_JSON uses g_json_output */
+} ExtractMode;
+
+static ExtractMode g_extract_mode = EXTRACT_PLAINTEXT;
+static const char* g_extract_format = NULL;
 #define ANSI_RESET   "\033[0m"
 #define ANSI_BOLD    "\033[1m"
 #define ANSI_DIM     "\033[2m"
@@ -1677,6 +1688,7 @@ static void print_help(void) {
 		"  index <path>          Index a directory or file\n"
 		"  update [path]         Re-index changed files only\n"
 		"  search <query>        Search indexed documents\n"
+		"  extract <file>        Extract text from a document\n"
 		"  status                Show index statistics\n"
 		"  config [key] [value]  Get/set configuration\n"
 		"  config debug          Show effective config with sources\n"
@@ -1686,6 +1698,8 @@ static void print_help(void) {
 		"  -h, --help            Show this help\n"
 		"  --about               Show version and platform info\n"
 		"  --json                Output as JSON\n"
+		"  --markdown            Output as markdown (extract command)\n"
+		"  --format <fmt>        Override format detection (md|txt|docx|pdf|doc|rtf|epub)\n"
 		"  --limit N             Limit search results (default: 10)\n"
 		"  --exact               Exact (FTS5-only) search\n"
 		"  --similar             Similar (vector-only) search\n"
@@ -1720,6 +1734,10 @@ static void print_help(void) {
 		"  docscan update ~/Documents\n"
 		"  docscan status\n"
 		"  docscan config embedding.model bge-m3\n"
+		"  docscan extract document.pdf\n"
+		"  docscan extract --markdown report.docx\n"
+		"  docscan extract --json contract.md\n"
+		"  cat file.md | docscan extract --format md -\n"
 		"  docscan config embedding.api openai\n",
 		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
@@ -2647,6 +2665,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 			}
 		}
 
+		info_msg("Phase 1/3: Parsing %d files (%d threads)...", fl.count, nthreads);
 		/* Progress updates while Phase 1 workers run */
 		while (atomic_load(&ctx.completed) < fl.count) {
 			int done = atomic_load(&ctx.completed);
@@ -2711,7 +2730,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 				} else {
 					int total_batches = (total_chunks + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE;
 
-					info_msg("Embedding %d chunks in %d batch%s...",
+					info_msg("Phase 2/3: Embedding %d chunks in %d batch%s...",
 						total_chunks, total_batches, total_batches == 1 ? "" : "es");
 
 					progress_init(&prog, total_chunks);
@@ -2751,6 +2770,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 			}
 		}
 
+		if (files_to_index > 0) info_msg("Phase 3/3: Inserting %d files into database...", files_to_index);
 		/* ── Phase 3: Sequential insertion + tally ───────────────── */
 		int emb_global_offset = 0;
 		info_msg("Inserting %d file%s into database...",
@@ -3669,6 +3689,310 @@ static int cmd_mcp_serve(const char* db_path_arg, const char* model) {
 	return 0;
 }
 
+/* ── Extract command ───────────────────────────────────────────────── */
+
+/*
+ * Skip past a JSON value (string, number, object, array, bool, null).
+ * Returns pointer to the character after the value, or NULL on error.
+ */
+static const char* json_skip_value(const char* p) {
+	if (!p) return NULL;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+
+	if (*p == '"') {
+		/* string */
+		p++;
+		while (*p && *p != '"') {
+			if (*p == '\\') { p++; if (*p) p++; }
+			else p++;
+		}
+		if (*p == '"') p++;
+		return p;
+	}
+	if (*p == '{') {
+		/* object */
+		int depth = 1;
+		p++;
+		while (*p && depth > 0) {
+			if (*p == '{') depth++;
+			else if (*p == '}') depth--;
+			else if (*p == '"') {
+				p++;
+				while (*p && *p != '"') {
+					if (*p == '\\') { p++; if (*p) p++; }
+					else p++;
+				}
+				/* p now points to closing quote */
+			}
+			if (*p) p++;
+		}
+		return p;
+	}
+	if (*p == '[') {
+		/* array */
+		int depth = 1;
+		p++;
+		while (*p && depth > 0) {
+			if (*p == '[') depth++;
+			else if (*p == ']') depth--;
+			else if (*p == '"') {
+				p++;
+				while (*p && *p != '"') {
+					if (*p == '\\') { p++; if (*p) p++; }
+					else p++;
+				}
+			}
+			if (*p) p++;
+		}
+		return p;
+	}
+	/* number, bool, null */
+	while (*p && *p != ',' && *p != '}' && *p != ']' &&
+	       *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+	return p;
+}
+
+/*
+ * Extract a JSON string value in-place. Returns malloc'd unescaped string.
+ * p should point to the opening '"'. On return, *end points past the closing '"'.
+ */
+static char* json_extract_string(const char* p, const char** end) {
+	if (!p || *p != '"') {
+		if (end) *end = p;
+		return NULL;
+	}
+	p++; /* past opening quote */
+
+	/* First pass: measure */
+	size_t len = 0;
+	const char* scan = p;
+	while (*scan && *scan != '"') {
+		if (*scan == '\\' && *(scan + 1)) {
+			scan += 2;
+		} else {
+			scan++;
+		}
+		len++;
+	}
+
+	char* buf = malloc(len + 1);
+	if (!buf) { if (end) *end = scan; return NULL; }
+
+	/* Second pass: copy with unescape */
+	size_t i = 0;
+	while (*p && *p != '"' && i < len) {
+		if (*p == '\\' && *(p + 1)) {
+			p++;
+			switch (*p) {
+				case 'n': buf[i++] = '\n'; break;
+				case 'r': buf[i++] = '\r'; break;
+				case 't': buf[i++] = '\t'; break;
+				case '"': buf[i++] = '"';  break;
+				case '\\': buf[i++] = '\\'; break;
+				case '/': buf[i++] = '/';  break;
+				default: buf[i++] = *p;    break;
+			}
+		} else {
+			buf[i++] = *p;
+		}
+		p++;
+	}
+	buf[i] = '\0';
+	if (*p == '"') p++;
+	if (end) *end = p;
+	return buf;
+}
+
+/*
+ * Recursively walk sections in JSON and output text.
+ * p should point to the '[' of the sections array.
+ * Returns pointer past the closing ']'.
+ */
+static const char* extract_walk_sections(const char* p, int markdown_mode) {
+	if (!p || *p != '[') return p;
+	p++; /* past '[' */
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+
+	while (*p && *p != ']') {
+		if (*p == ',') { p++; continue; }
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+		if (*p != '{') break;
+		p++; /* past '{' */
+
+		/* Walk key-value pairs in this section object */
+		char* heading = NULL;
+		int level = 0;
+		char* content = NULL;
+		const char* children_start = NULL;
+
+		while (*p && *p != '}') {
+			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+			if (*p == '}') break;
+
+			/* Parse key */
+			if (*p != '"') break;
+			const char* key_end;
+			char* key = json_extract_string(p, &key_end);
+			p = key_end;
+
+			/* Skip ':' */
+			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+			if (*p == ':') p++;
+			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+
+			if (key && strcmp(key, "heading") == 0) {
+				if (*p == 'n' && strncmp(p, "null", 4) == 0) {
+					p += 4;
+				} else {
+					heading = json_extract_string(p, &p);
+				}
+			} else if (key && strcmp(key, "level") == 0) {
+				level = atoi(p);
+				p = json_skip_value(p);
+			} else if (key && strcmp(key, "content") == 0) {
+				content = json_extract_string(p, &p);
+			} else if (key && strcmp(key, "children") == 0) {
+				children_start = p;
+				p = json_skip_value(p);
+			} else {
+				p = json_skip_value(p);
+			}
+
+			free(key);
+		}
+
+		/* Output this section */
+		if (heading && heading[0]) {
+			if (markdown_mode) {
+				for (int i = 0; i < level && i < 6; i++) printf("#");
+				if (level > 0) printf(" ");
+				printf("%s\n\n", heading);
+			} else {
+				printf("%s\n", heading);
+			}
+		}
+		if (content && content[0]) {
+			printf("%s\n", content);
+			if (markdown_mode) printf("\n");
+		}
+
+		/* Recurse into children */
+		if (children_start) {
+			extract_walk_sections(children_start, markdown_mode);
+		}
+
+		free(heading);
+		free(content);
+
+		if (*p == '}') p++;
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+	}
+
+	if (*p == ']') p++;
+	return p;
+}
+
+/*
+ * Read all of stdin into a malloc'd buffer. Returns NULL on error.
+ */
+static uint8_t* read_stdin_all(size_t* out_len) {
+	size_t cap = 4096;
+	size_t len = 0;
+	uint8_t* buf = malloc(cap);
+	if (!buf) return NULL;
+
+	while (1) {
+		if (len + 4096 > cap) {
+			cap *= 2;
+			uint8_t* nb = realloc(buf, cap);
+			if (!nb) { free(buf); return NULL; }
+			buf = nb;
+		}
+		size_t rd = fread(buf + len, 1, 4096, stdin);
+		if (rd == 0) break;
+		len += rd;
+	}
+	*out_len = len;
+	return buf;
+}
+
+/*
+ * cmd_extract — extract text from a document and output to stdout.
+ *
+ * Modes:
+ *   - Plaintext (default): just output all text content
+ *   - Markdown (--markdown): output with heading markers
+ *   - JSON (--json): output raw JSON from docscan_parse
+ */
+static int cmd_extract(const char* file_path, const char* format_override) {
+	uint8_t* data = NULL;
+	size_t data_len = 0;
+	const char* format = NULL;
+	const char* display_path = file_path;
+
+	/* Read input */
+	if (strcmp(file_path, "-") == 0 || strcmp(file_path, "@stdin") == 0) {
+		data = read_stdin_all(&data_len);
+		if (!data) {
+			err_msg("failed to read stdin");
+			return 1;
+		}
+		display_path = "<stdin>";
+		if (!format_override) {
+			err_msg("--format is required when reading from stdin");
+			free(data);
+			return 1;
+		}
+	} else {
+		data = read_file(file_path, &data_len);
+		if (!data) {
+			err_msg("cannot read file: %s", file_path);
+			return 1;
+		}
+	}
+
+	/* Determine format */
+	if (format_override) {
+		format = format_override;
+	} else {
+		format = format_for_ext(file_path);
+		if (!format) {
+			err_msg("unsupported format: %s", file_path);
+			free(data);
+			return 1;
+		}
+	}
+
+	/* Parse via FFI */
+	char err_buf[ERR_BUF_LEN];
+	err_buf[0] = '\0';
+	char* json = docscan_parse(data, data_len, display_path, format,
+	                           err_buf, sizeof(err_buf));
+	free(data);
+
+	if (!json) {
+		err_msg("parse failed: %s", err_buf[0] ? err_buf : "unknown error");
+		return 1;
+	}
+
+	/* Output based on mode */
+	if (g_json_output) {
+		/* JSON mode: output raw JSON */
+		printf("%s\n", json);
+	} else {
+		/* Find the "sections" array in the JSON */
+		const char* sections = strstr(json, "\"sections\"");
+		if (sections) {
+			sections += 10; /* past "sections" */
+			while (*sections == ' ' || *sections == ':') sections++;
+			extract_walk_sections(sections, g_extract_mode == EXTRACT_MARKDOWN);
+		}
+	}
+
+	docscan_free(json);
+	return 0;
+}
+
 /* ── Main: argument parsing ─────────────────────────────────────────── */
 
 int main(int argc, char** argv) {
@@ -3740,6 +4064,14 @@ int main(int argc, char** argv) {
 			search_mode = "similar";
 			continue;
 		}
+		if (strcmp(argv[i], "--markdown") == 0) {
+			g_extract_mode = EXTRACT_MARKDOWN;
+			continue;
+		}
+		if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+			g_extract_format = argv[++i];
+			continue;
+		}
 
 		/* Named flags with values */
 		if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
@@ -3791,7 +4123,7 @@ int main(int argc, char** argv) {
 			continue;
 		}
 		/* Command or positional arg */
-		if (argv[i][0] == '-') {
+		if (argv[i][0] == '-' && argv[i][1] != '\0') {
 			err_msg("unknown flag: %s", argv[i]);
 			fprintf(stderr, "Run 'docscan --help' for usage.\n");
 			return 1;
@@ -3990,6 +4322,16 @@ int main(int argc, char** argv) {
 
 	if (strcmp(command, "mcp-serve") == 0) {
 		return cmd_mcp_serve(db_path_arg, model);
+	}
+
+	if (strcmp(command, "extract") == 0) {
+		const char* file_arg = (positional_count > 0) ? positionals[0] : NULL;
+		if (!file_arg) {
+			err_msg("extract requires a file argument");
+			fprintf(stderr, "Usage: docscan extract [--markdown|--json] [--format <fmt>] <file>\n");
+			return 1;
+		}
+		return cmd_extract(file_arg, g_extract_format);
 	}
 
 	/* Unknown command */
