@@ -48,8 +48,11 @@ docscan status
 docscan extract document.pdf
 docscan extract --markdown report.docx
 docscan extract --json contract.md
+docscan extract --from 5 --to 10 book.pdf
 cat file.md | docscan extract --format md -
-```
+
+# Normalize text (fix word splits, ligatures, hyphenation)
+echo "kn own" | docscan normalize```
 
 ## Embedding backends
 
@@ -102,11 +105,12 @@ Exposes 7 tools: `docscan_search`, `docscan_status`, `docscan_read_chunk`, `docs
 | Format | Extraction | Structure detection | Location info |
 |--------|-----------|-------------------|---------------|
 | `.md` | Full text | ATX headings (`#` through `######`) | Line number |
+| `.txt` | Full text | (same as markdown) | Line number |
 | `.docx` | Full text + metadata | Word heading styles (Heading1-6, Title) | Page (from `lastRenderedPageBreak`) |
 | `.pdf` | Full text via content stream operators | Font-size heuristics + ToUnicode CMap | Page number |
 | `.doc` | Full text via OLE2/Piece Table | Heuristic (ALL CAPS, numbered sections) | — |
 | `.rtf` | Full text with Unicode/Windows-1252 decoding | Font-size heuristics, `\page` breaks | Page (hard breaks) |
-
+| `.epub` | Full text from XHTML chapters | HTML headings (h1-h6) | — |
 ## Building from source
 
 Requires [Nix](https://nixos.org/download) with flakes enabled.

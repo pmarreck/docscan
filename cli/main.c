@@ -1705,6 +1705,10 @@ static void print_help(void) {
 		"  --json                Output as JSON\n"
 		"  --markdown            Output as markdown (extract command)\n"
 		"  --format <fmt>        Override format detection (md|txt|docx|pdf|doc|rtf|epub)\n"
+		"  --from N              Extract from page N (PDF/DOCX)\n"
+		"  --to N                Extract to page N (PDF/DOCX)\n"
+		"  --from-line N         Extract from source line N\n"
+		"  --to-line N           Extract to source line N\n"
 		"  --limit N             Limit search results (default: 10)\n"
 		"  --exact               Exact (FTS5-only) search\n"
 		"  --similar             Similar (vector-only) search\n"
@@ -1717,8 +1721,7 @@ static void print_help(void) {
 		"  --no-progress         Disable progress bar\n"
 		"  --simple              Plain output (no color, no emoji)\n"
 		"  --lang <code>         Language override\n"
-		"  --threads N           Number of indexing threads (default: 4)\n"
-		"\n"
+		"  --threads N           Number of indexing threads (default: 8)\n"		"\n"
 		"%sENVIRONMENT%s\n"
 		"  DOCSCAN_MODEL              Default embedding model\n"
 		"  DOCSCAN_DB                 Default database path\n"
@@ -1742,9 +1745,10 @@ static void print_help(void) {
 		"  docscan extract document.pdf\n"
 		"  docscan extract --markdown report.docx\n"
 		"  docscan extract --json contract.md\n"
+		"  docscan extract --from 5 --to 10 book.pdf\n"
 		"  cat file.md | docscan extract --format md -\n"
-		"  docscan config embedding.api openai\n",
-		color(ANSI_BOLD), color(ANSI_RESET),
+		"  echo 'kn own' | docscan normalize\n"
+		"  docscan config embedding.api openai\n",		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
