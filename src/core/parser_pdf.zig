@@ -1026,6 +1026,14 @@ fn skipStreamWhitespace(data: []const u8, start: usize) usize {
 	return p;
 }
 
+/// Check if a slice contains only ASCII alphabetic characters.
+fn isAlphaOnly(s: []const u8) bool {
+	for (s) |c| {
+		if (!std.ascii.isAlphabetic(c)) return false;
+	}
+	return s.len > 0;
+}
+
 fn isDelimiter(c: u8) bool {
 	return c == ' ' or c == '\t' or c == '\n' or c == '\r' or
 		c == '/' or c == '<' or c == '>' or c == '[' or c == ']' or
@@ -1189,6 +1197,36 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 							const space_threshold = prev_font_size * 0.25;
 							if (gap > space_threshold) {
 								try fs.content_buf.append(allocator, ' ');
+							} else {
+								// Gap below threshold — but check if concatenating
+								// produces a non-word. If so, keep the space.
+								// "for"+"an" = "foran" (not a word) → insert space
+								// "sell"+"off" = "selloff" (a word) → no space
+								const prev_start = if (buf_len > 20) buf_len - 20 else 0;
+								const prev_word_start = blk: {
+									var s = buf_len;
+									while (s > prev_start) : (s -= 1) {
+										if (fs.content_buf.items[s - 1] == ' ' or fs.content_buf.items[s - 1] == '\n') break;
+									}
+									break :blk s;
+								};
+								const prev_fragment = fs.content_buf.items[prev_word_start..buf_len];
+								if (prev_fragment.len > 0 and prev_fragment.len + span.text.len <= 64) {
+									var concat_buf: [64]u8 = undefined;
+									@memcpy(concat_buf[0..prev_fragment.len], prev_fragment);
+									const span_word_end = blk2: {
+										var e: usize = 0;
+										while (e < span.text.len and span.text[e] != ' ' and span.text[e] != '\n') : (e += 1) {}
+										break :blk2 e;
+									};
+									const next_fragment = span.text[0..span_word_end];
+									@memcpy(concat_buf[prev_fragment.len..prev_fragment.len + next_fragment.len], next_fragment);
+									const combined = concat_buf[0..prev_fragment.len + next_fragment.len];
+									if (!wordfix.isWord(combined) and prev_fragment.len >= 2 and next_fragment.len >= 2 and isAlphaOnly(prev_fragment) and isAlphaOnly(next_fragment)) {
+										// Concatenation is not a word — this was a real space
+										try fs.content_buf.append(allocator, ' ');
+									}
+								}
 							}
 						}
 					} else {

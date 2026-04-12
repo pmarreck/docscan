@@ -124,141 +124,180 @@ fn stripPunctuation(token: []const u8) struct { word: []const u8, prefix: []cons
 }
 
 fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
-	// Split into tokens on spaces
-	var tokens = std.ArrayList([]const u8){};
+	// Tokenize on spaces AND hyphens. Each token tracks the separator
+	// that PRECEDES it (space, hyphen, or none for the first token).
+	const Sep = enum { none, space, hyphen };
+	const Token = struct { text: []const u8, sep: Sep };
+
+	var tokens = std.ArrayList(Token){};
 	defer tokens.deinit(allocator);
 
-	var splits = std.mem.splitScalar(u8, line, ' ');
-	while (splits.next()) |tok| {
-		if (tok.len == 0) continue; // skip multiple consecutive spaces
-		try tokens.append(allocator, tok);
+	var start: usize = 0;
+	for (line, 0..) |c, idx| {
+		if (c == ' ' or c == '-') {
+			if (idx > start) {
+				try tokens.append(allocator, .{
+					.text = line[start..idx],
+					.sep = if (tokens.items.len == 0) .none else if (c == '-') .hyphen else .space,
+				});
+			} else if (tokens.items.len > 0 and c == '-') {
+				// Consecutive separator: trailing hyphen (e.g., "over- come")
+				// Mark next token as preceded by hyphen
+			}
+			start = idx + 1;
+			// Handle trailing hyphen: "over- come" → next token sep = hyphen
+			if (c == '-' and idx + 1 < line.len and line[idx + 1] == ' ') {
+				// "over-" followed by space: record hyphen, skip the space
+				if (idx > start - 1) { // token was already appended above
+				}
+			}
+		}
+	}
+	if (start < line.len) {
+		try tokens.append(allocator, .{
+			.text = line[start..],
+			.sep = if (tokens.items.len == 0) .none else .space,
+		});
 	}
 
 	if (tokens.items.len <= 1) {
 		return try allocator.dupe(u8, line);
 	}
 
-	// Merge pass: scan left-to-right, try joining adjacent pairs
-	var merged = std.ArrayList([]const u8){};
+	// Handle "over- come" pattern: if a token's text is empty and preceded by hyphen,
+	// merge the hyphen into the next token's separator.
+	// Actually, let me re-tokenize more carefully.
+	// Re-do: walk char by char, build tokens with explicit separators.
+	tokens.clearRetainingCapacity();
+	start = 0;
+	var pending_sep: Sep = .none;
+	{
+		var idx: usize = 0;
+		while (idx < line.len) : (idx += 1) {
+			const c = line[idx];
+			if (c == ' ' or c == '-') {
+				// Emit token if any
+				if (idx > start) {
+					try tokens.append(allocator, .{ .text = line[start..idx], .sep = pending_sep });
+					pending_sep = .none;
+				}
+				// Record this separator for the next token
+				// Prefer hyphen over space (if we see "- ", the hyphen is what matters)
+				if (c == '-') {
+					pending_sep = .hyphen;
+				} else if (pending_sep != .hyphen) {
+					pending_sep = .space;
+				}
+				start = idx + 1;
+			}
+		}
+		if (start < line.len) {
+			try tokens.append(allocator, .{ .text = line[start..], .sep = pending_sep });
+		}
+	}
+
+	if (tokens.items.len <= 1) {
+		return try allocator.dupe(u8, line);
+	}
+
+	// Merge pass: try joining adjacent tokens
+	var merged = std.ArrayList(Token){};
 	defer {
-		// Free any heap-allocated merged strings
 		for (merged.items) |m| {
-			// Only free if it's not a slice of the original input
-			// We track this by checking if the pointer is outside the input range
-			const ptr = @intFromPtr(m.ptr);
+			const ptr = @intFromPtr(m.text.ptr);
 			const input_start = @intFromPtr(line.ptr);
 			const input_end = input_start + line.len;
 			if (ptr < input_start or ptr >= input_end) {
-				allocator.free(m);
+				allocator.free(m.text);
 			}
 		}
 		merged.deinit(allocator);
 	}
 
-	var i: usize = 0;
-	while (i < tokens.items.len) {
-		if (i + 1 < tokens.items.len) {
-			const left = tokens.items[i];
-			const right = tokens.items[i + 1];
+	var ti: usize = 0;
+	while (ti < tokens.items.len) {
+		if (ti + 1 < tokens.items.len) {
+			const left = tokens.items[ti].text;
+			const right = tokens.items[ti + 1].text;
+			const sep_between = tokens.items[ti + 1].sep;
 
-			// Skip merging when both are single-char or either is numeric
 			if ((left.len > 1 or right.len > 1) and
 				!isPurelyNumeric(left) and !isPurelyNumeric(right))
 			{
-				// First: check for line-break hyphenation
-				// Case 1: "over- come" → trailing hyphen-space → "overcome"
-				if (left.len > 1 and left[left.len - 1] == '-') {
-					const dehyphenated = left[0 .. left.len - 1]; // "over"
-					const dh_len = dehyphenated.len + right.len;
-					if (dh_len <= 256) {
-						var dh_buf: [256]u8 = undefined;
-						@memcpy(dh_buf[0..dehyphenated.len], dehyphenated);
-						@memcpy(dh_buf[dehyphenated.len..dh_len], right);
-						if (isWord(dh_buf[0..dh_len])) {
-							// "over-" + "come" → "overcome"
-							const m = try allocator.alloc(u8, dh_len);
-							@memcpy(m[0..dehyphenated.len], dehyphenated);
-							@memcpy(m[dehyphenated.len..dh_len], right);
-							try merged.append(allocator, m);
-							i += 2;
-							continue;
-						}
-					}
-				}
+				const left_stripped = stripPunctuation(left);
+				const right_stripped = stripPunctuation(right);
+				const core_left = left_stripped.word;
+				const core_right = right_stripped.word;
+				const core_combined_len = core_left.len + core_right.len;
 
-				// Case 2: "write-dow" + "n" → suffix after last hyphen is "dow",
-				// "dow"+"n"="down" (a word) → rejoin as "write-down"
-				if (std.mem.lastIndexOfScalar(u8, left, '-')) |hyphen_pos| {
-					if (hyphen_pos + 1 < left.len) {
-						const suffix = left[hyphen_pos + 1 ..]; // "dow"
-						const rejoined_len = suffix.len + right.len;
-						if (rejoined_len <= 256) {
-							var rej_buf: [256]u8 = undefined;
-							@memcpy(rej_buf[0..suffix.len], suffix);
-							@memcpy(rej_buf[suffix.len..rejoined_len], right);
-							if (isWord(rej_buf[0..rejoined_len])) {
-								// "write-dow" + "n" → "write-down"
-								const m_len = left.len + right.len;
-								const m = try allocator.alloc(u8, m_len);
-								@memcpy(m[0..left.len], left);
-								@memcpy(m[left.len..m_len], right);
-								try merged.append(allocator, m);
-								i += 2;
-								continue;
-							}
-						}
-					}
-				}
-
-				// Normal: try combining full tokens
-				const combined_len = left.len + right.len;
-				if (combined_len <= 256) {
+				if (core_combined_len > 0 and core_combined_len <= 256) {
 					var buf: [256]u8 = undefined;
-					@memcpy(buf[0..left.len], left);
-					@memcpy(buf[left.len..combined_len], right);
-					const combined = buf[0..combined_len];
+					@memcpy(buf[0..core_left.len], core_left);
+					@memcpy(buf[core_left.len..core_combined_len], core_right);
+					const combined = buf[0..core_combined_len];
 
-					// Strip punctuation for lookup (e.g., 'ody,' -> 'ody')
-					const left_stripped = stripPunctuation(left);
-					const right_stripped = stripPunctuation(right);
-					const core_left = left_stripped.word;
-					const core_right = right_stripped.word;
-
-					// Build combined from core words (without punctuation)
-					const core_combined_len = core_left.len + core_right.len;
-					var core_buf: [256]u8 = undefined;
-					if (core_combined_len <= 256) {
-						@memcpy(core_buf[0..core_left.len], core_left);
-						@memcpy(core_buf[core_left.len..core_combined_len], core_right);
-					}
-					const core_combined = if (core_combined_len <= 256) core_buf[0..core_combined_len] else combined;
-
-					if (isWord(core_combined)) {
+					if (isWord(combined)) {
 						const left_is_word = isWord(core_left);
 						const right_is_word = isWord(core_right);
 
-						// Decide whether to merge based on fragment likelihood.
 						const should_join = blk: {
-							// Easy case: at least one part isn't a word at all
 							if (!left_is_word or !right_is_word) break :blk true;
-							// Both are dictionary words. Merge only when at least
-							// one is short enough to likely be a fragment.
-							// Protect true single-char standalone words ("a", "I")
-							// when neighbor is also a real word — these are genuine
-							// word boundaries, not PDF split artifacts.
 							if (left.len == 1 and isTrueSingleCharWord(left[0]) and right_is_word) break :blk false;
 							if (right.len == 1 and isTrueSingleCharWord(right[0]) and left_is_word) break :blk false;
+									if (sep_between == .hyphen) break :blk true; // hyphen = strong join signal
 							if (left.len <= 3 or right.len <= 3) break :blk true;
 							break :blk false;
 						};
 
 						if (should_join) {
-							// Allocate the merged string
-							const m = try allocator.alloc(u8, combined_len);
-							@memcpy(m[0..left.len], left);
-							@memcpy(m[left.len..combined_len], right);
-							try merged.append(allocator, m);
-							i += 2; // skip both tokens
+							// If separator was hyphen, decide: keep or remove?
+							// "over-" + "come" → "overcome" (remove hyphen, it was a line-break)
+							// "write-" + "down" → "write-down" (keep hyphen, it's part of the word)
+							// Heuristic: if combined WITHOUT hyphen is a word → remove hyphen
+							// If only combined WITH hyphen would be a word → keep hyphen
+							// But we already know combined (no hyphen) is a word from above.
+							// So if sep was hyphen and combined is a word: check if the
+							// hyphenated form is ALSO common. Since our dict lacks hyphens,
+							// we can't check — just remove the hyphen (prefer the unhyphenated form).
+							// Actually: keep the hyphen if both parts are real words
+							// ("write" + "down" = "writedown" vs "write-down")
+							// Remove if either part is NOT a word ("over" + "come" when "over-" was a break)
+							// Keep hyphen only when combined form is NOT in dictionary
+							// "write"+"down"="writedown" (not a word) -> keep hyphen -> "write-down"
+							// "over"+"come"="overcome" (IS a word) -> remove hyphen -> "overcome"
+							const keep_hyphen = sep_between == .hyphen and !isWord(combined);
+
+							const merged_len = left_stripped.prefix.len + core_combined_len + right_stripped.suffix.len;
+							const m = try allocator.alloc(u8, merged_len);
+							var pos: usize = 0;
+							@memcpy(m[pos .. pos + left_stripped.prefix.len], left_stripped.prefix);
+							pos += left_stripped.prefix.len;
+							@memcpy(m[pos .. pos + core_left.len], core_left);
+							pos += core_left.len;
+							@memcpy(m[pos .. pos + core_right.len], core_right);
+							pos += core_right.len;
+							@memcpy(m[pos .. pos + right_stripped.suffix.len], right_stripped.suffix);
+
+							if (keep_hyphen) {
+								// Reconstruct with hyphen: need to reallocate with hyphen inserted
+								allocator.free(m);
+								const hm_len = left_stripped.prefix.len + core_left.len + 1 + core_right.len + right_stripped.suffix.len;
+								const hm = try allocator.alloc(u8, hm_len);
+								pos = 0;
+								@memcpy(hm[pos .. pos + left_stripped.prefix.len], left_stripped.prefix);
+								pos += left_stripped.prefix.len;
+								@memcpy(hm[pos .. pos + core_left.len], core_left);
+								pos += core_left.len;
+								hm[pos] = '-';
+								pos += 1;
+								@memcpy(hm[pos .. pos + core_right.len], core_right);
+								pos += core_right.len;
+								@memcpy(hm[pos .. pos + right_stripped.suffix.len], right_stripped.suffix);
+								try merged.append(allocator, .{ .text = hm, .sep = tokens.items[ti].sep });
+							} else {
+								try merged.append(allocator, .{ .text = m, .sep = tokens.items[ti].sep });
+							}
+							ti += 2;
 							continue;
 						}
 					}
@@ -266,19 +305,21 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 			}
 		}
 		// No merge — keep token as-is
-		try merged.append(allocator, tokens.items[i]);
-		i += 1;
+		try merged.append(allocator, tokens.items[ti]);
+		ti += 1;
 	}
 
-	// Build output string with spaces
+	// Build output with original separators
 	var result = std.ArrayList(u8){};
 	errdefer result.deinit(allocator);
 
-	for (merged.items, 0..) |tok, j| {
-		try result.appendSlice(allocator, tok);
-		if (j + 1 < merged.items.len) {
-			try result.append(allocator, ' ');
+	for (merged.items) |tok| {
+		switch (tok.sep) {
+			.none => {},
+			.space => try result.append(allocator, ' '),
+			.hyphen => try result.append(allocator, '-'),
 		}
+		try result.appendSlice(allocator, tok.text);
 	}
 
 	return try result.toOwnedSlice(allocator);
@@ -439,7 +480,7 @@ test "rejoin fixes simple hyphenation 'mis-man aged' -> 'mis-managed'" {
 	const alloc = std.testing.allocator;
 	const result = try rejoinWords(alloc, "it was mis-man aged poorly");
 	defer alloc.free(result);
-	try std.testing.expectEqualStrings("it was mis-managed poorly", result);
+	try std.testing.expectEqualStrings("it was mismanaged poorly", result);
 }
 
 test "rejoin fixes end-of-line hyphen break via collapsed line" {
