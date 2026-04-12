@@ -16,6 +16,7 @@ const PdfContext = pdf_objects.PdfContext;
 const PdfValue = pdf_objects.PdfValue;
 const PdfError = pdf_objects.PdfError;
 const encoding = @import("encoding.zig");
+const wordfix = @import("wordfix.zig");
 
 /// ToUnicode CMap: maps glyph IDs (as u16) to Unicode text.
 /// Built from PDF font /ToUnicode streams.
@@ -327,6 +328,9 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 		for (sections) |s| freeSectionContents(allocator, s);
 		if (sections.len > 0) allocator.free(sections);
 	}
+
+	// Post-process: rejoin falsely-split words using dictionary lookup
+	try applySectionWordfix(allocator, sections);
 
 	// Extract title from first heading or first text
 	var title: ?[]const u8 = null;
@@ -1026,6 +1030,25 @@ fn isDelimiter(c: u8) bool {
 	return c == ' ' or c == '\t' or c == '\n' or c == '\r' or
 		c == '/' or c == '<' or c == '>' or c == '[' or c == ']' or
 		c == '(' or c == ')' or c == '{' or c == '}';
+}
+
+// ── Word Rejoining Post-Process ────────────────────────────────────
+
+/// Walk all sections (recursively into children) and apply dictionary-based
+/// word rejoining to fix false splits from PDF text extraction.
+fn applySectionWordfix(allocator: Allocator, sections: []const Section) !void {
+	// Cast away const to modify content in-place (we own these allocations)
+	const mutable: []Section = @constCast(sections);
+	for (mutable) |*section| {
+		if (section.content.len > 0) {
+			const fixed = try wordfix.rejoinWords(allocator, section.content);
+			allocator.free(@constCast(section.content));
+			section.content = fixed;
+		}
+		if (section.children.len > 0) {
+			try applySectionWordfix(allocator, section.children);
+		}
+	}
 }
 
 // ── Structure Inference ────────────────────────────────────────────

@@ -12,7 +12,7 @@
 
 All pure computation — no I/O.
 
-- **`root.zig`** (20 lines) — Module root. Re-exports all sub-modules: document, parser_md, parser_docx, parser_pdf, parser_doc, chunker, storage, search, ignore, xml, zip, ole2, pdf_objects.
+- **`root.zig`** (25 lines) — Module root. Re-exports all sub-modules: document, parser_md, parser_docx, parser_pdf, parser_doc, chunker, storage, search, ignore, xml, zip, ole2, pdf_objects, wordfix.
 - **`document.zig`** (173 lines) — Core data model types:
   - `Format` enum (md/docx/pdf/doc) with `extension()`/`fromExtension()`
   - `MetadataEntry`, `Section` (recursive), `Document`, `Chunk`, `SearchResult`
@@ -21,7 +21,9 @@ All pure computation — no I/O.
 - **`zip.zig`** (360 lines) — In-memory ZIP reader. Stored + deflated extraction. `buildTestZip()` helper. 7 tests.
 - **`parser_docx.zig`** (613 lines) — DOCX parser. ZIP extraction → XML parse → heading style detection (Heading1-6, Title) → text run extraction → metadata from core.xml. 8 tests.
 - **`pdf_objects.zig`** (~1700 lines) — Low-level PDF infrastructure. Xref table and xref stream (PDF 1.5+) parsing, /Prev incremental update chain following, object lookup including compressed objects in object streams (/Type /ObjStm), stream decompression (FlateDecode/zlib with PNG predictor support) with per-context decompression cache (`stream_cache`) to avoid redundant decompression of shared object streams, indirect /Length resolution, PdfValue deep cloning, full PDF value parser (dicts, arrays, strings, references, names). 23 tests.
-- **`parser_pdf.zig`** (~1585 lines) — PDF text extraction. Page tree traversal, content stream operator parsing (BT/ET, Tf, Tj, TJ, Td, Tm), hex string glyph decoding via ToUnicode CMap, font resource resolution, TJ kerning-to-space insertion for word boundaries, same-line vs different-line span joining (space vs newline), font-size heading heuristic. 14 tests.
+- **`wordfix.zig`** (~310 lines) — Dictionary-based word rejoining for PDF text extraction. Embeds a zlib-compressed 89K-word dictionary via `@embedFile`, lazy-initializes into a hashmap on first use (thread-safe via mutex). Two-pass algorithm fixes false word splits (e.g., "kn own" -> "known", "un know n" -> "unknown"). Handles case-insensitive lookup, preserves original case, protects standalone single-char words ("a", "I") from merging. 11 tests.
+- **`dictionary.zlib`** (250KB) — Zlib-compressed English dictionary, one word per line, 89,217 words. Embedded into the binary at compile time.
+- **`parser_pdf.zig`** (~1600 lines) — PDF text extraction. Page tree traversal, content stream operator parsing (BT/ET, Tf, Tj, TJ, Td, Tm), hex string glyph decoding via ToUnicode CMap, font resource resolution, TJ kerning-to-space insertion for word boundaries, same-line vs different-line span joining (space vs newline), font-size heading heuristic, post-processing word rejoining via wordfix. 14 tests.
 - **`ole2.zig`** (685 lines) — OLE2 (Compound Binary File) reader. Header parsing, FAT chain following, directory walking, mini stream support, UTF-16LE→UTF-8 conversion. 9 tests.
 - **`parser_doc.zig`** (1138 lines) — Legacy Word (.doc) parser. FIB parsing, Piece Table extraction, Windows-1252 decoding, heuristic heading detection (ALL CAPS, numbered sections, Chapter/Section patterns). 24 tests.
 - **`chunker.zig`** (601 lines) — Structure-aware chunker. Recursive section walking, breadcrumb paths, paragraph-boundary splitting, small-section merging. 10 tests.
@@ -45,13 +47,13 @@ All pure computation — no I/O.
   - Recursive directory walker with format filtering
   - Terminal-aware progress bar
   - MCP server (JSON-RPC 2.0 over stdio, 7 tools)
-  - Commands: index, update, search, status, config, config debug, mcp-serve
-  - Flags: --help, --about, --json, --limit, --exact, --similar, --model, --db, --no-color, --no-progress, --simple, --lang
+  - Commands: index, update, search, status, config, config debug, extract, mcp-serve
+  - Flags: --help, --about, --json, --limit, --exact, --similar, --model, --db, --no-color, --no-progress, --simple, --lang, --markdown, --format
 
 ## Tests
 
 - **`src/all_tests.zig`** — Aggregated Zig unit tests (~153 tests across all modules)
-- **`tests/cli/test-cli`** — 28 Bash black-box CLI tests
+- **`tests/cli/test-cli`** — 39 Bash black-box CLI tests
 - **`tests/mcp/test-mcp`** (316 lines) — 14 Bash MCP protocol tests
 - **`tests/integration/`** — Placeholder for Ollama-dependent tests
 - **`tests/unit/`** — Test fixture directory

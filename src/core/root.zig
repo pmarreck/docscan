@@ -21,3 +21,4 @@ pub const pdf_objects = @import("pdf_objects.zig");
 pub const ole2 = @import("ole2.zig");
 pub const ignore = @import("ignore.zig");
 pub const encoding = @import("encoding.zig");
+pub const wordfix = @import("wordfix.zig");
