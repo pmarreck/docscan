@@ -12,7 +12,7 @@ const Document = document.Document;
 const Section = document.Section;
 const MetadataEntry = document.MetadataEntry;
 const Format = document.Format;
-
+const wordfix = @import("wordfix.zig");
 // ── Windows-1252 decoding ────────────────────────────────────────────
 
 /// Decode a Windows-1252 byte to a Unicode codepoint.
@@ -488,8 +488,9 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	const metadata = try metadata_list.toOwnedSlice(allocator);
 	const path_dupe = try allocator.dupe(u8, path);
 
-	return Document{
-		.path = path_dupe,
+	wordfix.applySections(allocator, sections);
+
+	return Document{		.path = path_dupe,
 		.format = .rtf,
 		.title = title,
 		.metadata = metadata,

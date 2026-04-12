@@ -393,8 +393,10 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 	const path_dupe = try gpa.dupe(u8, path);
 	errdefer gpa.free(path_dupe);
 
-	return Document{
-		.path = path_dupe,
+	// Normalize extracted text
+	wordfix.applySections(gpa, sections);
+
+	return Document{		.path = path_dupe,
 		.format = .docx,
 		.title = title,
 		.metadata = meta.metadata,

@@ -8,7 +8,7 @@ const document = @import("document.zig");
 const Document = document.Document;
 const Section = document.Section;
 const Format = document.Format;
-
+const wordfix = @import("wordfix.zig");
 /// A flat section before nesting is applied.
 const FlatSection = struct {
 	heading: ?[]const u8,
@@ -232,8 +232,9 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 	const path_dupe = try gpa.dupe(u8, path);
 	errdefer gpa.free(path_dupe);
 
-	return Document{
-		.path = path_dupe,
+	wordfix.applySections(gpa, sections);
+
+	return Document{		.path = path_dupe,
 		.format = .md,
 		.title = title,
 		.metadata = try gpa.alloc(document.MetadataEntry, 0),

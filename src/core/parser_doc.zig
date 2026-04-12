@@ -13,8 +13,8 @@ const Document = document.Document;
 const Section = document.Section;
 const MetadataEntry = document.MetadataEntry;
 const Format = document.Format;
+const wordfix = @import("wordfix.zig");
 const ole2 = @import("ole2.zig");
-
 /// Errors specific to DOC parsing.
 pub const DocError = error{
 	InvalidDoc,
@@ -712,8 +712,9 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 
 	const metadata = try allocator.alloc(MetadataEntry, 0);
 
-	return Document{
-		.path = path_dupe,
+	wordfix.applySections(allocator, sections);
+
+	return Document{		.path = path_dupe,
 		.format = .doc,
 		.title = title,
 		.metadata = metadata,
