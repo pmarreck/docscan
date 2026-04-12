@@ -145,7 +145,52 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 			if ((left.len > 1 or right.len > 1) and
 				!isPurelyNumeric(left) and !isPurelyNumeric(right))
 			{
-				// Try combining
+				// First: check for line-break hyphenation
+				// Case 1: "over- come" → trailing hyphen-space → "overcome"
+				if (left.len > 1 and left[left.len - 1] == '-') {
+					const dehyphenated = left[0 .. left.len - 1]; // "over"
+					const dh_len = dehyphenated.len + right.len;
+					if (dh_len <= 256) {
+						var dh_buf: [256]u8 = undefined;
+						@memcpy(dh_buf[0..dehyphenated.len], dehyphenated);
+						@memcpy(dh_buf[dehyphenated.len..dh_len], right);
+						if (isWord(dh_buf[0..dh_len])) {
+							// "over-" + "come" → "overcome"
+							const m = try allocator.alloc(u8, dh_len);
+							@memcpy(m[0..dehyphenated.len], dehyphenated);
+							@memcpy(m[dehyphenated.len..dh_len], right);
+							try merged.append(allocator, m);
+							i += 2;
+							continue;
+						}
+					}
+				}
+
+				// Case 2: "write-dow" + "n" → suffix after last hyphen is "dow",
+				// "dow"+"n"="down" (a word) → rejoin as "write-down"
+				if (std.mem.lastIndexOfScalar(u8, left, '-')) |hyphen_pos| {
+					if (hyphen_pos + 1 < left.len) {
+						const suffix = left[hyphen_pos + 1 ..]; // "dow"
+						const rejoined_len = suffix.len + right.len;
+						if (rejoined_len <= 256) {
+							var rej_buf: [256]u8 = undefined;
+							@memcpy(rej_buf[0..suffix.len], suffix);
+							@memcpy(rej_buf[suffix.len..rejoined_len], right);
+							if (isWord(rej_buf[0..rejoined_len])) {
+								// "write-dow" + "n" → "write-down"
+								const m_len = left.len + right.len;
+								const m = try allocator.alloc(u8, m_len);
+								@memcpy(m[0..left.len], left);
+								@memcpy(m[left.len..m_len], right);
+								try merged.append(allocator, m);
+								i += 2;
+								continue;
+							}
+						}
+					}
+				}
+
+				// Normal: try combining full tokens
 				const combined_len = left.len + right.len;
 				if (combined_len <= 256) {
 					var buf: [256]u8 = undefined;
@@ -363,3 +408,25 @@ test "rejoin does not falsely join across hyphenated words" {
 	// because 'n' is not a word (prefer joining non-words with non-words)
 	try std.testing.expectEqualStrings("down or", result);
 }
+test "rejoin fixes line-break hyphenation 'write-dow n' -> 'write-down'" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "the write-dow n was significant");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("the write-down was significant", result);
+}
+
+test "rejoin fixes simple hyphenation 'mis-man aged' -> 'mis-managed'" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "it was mis-man aged poorly");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("it was mis-managed poorly", result);
+}
+
+test "rejoin fixes end-of-line hyphen break via collapsed line" {
+	const alloc = std.testing.allocator;
+	// After line collapse, 'over-' + 'come' would be 'over- come'
+	const result = try rejoinWords(alloc, "to over- come the obstacle");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("to overcome the obstacle", result);
+}
+
