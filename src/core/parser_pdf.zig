@@ -1287,7 +1287,7 @@ fn buildTree(
 			.level = fs.level,
 			.content = content,
 			.children = children,
-			.page = fs.page,
+			.page_physical = fs.page,
 		});
 
 		i = child_end;

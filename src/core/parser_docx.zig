@@ -186,7 +186,7 @@ fn buildTree(
 			.level = fs.level,
 			.content = content,
 			.children = children,
-			.page = fs.page,
+			.page_physical = fs.page,
 		});
 
 		i = child_end;
@@ -685,11 +685,11 @@ test "page tracking with lastRenderedPageBreak" {
 
 	// First section starts on page 1
 	try testing.expectEqualStrings("Page 1 Heading", doc.sections[0].heading.?);
-	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page_physical);
 
 	// Second section starts on page 2 (after the lastRenderedPageBreak)
 	try testing.expectEqualStrings("Page 2 Heading", doc.sections[1].heading.?);
-	try testing.expectEqual(@as(?u32, 2), doc.sections[1].page);
+	try testing.expectEqual(@as(?u32, 2), doc.sections[1].page_physical);
 }
 
 test "page tracking with hard page break (w:br type=page)" {
@@ -710,10 +710,10 @@ test "page tracking with hard page break (w:br type=page)" {
 	try testing.expectEqual(@as(usize, 2), doc.sections.len);
 
 	try testing.expectEqualStrings("First Page", doc.sections[0].heading.?);
-	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page_physical);
 
 	try testing.expectEqualStrings("Second Page", doc.sections[1].heading.?);
-	try testing.expectEqual(@as(?u32, 2), doc.sections[1].page);
+	try testing.expectEqual(@as(?u32, 2), doc.sections[1].page_physical);
 }
 
 test "page tracking with multiple page breaks" {
@@ -733,9 +733,9 @@ test "page tracking with multiple page breaks" {
 	try testing.expectEqual(@as(usize, 2), doc.sections.len);
 
 	try testing.expectEqualStrings("Page 1", doc.sections[0].heading.?);
-	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page_physical);
 
 	// Two page breaks passed → page 3
 	try testing.expectEqualStrings("Page 3", doc.sections[1].heading.?);
-	try testing.expectEqual(@as(?u32, 3), doc.sections[1].page);
+	try testing.expectEqual(@as(?u32, 3), doc.sections[1].page_physical);
 }

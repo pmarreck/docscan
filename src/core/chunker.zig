@@ -25,7 +25,7 @@ const ProtoChunk = struct {
 	parent_path: []const u8, // always allocated
 	text_allocated: bool, // true if text was allocated (merged text)
 	heading_level: u8 = 0, // section level: 0 = body, 1 = top heading, etc.
-	page: ?u32 = null, // page number from section (PDF)
+	page_physical: ?u32 = null, // physical page number from section (PDF)
 	source_line: ?u32 = null, // line number from section (markdown)
 };
 
@@ -101,7 +101,7 @@ fn forceSplitByBytes(
 	heading_level: u8,
 	options: ChunkOptions,
 	out: *std.ArrayListUnmanaged(ProtoChunk),
-	page: ?u32,
+	page_physical: ?u32,
 	source_line: ?u32,
 ) !void {
 	var offset: usize = 0;
@@ -136,7 +136,7 @@ fn forceSplitByBytes(
 			.parent_path = pp,
 			.text_allocated = false,
 			.heading_level = heading_level,
-			.page = page,
+			.page_physical = page_physical,
 			.source_line = source_line,
 		});
 		offset = end;
@@ -193,7 +193,7 @@ fn chunkSection(
 	if (has_children) {
 		// Parent with preamble: emit preamble as its own chunk
 		if (has_content) {
-			try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, section.level, options, out, section.page, section.source_line);
+			try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, section.level, options, out, section.page_physical, section.source_line);
 		}
 		// Recurse into children
 		for (section.children) |child| {
@@ -207,7 +207,7 @@ fn chunkSection(
 		}
 	} else if (has_content) {
 		// Leaf section with content
-		try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, section.level, options, out, section.page, section.source_line);
+		try emitContentChunks(allocator, section.content, my_path, parent_path, section.heading, section.level, options, out, section.page_physical, section.source_line);
 	} else {
 		// Empty leaf — skip, free path
 		allocator.free(my_path);
@@ -224,7 +224,7 @@ fn emitContentChunks(
 	heading_level: u8,
 	options: ChunkOptions,
 	out: *std.ArrayListUnmanaged(ProtoChunk),
-	page: ?u32,
+	page_physical: ?u32,
 	source_line: ?u32,
 ) !void {
 	const token_count = estimateTokens(content, options.tokens_per_byte);
@@ -239,7 +239,7 @@ fn emitContentChunks(
 			.parent_path = pp,
 			.text_allocated = false,
 			.heading_level = heading_level,
-			.page = page,
+			.page_physical = page_physical,
 			.source_line = source_line,
 		});
 		return;
@@ -258,7 +258,7 @@ fn emitContentChunks(
 			// No line boundaries at all — force-split at max_chunk_bytes to avoid
 			// overflowing SQLite/FTS5 32-bit internal size fields.
 			if (content.len > options.max_chunk_bytes) {
-				try forceSplitByBytes(allocator, content, section_path, parent_path, heading, heading_level, options, out, page, source_line);
+				try forceSplitByBytes(allocator, content, section_path, parent_path, heading, heading_level, options, out, page_physical, source_line);
 			} else {
 				const pp = try allocator.dupe(u8, parent_path);
 				try out.append(allocator, .{
@@ -268,7 +268,7 @@ fn emitContentChunks(
 					.parent_path = pp,
 					.text_allocated = false,
 					.heading_level = heading_level,
-					.page = page,
+					.page_physical = page_physical,
 					.source_line = source_line,
 				});
 			}
@@ -298,7 +298,7 @@ fn emitContentChunks(
 				.parent_path = pp,
 				.text_allocated = false,
 				.heading_level = heading_level,
-				.page = page,
+				.page_physical = page_physical,
 				.source_line = source_line,
 			});
 			group_start = idx;
@@ -322,7 +322,7 @@ fn emitContentChunks(
 			.parent_path = pp,
 			.text_allocated = false,
 			.heading_level = heading_level,
-			.page = page,
+			.page_physical = page_physical,
 			.source_line = source_line,
 		});
 	}
@@ -413,7 +413,7 @@ fn mergeSmallChunks(
 				.parent_path = current.parent_path,
 				.text_allocated = true,
 				.heading_level = current.heading_level,
-				.page = current.page,
+				.page_physical = current.page_physical,
 				.source_line = current.source_line,
 			});
 			i = merge_end;
@@ -467,7 +467,7 @@ pub fn chunk(allocator: std.mem.Allocator, doc: document.Document, options: Chun
 			.end_byte = byte_offset + text_owned.len,
 			.chunk_index = @intCast(idx),
 			.heading_level = pc.heading_level,
-			.page = pc.page,
+			.page_physical = pc.page_physical,
 			.source_line = pc.source_line,
 		};
 		byte_offset += text_owned.len;

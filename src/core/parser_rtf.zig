@@ -750,7 +750,7 @@ fn buildTree(
 			.level = fs.level,
 			.content = content,
 			.children = children,
-			.page = fs.page,
+			.page_physical = fs.page,
 		});
 
 		i = child_end;
@@ -953,7 +953,7 @@ test "RTF: page breaks increment page counter" {
 	try testing.expect(doc.sections.len > 0);
 
 	// The first section should be page 1
-	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page);
+	try testing.expectEqual(@as(?u32, 1), doc.sections[0].page_physical);
 }
 
 test "RTF: font size heading detection" {

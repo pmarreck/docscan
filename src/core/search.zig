@@ -213,7 +213,10 @@ pub fn search(
 			.score = cand.fused_score,
 			.vector_score = cand.vector_distance,
 			.lexical_score = cand.lexical_score,
-			.page = chunk.page,
+			.page_physical = chunk.page_physical,
+			.page_logical = chunk.page_logical,
+			.page_section = chunk.page_section,
+			.page_roman = chunk.page_roman,
 			.source_line = chunk.source_line,
 		});
 	}

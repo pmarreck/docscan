@@ -92,7 +92,24 @@ This is a separate project-scale feature — the translation model is a heavy de
 - Encoding replacement chars: "�" in some PDFs (Berkshire letter) — need better fallback encoding handling
 - Stray isolated ligature expansions: lone "ff" on a line from a PDF ligature with no surrounding context
 
-## Planned: Logical page numbers
+## In Progress: Logical page numbers
+
+### Completed steps
+- [x] Roman numeral conversion: `arabicToRoman()`/`romanToArabic()` with 5 tests (2026-04-10 EST)
+- [x] Rename `page` -> `page_physical` across all source files (2026-04-10 EST)
+- [x] Add `page_logical`, `page_section`, `page_roman` fields to Section, Chunk, SearchResult, ChunkRecord (2026-04-10 EST)
+- [x] Add DB columns and indexes for new page fields (2026-04-10 EST)
+- [x] Update JSON serialization in c_api.zig for all new fields (2026-04-10 EST)
+- [x] Update CLI main.c to parse `page_physical` from JSON (2026-04-10 EST)
+
+### Remaining steps
+- [ ] PDF `/PageLabels` parsing in parser_pdf.zig
+- [ ] CLI `--logical`/`--physical` flags and display changes
+- [ ] DOCX `pgNumType` support
+- [ ] DOC `pgn_start` support
+- [ ] RTF `\pgnstart` support
+
+### Background
 
 Physical page numbers (what we track now) differ from logical page numbers
 (what the reader sees) due to front matter, section breaks, and page number

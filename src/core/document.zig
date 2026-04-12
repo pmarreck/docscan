@@ -55,7 +55,10 @@ pub const Section = struct {
 	level: u8,
 	content: []const u8,
 	children: []const Section,
-	page: ?u32 = null, // starting page number (1-based, PDF)
+	page_physical: ?u32 = null, // physical page number (1-based, PDF)
+	page_logical: ?u32 = null, // logical page number (from metadata)
+	page_section: ?u32 = null, // numbering section (1-based, increments on restart)
+	page_roman: bool = false, // true = roman numeral display
 	source_line: ?u32 = null, // starting line number (1-based, markdown)
 };
 
@@ -81,7 +84,10 @@ pub const Chunk = struct {
 	end_byte: u64,
 	chunk_index: u32,
 	heading_level: u8 = 0, // 0 = body, 1 = top-level heading, 2 = sub, etc.
-	page: ?u32 = null, // page number (1-based, PDF)
+	page_physical: ?u32 = null, // physical page number (1-based, PDF)
+	page_logical: ?u32 = null, // logical page number (from metadata)
+	page_section: ?u32 = null, // numbering section (1-based, increments on restart)
+	page_roman: bool = false, // true = roman numeral display
 	source_line: ?u32 = null, // line number (1-based, markdown)
 };
 
@@ -96,11 +102,118 @@ pub const SearchResult = struct {
 	score: f32,
 	vector_score: f32,
 	lexical_score: f32,
-	page: ?u32 = null, // page number (1-based, PDF)
+	page_physical: ?u32 = null, // physical page number (1-based, PDF)
+	page_logical: ?u32 = null, // logical page number (from metadata)
+	page_section: ?u32 = null, // numbering section (1-based, increments on restart)
+	page_roman: bool = false, // true = roman numeral display
 	source_line: ?u32 = null, // line number (1-based, markdown)
 };
 
+// ── Roman numeral conversion ──────────────────────────────────────────
+
+/// Convert an arabic integer (1-3999) to a lowercase roman numeral string.
+/// Returns null if n is 0 or > 3999. Caller owns returned memory.
+pub fn arabicToRoman(allocator: std.mem.Allocator, n: u32) !?[]const u8 {
+	if (n == 0 or n > 3999) return null;
+	const values = [_]u32{ 1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1 };
+	const symbols = [_][]const u8{ "m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i" };
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(allocator);
+	var remaining = n;
+	for (values, symbols) |val, sym| {
+		while (remaining >= val) {
+			try buf.appendSlice(allocator, sym);
+			remaining -= val;
+		}
+	}
+	return try buf.toOwnedSlice(allocator);
+}
+
+/// Convert a roman numeral string (case-insensitive) to an arabic integer.
+/// Returns null if the string is empty or contains non-roman characters.
+/// Lenient: accepts non-canonical forms like "iiii" (= 4).
+pub fn romanToArabic(s: []const u8) ?u32 {
+	if (s.len == 0) return null;
+	var total: u32 = 0;
+	var i: usize = 0;
+	while (i < s.len) {
+		const cur = romanCharValue(s[i]) orelse return null;
+		if (i + 1 < s.len) {
+			const next = romanCharValue(s[i + 1]) orelse return null;
+			if (cur < next) {
+				total += next - cur;
+				i += 2;
+				continue;
+			}
+		}
+		total += cur;
+		i += 1;
+	}
+	return if (total == 0) null else total;
+}
+
+fn romanCharValue(ch: u8) ?u32 {
+	return switch (ch) {
+		'i', 'I' => 1,
+		'v', 'V' => 5,
+		'x', 'X' => 10,
+		'l', 'L' => 50,
+		'c', 'C' => 100,
+		'd', 'D' => 500,
+		'm', 'M' => 1000,
+		else => null,
+	};
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "arabicToRoman — basic conversions" {
+	const alloc = std.testing.allocator;
+	const cases = [_]struct { n: u32, expected: []const u8 }{
+		.{ .n = 1, .expected = "i" },
+		.{ .n = 4, .expected = "iv" },
+		.{ .n = 9, .expected = "ix" },
+		.{ .n = 14, .expected = "xiv" },
+		.{ .n = 42, .expected = "xlii" },
+		.{ .n = 100, .expected = "c" },
+		.{ .n = 2024, .expected = "mmxxiv" },
+		.{ .n = 3999, .expected = "mmmcmxcix" },
+	};
+	for (cases) |c| {
+		const result = (try arabicToRoman(alloc, c.n)).?;
+		defer alloc.free(result);
+		try std.testing.expectEqualStrings(c.expected, result);
+	}
+}
+
+test "arabicToRoman — boundary: 0 and >3999 return null" {
+	try std.testing.expectEqual(null, try arabicToRoman(std.testing.allocator, 0));
+	try std.testing.expectEqual(null, try arabicToRoman(std.testing.allocator, 4000));
+}
+
+test "romanToArabic — basic conversions" {
+	const cases = [_]struct { s: []const u8, expected: u32 }{
+		.{ .s = "i", .expected = 1 },
+		.{ .s = "iv", .expected = 4 },
+		.{ .s = "ix", .expected = 9 },
+		.{ .s = "xlii", .expected = 42 },
+		.{ .s = "mmxxiv", .expected = 2024 },
+		.{ .s = "XIV", .expected = 14 },
+	};
+	for (cases) |c| {
+		try std.testing.expectEqual(c.expected, romanToArabic(c.s).?);
+	}
+}
+
+test "romanToArabic — lenient iiii = 4" {
+	try std.testing.expectEqual(@as(u32, 4), romanToArabic("iiii").?);
+}
+
+test "romanToArabic — invalid returns null" {
+	try std.testing.expectEqual(null, romanToArabic("abc"));
+	try std.testing.expectEqual(null, romanToArabic(""));
+	try std.testing.expectEqual(null, romanToArabic("i2v"));
+}
 
 test "Format.extension round-trips" {
 	const cases = [_]struct { fmt: Format, ext: []const u8 }{

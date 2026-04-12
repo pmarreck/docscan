@@ -13,9 +13,10 @@
 All pure computation — no I/O.
 
 - **`root.zig`** (25 lines) — Module root. Re-exports all sub-modules: document, parser_md, parser_docx, parser_pdf, parser_doc, chunker, storage, search, ignore, xml, zip, ole2, pdf_objects, wordfix.
-- **`document.zig`** (173 lines) — Core data model types:
+- **`document.zig`** (~250 lines) — Core data model types + roman numeral conversion:
   - `Format` enum (md/docx/pdf/doc) with `extension()`/`fromExtension()`
-  - `MetadataEntry`, `Section` (recursive), `Document`, `Chunk`, `SearchResult`
+  - `MetadataEntry`, `Section` (recursive with `page_physical`/`page_logical`/`page_section`/`page_roman`), `Document`, `Chunk`, `SearchResult`
+  - `arabicToRoman()`/`romanToArabic()` — bidirectional roman numeral conversion (case-insensitive, lenient)
 - **`parser_md.zig`** (417 lines) — Markdown parser. Splits on ATX headings (`# ` through `###### `), builds nested section tree. 8 tests.
 - **`xml.zig`** (552 lines) — Minimal XML parser for DOCX. Elements, attributes, namespaced tags, entity decoding. 14 tests.
 - **`zip.zig`** (360 lines) — In-memory ZIP reader. Stored + deflated extraction. `buildTestZip()` helper. 7 tests.

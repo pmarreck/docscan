@@ -2276,9 +2276,9 @@ static int cmd_search(const char* db_path_arg, const char* query,
 
 				/* Extract page (may be null) */
 				int page = -1;
-				const char* pg_start = strstr(p, "\"page\":");
+				const char* pg_start = strstr(p, "\"page_physical\":");
 				if (pg_start) {
-					pg_start += 7;
+					pg_start += 16;
 					if (*pg_start != 'n') /* not "null" */
 						page = atoi(pg_start);
 				}
@@ -3864,7 +3864,7 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 			} else if (key && strcmp(key, "children") == 0) {
 				children_start = p;
 				p = json_skip_value(p);
-			} else if (key && strcmp(key, "page") == 0) {
+			} else if (key && strcmp(key, "page_physical") == 0) {
 				if (*p != 'n') page = atoi(p); /* skip "null" */
 				p = json_skip_value(p);
 			} else {
