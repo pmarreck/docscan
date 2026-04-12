@@ -3,8 +3,7 @@
 [![CI](https://github.com/pmarreck/docscan/actions/workflows/ci.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/docscan/actions/workflows/ci.yml)
 [![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Fdocscan%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/docscan)
 
-Document indexing and semantic search for `.md`, `.docx`, `.pdf`, `.doc`, and `.rtf` files.
-
+Document indexing and semantic search for `.md`, `.txt`, `.docx`, `.pdf`, `.doc`, `.rtf`, and `.epub` files.
 ## What it does
 
 docscan indexes a collection of documents, extracts structured text with heading detection, chunks by document structure, embeds via a local model (Ollama or oMLX), and provides hybrid vector + lexical search from the CLI or via MCP for LLM integration.
@@ -52,15 +51,15 @@ docscan extract --from 5 --to 10 book.pdf
 cat file.md | docscan extract --format md -
 
 # Normalize text (fix word splits, ligatures, hyphenation)
-echo "kn own" | docscan normalize```
+echo "kn own" | docscan normalize
+```
 
 ## Embedding backends
 
 docscan supports both Ollama and OpenAI-compatible embedding servers (oMLX, LM Studio, vLLM, etc.).
 
 ```bash
-# Ollama (default)
-docscan index ~/docs/ --model nomic-embed-text
+# Ollama (default)docscan index ~/docs/ --model nomic-embed-text
 
 # oMLX / OpenAI-compatible
 docscan index ~/docs/ \
