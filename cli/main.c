@@ -3862,6 +3862,17 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 			free(key);
 		}
 
+		/* Normalize text before output */
+		char norm_err[256];
+		if (content && content[0]) {
+			char* norm = docscan_normalize(content, strlen(content), norm_err, sizeof(norm_err));
+			if (norm) { free(content); content = strdup(norm); docscan_free(norm); }
+		}
+		if (heading && heading[0]) {
+			char* norm = docscan_normalize(heading, strlen(heading), norm_err, sizeof(norm_err));
+			if (norm) { free(heading); heading = strdup(norm); docscan_free(norm); }
+		}
+
 		/* Output this section */
 		if (heading && heading[0]) {
 			if (markdown_mode) {
