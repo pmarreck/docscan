@@ -92,3 +92,17 @@ This is a separate project-scale feature — the translation model is a heavy de
 - Comma spacing: ",heard" ",inside" — comma immediately followed by word without space (PDF layout artifact)
 - "Citi­group" — soft hyphen line break preserved instead of rejoined
 - Greenberg still split in some instances where it appears mid-line with unusual spacing
+
+## Planned: Logical page numbers
+
+Physical page numbers (what we track now) differ from logical page numbers
+(what the reader sees) due to front matter, section breaks, and page number
+restarts. All major formats support this:
+
+- **PDF**: `/PageLabels` number tree in catalog — maps physical pages to labels (roman numerals, decimal with offset)
+- **DOCX**: `<w:pgNumType w:start="N"/>` in section properties — restarts numbering per section
+- **DOC**: `pgn_start` in SEPX (Section Properties) via plcfSed in Table stream
+- **RTF**: `\pgnstart N` control word — sets starting page number
+- **EPUB**: `<pageList>` in navigation document (maps reading positions to printed pages, optional)
+
+Implementation: store both `page` (physical, 1-indexed from file start) and `page_label` (string, what the reader sees — "iv", "42", etc.) on each section/chunk. `--from`/`--to` should match logical page labels by default, with `--physical-page` flag for physical.
