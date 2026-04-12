@@ -38,7 +38,27 @@ fn ensureInit() void {
 	while (lines.next()) |line| {
 		const trimmed = std.mem.trimRight(u8, line, "\r");
 		if (trimmed.len == 0) continue;
-		// Lowercase the word for case-insensitive storage
+		const lower = alloc.alloc(u8, trimmed.len) catch continue;
+		for (trimmed, 0..) |c, i| {
+			lower[i] = std.ascii.toLower(c);
+		}
+		map.put(alloc, lower, {}) catch continue;
+	}
+
+	// Also load proper nouns (surnames, first names, place names)
+	const pn_compressed = @embedFile("proper_nouns.zlib");
+	var pn_reader: std.Io.Reader = .fixed(pn_compressed);
+	var pn_decompress: std.compress.flate.Decompress = .init(&pn_reader, .zlib, &.{});
+	const pn_raw = pn_decompress.reader.allocRemaining(alloc, @enumFromInt(4 * 1024 * 1024)) catch {
+		dict = map;
+		dict_arena = arena;
+		return;
+	};
+
+	var pn_lines = std.mem.splitScalar(u8, pn_raw, '\n');
+	while (pn_lines.next()) |line| {
+		const trimmed = std.mem.trimRight(u8, line, "\r");
+		if (trimmed.len == 0) continue;
 		const lower = alloc.alloc(u8, trimmed.len) catch continue;
 		for (trimmed, 0..) |c, i| {
 			lower[i] = std.ascii.toLower(c);
@@ -430,3 +450,9 @@ test "rejoin fixes end-of-line hyphen break via collapsed line" {
 	try std.testing.expectEqualStrings("to overcome the obstacle", result);
 }
 
+test "rejoin fixes proper noun split 'Greenbe rg' -> 'Greenberg'" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "met Ace Greenbe rg at the");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("met Ace Greenberg at the", result);
+}
