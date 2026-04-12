@@ -641,6 +641,17 @@ else
 	fail "normalize fixes 'Greenbe rg' -> 'Greenberg'" "rc=$rc, out='$out'"
 fi
 
+
+# ──────────────────────────────────────────────
+# 46. normalize handles hyphenated split with prefix
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture bash -c "echo 'it was mis-man aged poorly' | \"$BINARY\" normalize"
+if [ "$rc" -eq 0 ] && [ "$out" = "it was mismanaged poorly" ]; then
+	pass "normalize handles 'it was mis-man aged poorly' -> 'it was mismanaged poorly'"
+else
+	fail "normalize handles hyphenated split with prefix" "rc=$rc, out='$out'"
+fi
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────

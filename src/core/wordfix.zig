@@ -423,16 +423,15 @@ fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
 					// Also try collecting space-separated fragments after hyphen
 					// e.g., "mis-man aged" → right_word="man", extended="managed"
 					var extended_end = right_end;
-					while (extended_end < text.len) {
-						if (text[extended_end] == 0x20) { // space
-							// Check if next char is alphabetic (continuation)
-							if (extended_end + 1 < text.len and std.ascii.isAlphabetic(text[extended_end + 1])) {
-								extended_end += 1; // skip space
-								while (extended_end < text.len and std.ascii.isAlphabetic(text[extended_end])) {
-									extended_end += 1;
-								}
-							} else break;
-						} else break;
+					// Try extending by ONE additional space-separated fragment
+					// (not unlimited — "mis-man aged poorly" should only try "managed", not "managedpoorly")
+					if (extended_end < text.len and text[extended_end] == 0x20) {
+						if (extended_end + 1 < text.len and std.ascii.isAlphabetic(text[extended_end + 1])) {
+							extended_end += 1; // skip space
+							while (extended_end < text.len and std.ascii.isAlphabetic(text[extended_end])) {
+								extended_end += 1;
+							}
+						}
 					}
 
 					// Try unhyphenated form
@@ -677,3 +676,24 @@ test "hyphen normalization: over- come → overcome" {
 	defer alloc.free(result);
 	try std.testing.expectEqualStrings("to overcome the obstacle", result);
 }
+
+test "dictionary loads and contains key words for normalization" {
+	ensureInit();
+	const d = dict orelse {
+		std.debug.print("ERROR: dict is null after ensureInit\n", .{});
+		return error.TestUnexpectedResult;
+	};
+	_ = d;
+	// Check words needed for normalization
+	try testing.expect(isWord("mismanaged"));
+	try testing.expect(isWord("known"));
+	try testing.expect(isWord("overcome"));
+	try testing.expect(isWord("nobody"));
+	// Proper noun: only when capitalized
+	try testing.expect(isWord("Greenberg"));
+	try testing.expect(!isWord("foran")); // proper noun, not capitalized
+}
+
+
+
+
