@@ -89,6 +89,20 @@ fn isTrueSingleCharWord(c: u8) bool {
 /// the parts is not independently a dictionary word, or if at least one
 /// part is very short (<=3 chars, likely a fragment). Single-character
 /// and purely-numeric tokens are never candidates for merging.
+
+/// Strip leading/trailing punctuation for dictionary lookup.
+/// Returns the core word and the stripped prefix/suffix.
+fn stripPunctuation(token: []const u8) struct { word: []const u8, prefix: []const u8, suffix: []const u8 } {
+	var start: usize = 0;
+	var end: usize = token.len;
+	// Strip leading punctuation (quotes, parens, brackets)
+	while (start < end and !std.ascii.isAlphanumeric(token[start])) : (start += 1) {}
+	// Strip trailing punctuation
+	while (end > start and !std.ascii.isAlphanumeric(token[end - 1])) : (end -= 1) {}
+	if (start >= end) return .{ .word = token, .prefix = token[0..0], .suffix = token[0..0] };
+	return .{ .word = token[start..end], .prefix = token[0..start], .suffix = token[end..] };
+}
+
 fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 	// Split into tokens on spaces
 	var tokens = std.ArrayList([]const u8){};
@@ -139,9 +153,24 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 					@memcpy(buf[left.len..combined_len], right);
 					const combined = buf[0..combined_len];
 
-					if (isWord(combined)) {
-						const left_is_word = isWord(left);
-						const right_is_word = isWord(right);
+					// Strip punctuation for lookup (e.g., 'ody,' -> 'ody')
+					const left_stripped = stripPunctuation(left);
+					const right_stripped = stripPunctuation(right);
+					const core_left = left_stripped.word;
+					const core_right = right_stripped.word;
+
+					// Build combined from core words (without punctuation)
+					const core_combined_len = core_left.len + core_right.len;
+					var core_buf: [256]u8 = undefined;
+					if (core_combined_len <= 256) {
+						@memcpy(core_buf[0..core_left.len], core_left);
+						@memcpy(core_buf[core_left.len..core_combined_len], core_right);
+					}
+					const core_combined = if (core_combined_len <= 256) core_buf[0..core_combined_len] else combined;
+
+					if (isWord(core_combined)) {
+						const left_is_word = isWord(core_left);
+						const right_is_word = isWord(core_right);
 
 						// Decide whether to merge based on fragment likelihood.
 						const should_join = blk: {
@@ -308,4 +337,29 @@ test "rejoin preserves both-valid long word boundaries" {
 	const result = try rejoinWords(alloc, "turn about face now");
 	defer alloc.free(result);
 	try testing.expectEqualStrings("turn about face now", result);
+}
+
+test "rejoin fixes 'nob ody' -> 'nobody'" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "nob ody");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("nobody", result);
+}
+
+test "rejoin fixes 'nob ody,' with trailing comma" {
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "a nob ody, had");
+	defer alloc.free(result);
+	try std.testing.expectEqualStrings("a nobody, had", result);
+}
+
+test "rejoin does not falsely join across hyphenated words" {
+	// 'write-dow n or' has a hyphen split — dictionary lacks 'write-down'
+	// so the algorithm should at minimum not make it WORSE by joining 'n'+'or'->'nor'
+	const alloc = std.testing.allocator;
+	const result = try rejoinWords(alloc, "dow n or");
+	defer alloc.free(result);
+	// 'dow'+'n' -> 'down' should be preferred over 'n'+'or' -> 'nor'
+	// because 'n' is not a word (prefer joining non-words with non-words)
+	try std.testing.expectEqualStrings("down or", result);
 }
