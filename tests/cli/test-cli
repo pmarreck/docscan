@@ -697,16 +697,15 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# 51. normalize: space between lowercase-uppercase boundary
+# 51. normalize: concatenated words stay as-is (splitting disabled — too many false positives)
 # ──────────────────────────────────────────────
 out="" ; err="" ; rc=""
 capture bash -c "echo 'placeimpossible to enter' | \"$BINARY\" normalize"
-if [ "$rc" -eq 0 ] && [ "$out" = "place impossible to enter" ]; then
-	pass "normalize adds space at camelCase word boundary"
+if [ "$rc" -eq 0 ] && [ "$out" = "placeimpossible to enter" ]; then
+	pass "normalize leaves concatenated words unsplit"
 else
-	fail "normalize adds space at camelCase word boundary" "rc=$rc, out='$out'"
+	fail "normalize leaves concatenated words unsplit" "rc=$rc, out='$out'"
 fi
-
 # ──────────────────────────────────────────────
 # 52. normalize: don't break real camelCase or proper nouns
 # ──────────────────────────────────────────────

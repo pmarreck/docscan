@@ -709,16 +709,19 @@ fn rejoinAcrossNewlines(allocator: Allocator, text: []const u8) ![]const u8 {
 	}
 
 	return try result.toOwnedSlice(allocator);
-}pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
+}
+
+pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	ensureInit();
 
 	// Phase 0-pre-a: expand ligatures and fix punctuation spacing
 	const normalized = try normalizeText(allocator, text);
 	defer allocator.free(normalized);
 
-	// Phase 0-pre-b: split at lowercase-uppercase word boundaries
-	const camel_split = try splitCamelBoundaries(allocator, normalized);
-	defer allocator.free(camel_split);
+	// Phase 0-pre-b: split concatenated words — DISABLED.
+	// Causes more harm than good (URL/email breakage, false splits on
+	// proper nouns). The extra-space problem is far more common than
+	// missing spaces. Re-enable via splitCamelBoundaries() if needed.
 
 	// Phase 0a: strip soft hyphens (U+00AD = 0xC2 0xAD in UTF-8)
 	// These are line-break hints, not real hyphens.
@@ -726,18 +729,17 @@ fn rejoinAcrossNewlines(allocator: Allocator, text: []const u8) ![]const u8 {
 	defer stripped.deinit(allocator);
 	{
 		var j: usize = 0;
-		while (j < camel_split.len) {
-			if (j + 1 < camel_split.len and camel_split[j] == 0xC2 and camel_split[j + 1] == 0xAD) {
+		while (j < normalized.len) {
+			if (j + 1 < normalized.len and normalized[j] == 0xC2 and normalized[j + 1] == 0xAD) {
 				j += 2;
 				// Also skip newline after soft hyphen (it was a line break)
-				while (j < camel_split.len and (camel_split[j] == 0x0A or camel_split[j] == 0x0D or camel_split[j] == 0x20)) : (j += 1) {}
+				while (j < normalized.len and (normalized[j] == 0x0A or normalized[j] == 0x0D or normalized[j] == 0x20)) : (j += 1) {}
 			} else {
-				try stripped.append(allocator, camel_split[j]);
+				try stripped.append(allocator, normalized[j]);
 				j += 1;
 			}
 		}
 	}
-
 	// Phase 0b: normalize hyphens
 	const dehyphenated = try normalizeHyphens(allocator, stripped.items);
 	defer allocator.free(dehyphenated);
