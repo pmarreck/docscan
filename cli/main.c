@@ -4055,19 +4055,50 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 		}
 	}
 
-	/* Check text quality — warn if extracted text looks garbled */
+	/* Check text quality — warn if extracted text looks garbled.
+	 * Sample from multiple "content": fields spread across the JSON so we
+	 * don't just test the title page (which is often clean even when the
+	 * body is garbled from custom font encoding). */
 	{
-		/* Sample text from the JSON content fields */
-		const char* sample = strstr(json, "\"content\":");
-		if (sample) {
-			sample += 10;
-			while (*sample == ' ' || *sample == '"') sample++;
-			/* Find a chunk of text to check (up to 2KB) */
-			size_t sample_len = 0;
-			const char* s = sample;
-			while (*s && *s != '"' && sample_len < 2048) { s++; sample_len++; }
-			if (sample_len > 20) {
-				unsigned char quality = docscan_text_quality(sample, sample_len);
+		/* Count total "content": occurrences */
+		size_t n_content = 0;
+		{
+			const char* p = json;
+			while ((p = strstr(p, "\"content\":")) != NULL) { n_content++; p += 10; }
+		}
+		if (n_content > 0) {
+			/* Build a combined sample buffer from up to 5 evenly-spaced
+			 * content fields, ~400 bytes from each */
+			char sample_buf[2048];
+			size_t buf_used = 0;
+			size_t step = n_content < 5 ? 1 : n_content / 5;
+			size_t idx = 0;
+			size_t samples_taken = 0;
+			const char* p = json;
+			while ((p = strstr(p, "\"content\":")) != NULL && samples_taken < 5) {
+				if (idx % step == 0 || idx == n_content / 2) {
+					const char* val = p + 10;
+					while (*val == ' ' || *val == '"') val++;
+					/* Copy up to 400 bytes from this content field */
+					size_t avail = 2048 - buf_used;
+					size_t chunk = 0;
+					const char* s = val;
+					while (*s && *s != '"' && chunk < 400 && chunk < avail) {
+						s++; chunk++;
+					}
+					if (chunk > 0) {
+						memcpy(sample_buf + buf_used, val, chunk);
+						buf_used += chunk;
+						/* Add a space separator between samples */
+						if (buf_used < 2048) sample_buf[buf_used++] = ' ';
+						samples_taken++;
+					}
+				}
+				idx++;
+				p += 10;
+			}
+			if (buf_used > 20) {
+				unsigned char quality = docscan_text_quality(sample_buf, buf_used);
 				if (quality < 30) {
 					fprintf(stderr,
 						"warn: Low text quality (%d%% of words recognized). "
@@ -4078,7 +4109,6 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 			}
 		}
 	}
-
 	docscan_free(json);
 	return 0;
 }
