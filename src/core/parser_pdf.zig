@@ -546,8 +546,71 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 		}
 		break;
 	}
+
+	// Follow Do operators into form XObjects — this is how OCR'd PDFs
+	// (e.g. from ocrmypdf) embed their invisible text layer.
+	extractFormXObjectText(allocator, ctx, page_dict, spans, page_num, &font_maps);
 }
 
+/// Walk /Resources/XObject entries on a page. For each form XObject
+/// (Subtype = /Form), parse its content stream for text spans.
+fn extractFormXObjectText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pdf_objects.DictEntry, spans: *std.ArrayList(TextSpan), page_num: u32, page_font_maps: *FontMap) void {
+	// Find /Resources (direct or indirect)
+	const resources = blk: {
+		if (pdf_objects.getDictDict(page_dict, "Resources")) |r| break :blk r;
+		const res_ref = pdf_objects.getDictRef(page_dict, "Resources") orelse return;
+		const res_val = (ctx.getObject(res_ref.obj) catch return) orelse return;
+		// Note: we can't defer free here because we need the dict to outlive this scope.
+		// The resource dict is borrowed from the page object, which is managed by ctx.
+		if (res_val != .dict) {
+			pdf_objects.freePdfValue(allocator, res_val);
+			return;
+		}
+		break :blk res_val.dict;
+	};
+
+	// Find /XObject sub-dictionary
+	const xobject_dict = pdf_objects.getDictDict(resources, "XObject") orelse return;
+
+	for (xobject_dict) |xobj_entry| {
+		// Each entry maps a name to a reference to an XObject stream
+		if (xobj_entry.value != .reference) continue;
+		const obj_num = xobj_entry.value.reference.obj;
+
+		// Get the XObject's dictionary to check Subtype
+		const xobj_val = (ctx.getObject(obj_num) catch continue) orelse continue;
+		defer pdf_objects.freePdfValue(allocator, xobj_val);
+		if (xobj_val != .dict) continue;
+
+		// Only process form XObjects (not images)
+		const subtype = pdf_objects.getDictName(xobj_val.dict, "Subtype") orelse continue;
+		if (!std.mem.eql(u8, subtype, "Form")) continue;
+
+		// Get the form's content stream
+		const stream_data = (ctx.getStream(obj_num) catch continue) orelse continue;
+		defer allocator.free(stream_data);
+
+		// Build font maps from the form's own /Resources if present,
+		// falling back to the page's font maps
+		var form_font_maps = FontMap.init(allocator);
+		defer {
+			var iter = form_font_maps.iterator();
+			while (iter.next()) |fe| {
+				allocator.free(fe.key_ptr.*);
+				var cm = fe.value_ptr.*;
+				cm.deinit();
+			}
+			form_font_maps.deinit();
+		}
+		if (pdf_objects.getDictDict(xobj_val.dict, "Resources")) |form_res| {
+			buildFontMapsFromResources(allocator, ctx, form_res, &form_font_maps);
+		}
+
+		// Use form's own fonts if available, otherwise fall back to page fonts
+		const effective_fonts = if (form_font_maps.count() > 0) &form_font_maps else page_font_maps;
+		parseContentStream(allocator, stream_data, spans, page_num, effective_fonts) catch continue;
+	}
+}
 /// Build font-name-to-CMap mappings from a page's /Resources/Font dictionary.
 fn buildFontMaps(allocator: Allocator, ctx: *PdfContext, page_dict: []const pdf_objects.DictEntry, font_maps: *FontMap) void {
 	// Find /Resources dict (may be direct or indirect)
@@ -706,7 +769,12 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 
 		// PDF string: (text)
 		if (ch == '(') {
-			const str = extractStreamString(allocator, stream, &pos) catch continue;
+			const raw_str = extractStreamString(allocator, stream, &pos) catch continue;
+			// Decode through CMap if available (needed for CID fonts in OCR'd PDFs)
+			const cmap = getCurrentCMap(font_maps, current_font_name);
+			const str = if (cmap) |cm| (decodeThroughCMap(allocator, raw_str, cm) orelse raw_str) else raw_str;
+			const str_is_decoded = (str.ptr != raw_str.ptr);
+			if (str_is_decoded) allocator.free(raw_str);
 			// Look ahead for Tj or '
 			const next_pos = skipStreamWhitespace(stream, pos);
 			if (next_pos < stream.len) {
@@ -739,7 +807,6 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 			allocator.free(str);
 			continue;
 		}
-
 		// Hex string: <hex> — could be Tj operand with glyph IDs
 		if (ch == '<' and pos + 1 < stream.len and stream[pos + 1] != '<') {
 			const hex_text = extractHexStringText(allocator, stream, &pos, getCurrentCMap(font_maps, current_font_name)) catch continue;
@@ -1005,6 +1072,62 @@ fn getCurrentCMap(font_maps: ?*const FontMap, font_name: ?[]const u8) ?*const CM
 	return maps.getPtr(name);
 }
 
+/// Decode raw bytes from a parenthesized string through a CMap.
+/// CID fonts (Type0/Identity-H) use 2-byte character codes; single-byte
+/// fonts use 1-byte codes. We try 2-byte first, then 1-byte fallback.
+/// If no CMap matches are found, returns null (caller keeps the raw string).
+fn decodeThroughCMap(allocator: Allocator, raw: []const u8, cmap: *const CMap) ?[]const u8 {
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(allocator);
+	var decoded_any = false;
+	var i: usize = 0;
+
+	while (i < raw.len) {
+		// Try 2-byte glyph ID first (CID font)
+		if (i + 2 <= raw.len) {
+			const glyph_id: u16 = (@as(u16, raw[i]) << 8) | raw[i + 1];
+			if (cmap.lookup(glyph_id)) |text| {
+				buf.appendSlice(allocator, text) catch return null;
+				decoded_any = true;
+				i += 2;
+				continue;
+			}
+			if (cmap.lookupCodepoint(glyph_id)) |cp| {
+				var utf8_buf: [4]u8 = undefined;
+				const n = encodeUtf8(cp, &utf8_buf);
+				buf.appendSlice(allocator, utf8_buf[0..n]) catch return null;
+				decoded_any = true;
+				i += 2;
+				continue;
+			}
+		}
+		// Try 1-byte glyph ID
+		const glyph_id_1: u16 = raw[i];
+		if (cmap.lookup(glyph_id_1)) |text| {
+			buf.appendSlice(allocator, text) catch return null;
+			decoded_any = true;
+			i += 1;
+			continue;
+		}
+		if (cmap.lookupCodepoint(glyph_id_1)) |cp| {
+			var utf8_buf: [4]u8 = undefined;
+			const n = encodeUtf8(cp, &utf8_buf);
+			buf.appendSlice(allocator, utf8_buf[0..n]) catch return null;
+			decoded_any = true;
+			i += 1;
+			continue;
+		}
+		// No match — keep raw byte
+		buf.append(allocator, raw[i]) catch return null;
+		i += 1;
+	}
+
+	if (!decoded_any) {
+		buf.deinit(allocator);
+		return null;
+	}
+	return buf.toOwnedSlice(allocator) catch null;
+}
 /// Extract text from a hex string like <0042004300440045>, decoding
 /// glyph IDs via CMap if available, otherwise returning raw bytes.
 fn extractHexStringText(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*const CMap) ![]const u8 {
@@ -2333,3 +2456,89 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 	return try buf.toOwnedSlice(allocator);
 }
 
+/// Build a synthetic PDF where text lives in a form XObject (like OCR'd PDFs).
+/// The page content stream uses `Do` to reference the form, which contains the Tj ops.
+fn buildTestPdfWithFormXObject(allocator: Allocator, form_text: []const u8) ![]const u8 {
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(allocator);
+	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	defer obj_offsets.deinit(allocator);
+
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+
+	// Object 1: Catalog
+	try obj_offsets.append(allocator, .{ .num = 1, .offset = buf.items.len });
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+	// Object 2: Pages
+	try obj_offsets.append(allocator, .{ .num = 2, .offset = buf.items.len });
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+	// Object 5: Form XObject stream with the actual text
+	var form_stream = std.ArrayList(u8){};
+	defer form_stream.deinit(allocator);
+	try form_stream.appendSlice(allocator, "BT\n/F1 12 Tf\n72 700 Td\n(");
+	try form_stream.appendSlice(allocator, form_text);
+	try form_stream.appendSlice(allocator, ") Tj\nET\n");
+
+	try obj_offsets.append(allocator, .{ .num = 5, .offset = buf.items.len });
+	try std.fmt.format(buf.writer(allocator),
+		"5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Length {d} >>\nstream\n", .{form_stream.items.len});
+	try buf.appendSlice(allocator, form_stream.items);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+
+	// Object 4: Content stream — just references the form XObject via Do
+	const content = "/OCR Do\n";
+	try obj_offsets.append(allocator, .{ .num = 4, .offset = buf.items.len });
+	try std.fmt.format(buf.writer(allocator),
+		"4 0 obj\n<< /Length {d} >>\nstream\n", .{content.len});
+	try buf.appendSlice(allocator, content);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+
+	// Object 3: Page — references content stream and XObject
+	try obj_offsets.append(allocator, .{ .num = 3, .offset = buf.items.len });
+	try buf.appendSlice(allocator,
+		"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> /XObject << /OCR 5 0 R >> >> >>\nendobj\n");
+
+	// Xref
+	var max_obj: u32 = 0;
+	for (obj_offsets.items) |o| { if (o.num > max_obj) max_obj = o.num; }
+	const xref_offset = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n");
+	try std.fmt.format(buf.writer(allocator), "0 {d}\n", .{max_obj + 1});
+	try buf.appendSlice(allocator, "0000000000 65535 f\n");
+	var obj_idx: u32 = 1;
+	while (obj_idx <= max_obj) : (obj_idx += 1) {
+		var found = false;
+		for (obj_offsets.items) |o| {
+			if (o.num == obj_idx) {
+				try std.fmt.format(buf.writer(allocator), "{d:0>10} 00000 n\n", .{o.offset});
+				found = true;
+				break;
+			}
+		}
+		if (!found) try buf.appendSlice(allocator, "0000000000 00000 f\n");
+	}
+	try std.fmt.format(buf.writer(allocator), "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
+	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "parse extracts text from form XObjects (OCR'd PDFs)" {
+	const alloc = testing.allocator;
+	const pdf = try buildTestPdfWithFormXObject(alloc, "Hello from OCR layer");
+	defer alloc.free(pdf);
+	const doc = try parse(alloc, pdf, "test-form-xobj.pdf");
+	defer freeDocument(alloc, doc);
+	// The text lives in a form XObject, not the main content stream.
+	// Parser must follow Do into form XObjects to find it.
+	try testing.expect(doc.sections.len > 0);
+	var found = false;
+	for (doc.sections) |sec| {
+		if (std.mem.indexOf(u8, sec.content, "Hello from OCR layer") != null) {
+			found = true;
+			break;
+		}
+	}
+	try testing.expect(found);
+}

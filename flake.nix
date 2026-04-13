@@ -115,12 +115,12 @@
 				};
 
 				devShells.default = pkgs.mkShell {
-					packages = with pkgs; [
-						zig_0_15
-						jq
-						hyperfine
-					];
-					shellHook = ''
+				packages = with pkgs; [
+					zig_0_15
+					jq
+					hyperfine
+					ocrmypdf
+				];					shellHook = ''
 						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
 						export ZIG_GLOBAL_CACHE_DIR="$HOME/.cache/zig"
 						export ZIG_LOCAL_CACHE_DIR="$PWD/zig-cache"
