@@ -2015,6 +2015,21 @@ static int cmd_config(const char* db_path_arg, const char* key, const char* valu
 			docscan_close(db);
 		}
 
+		/* Layer env vars on top of config file values */
+		{
+			const char* env_api = getenv("DOCSCAN_EMBEDDING_API");
+			if (env_api && env_api[0])
+				snprintf(cfg.embedding_api, sizeof(cfg.embedding_api), "%s", env_api);
+			const char* env_url = getenv("DOCSCAN_EMBEDDING_URL");
+			if (env_url && env_url[0])
+				snprintf(cfg.embedding_url, sizeof(cfg.embedding_url), "%s", env_url);
+			const char* env_model = getenv("DOCSCAN_MODEL");
+			if (env_model && env_model[0])
+				snprintf(cfg.embedding_model, sizeof(cfg.embedding_model), "%s", env_model);
+			const char* env_key = getenv("DOCSCAN_EMBEDDING_API_KEY");
+			if (env_key && env_key[0])
+				snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key), "%s", env_key);
+		}
 		if (g_json_output) {
 			printf("{");
 			printf("\"embedding.api\":\"%s\"", cfg.embedding_api);
