@@ -590,6 +590,15 @@ fn splitCamelBoundaries(allocator: Allocator, text: []const u8) ![]const u8 {
 			word_end += 1;
 		}
 		const token = text[i..word_end];
+		// Skip tokens that are part of a URL or email address —
+		// don't split "wolframscience" inside "www.wolframscience.com"
+		const has_dot_before = (i > 0 and text[i - 1] == '.');
+		const has_dot_after = (word_end < text.len and text[word_end] == '.');
+		if (has_dot_before or has_dot_after) {
+			try result.appendSlice(allocator, token);
+			i = word_end;
+			continue;
+		}
 
 		// If the whole token is already a known word, don't split
 		if (isWord(token)) {
@@ -597,7 +606,6 @@ fn splitCamelBoundaries(allocator: Allocator, text: []const u8) ![]const u8 {
 			i = word_end;
 			continue;
 		}
-
 		// Try splitting: scan from longest-left to shortest-left.
 		// Require both halves to be >=3 chars AND dictionary words.
 		// This avoids false splits like "Greenbe" → "Green"+"be" where
@@ -1073,7 +1081,13 @@ test "splitCamelBoundaries: preserves McDonald" {
 	try testing.expectEqualStrings("McDonald went to YouTube", result);
 }
 
-test "rejoinWords: full pipeline ligature + punctuation + camel" {
+test "splitCamelBoundaries: preserves URLs" {
+	const alloc = testing.allocator;
+	ensureInit();
+	const result = try splitCamelBoundaries(alloc, "visit www.wolframscience.com for details");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("visit www.wolframscience.com for details", result);
+}test "rejoinWords: full pipeline ligature + punctuation + camel" {
 	const alloc = testing.allocator;
 	const result = try rejoinWords(alloc, "Arti\x02cial Intelligence");
 	defer alloc.free(result);
