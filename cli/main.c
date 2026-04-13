@@ -4055,10 +4055,33 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 		}
 	}
 
+	/* Check text quality — warn if extracted text looks garbled */
+	{
+		/* Sample text from the JSON content fields */
+		const char* sample = strstr(json, "\"content\":");
+		if (sample) {
+			sample += 10;
+			while (*sample == ' ' || *sample == '"') sample++;
+			/* Find a chunk of text to check (up to 2KB) */
+			size_t sample_len = 0;
+			const char* s = sample;
+			while (*s && *s != '"' && sample_len < 2048) { s++; sample_len++; }
+			if (sample_len > 20) {
+				unsigned char quality = docscan_text_quality(sample, sample_len);
+				if (quality < 30) {
+					fprintf(stderr,
+						"warn: Low text quality (%d%% of words recognized). "
+						"This document may have garbled text from custom font encoding or poor OCR.\n"
+						"      Consider re-processing with: ocrmypdf input.pdf output.pdf\n",
+						(int)quality);
+				}
+			}
+		}
+	}
+
 	docscan_free(json);
 	return 0;
 }
-
 /* ── Main: argument parsing ─────────────────────────────────────────── */
 
 /* ── Command: normalize ───────────────────────────────────────────── */

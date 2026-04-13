@@ -132,8 +132,10 @@ int docscan_config_set(docscan_db* db, const char* key, const char* value,
 char* docscan_normalize(const char* text, size_t len,
                          char* err_buf, size_t err_buf_len);
 
-void docscan_free(char* ptr);
+/* Check text quality (0-100%). Low scores suggest garbled/OCR text. */
+unsigned char docscan_text_quality(const char* text, size_t len);
 
+void docscan_free(char* ptr);
 #ifdef __cplusplus
 }
 #endif

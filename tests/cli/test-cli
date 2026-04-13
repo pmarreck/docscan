@@ -850,6 +850,22 @@ else
 	fail "--help mentions --logical and --physical" "rc=$rc"
 fi
 
+
+# ──────────────────────────────────────────────
+# 64. extract warns on low-quality text (high non-word ratio)
+# ──────────────────────────────────────────────
+cat > "$TEST_DIR/garbled.md" << 'FIXTURE'
+@FDA6G5F;A@ A8 +L77@F5:
+*96 FC?:?8 @7 &C@DA6C@
+*96 (F3C:4 @7 9C:>2?
+FIXTURE
+out="" ; err="" ; rc=""
+capture "$BINARY" extract "$TEST_DIR/garbled.md"
+if [ "$rc" -eq 0 ] && echo "$err" | grep -qi "quality\|garbled\|OCR\|ocrmypdf"; then
+	pass "extract warns on low-quality garbled text"
+else
+	fail "extract warns on low-quality text" "rc=$rc, err='$err'"
+fi
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────

@@ -853,6 +853,12 @@ export fn docscan_normalize(
 
 	return dupeToC(result);
 }
+/// Check text quality (0-100%). Low scores suggest garbled/OCR text.
+export fn docscan_text_quality(text: ?[*]const u8, len: usize) u8 {
+	const input = if (text) |t| t[0..len] else return 100;
+	return core.wordfix.textQuality(input);
+}
+
 /// Free a string returned by any docscan_* function.
 export fn docscan_free(ptr: ?[*:0]u8) void {
 	if (ptr) |p| {

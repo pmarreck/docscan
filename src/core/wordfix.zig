@@ -688,12 +688,59 @@ pub fn applySections(allocator: Allocator, sections: []const document.Section) v
 		}
 	}
 }
+// ── Text quality scoring ──────────────────────────────────────────────
+
+/// Dictionary-based text quality scoring (0-100%).
+/// Samples words from the text and checks what percentage are recognized.
+/// Also factors in alpha density — garbled OCR text has sparse alphabetic
+/// runs mixed with symbols/digits, which is a strong garbled-text signal
+/// independent of whether the few alpha fragments happen to match words.
+pub fn textQuality(text: []const u8) u8 {	ensureInit();
+	if (text.len == 0) return 100;
+
+	// Alpha density: what fraction of bytes are alphabetic
+	var alpha_count: u32 = 0;
+	for (text) |c| {
+		if (std.ascii.isAlphabetic(c)) alpha_count += 1;
+	}
+	const text_len: u32 = @intCast(@min(text.len, std.math.maxInt(u32)));
+	const alpha_pct: u32 = (alpha_count * 100) / text_len;
+
+	var total: u32 = 0;
+	var recognized: u32 = 0;
+	var i: usize = 0;
+
+	// Sample up to 200 words
+	while (i < text.len and total < 200) {
+		// Skip non-alpha
+		while (i < text.len and !std.ascii.isAlphabetic(text[i])) : (i += 1) {}
+		if (i >= text.len) break;
+
+		// Collect word
+		const start = i;
+		while (i < text.len and std.ascii.isAlphabetic(text[i])) : (i += 1) {}
+		const word = text[start..i];
+
+		// Skip very short words (1-2 chars) — too many false positives
+		if (word.len < 3) continue;
+
+		total += 1;
+		if (isWord(word)) recognized += 1;
+	}
+
+	const word_pct: u32 = if (total > 0) (recognized * 100) / total else 100;
+
+	// Quality is the lower of alpha density and word recognition rate.
+	// Both need to be high for genuine text — garbled text fails on alpha density,
+	// random letter sequences fail on word recognition.
+	return @intCast(@min(alpha_pct, word_pct));
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "isWord finds common words" {
-	try testing.expect(isWord("hello"));
+test "isWord finds common words" {	try testing.expect(isWord("hello"));
 	try testing.expect(isWord("Hello")); // case-insensitive
 	try testing.expect(isWord("HELLO"));
 	try testing.expect(isWord("known"));
@@ -954,4 +1001,18 @@ test "rejoinWords: full pipeline ligature + punctuation + camel" {
 	const result = try rejoinWords(alloc, "Arti\x02cial Intelligence");
 	defer alloc.free(result);
 	try testing.expectEqualStrings("Artificial Intelligence", result);
+}
+
+test "textQuality: garbled OCR text scores below 30" {
+	// Garbled text from a bad OCR scan — should score very low quality
+	const garbled = "@FDA6G5F;A@ A8 +L77@F5:\n*96 FC?:?8 @7 &C@DA6C@\n*96 (F3C:4 @7 9C:>2?";
+	const quality = textQuality(garbled);
+	// Must be below 30% — this is clearly not real English
+	try testing.expect(quality < 30);
+}
+
+test "textQuality: normal English text scores above 70" {
+	const english = "The quick brown fox jumps over the lazy dog and runs through the forest";
+	const quality = textQuality(english);
+	try testing.expect(quality > 70);
 }
