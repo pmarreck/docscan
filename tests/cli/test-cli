@@ -785,6 +785,72 @@ else
 	fail "extract --to filters sections" "rc=$rc, out='$out'"
 fi
 # ──────────────────────────────────────────────
+# 58. --logical flag accepted without error
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --logical --from 1 --to 1 "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ]; then
+	pass "--logical flag accepted"
+else
+	fail "--logical flag accepted" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 59. --physical flag accepted without error
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --physical --from 1 --to 1 "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ]; then
+	pass "--physical flag accepted"
+else
+	fail "--physical flag accepted" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 60. --from/--to without --logical/--physical hint on stderr
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --from 1 --to 1 "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && echo "$err" | grep -qi "physical"; then
+	pass "--from/--to shows physical page hint on stderr"
+else
+	fail "--from/--to shows physical page hint" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 61. --logical suppresses the physical hint
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --logical --from 1 --to 1 "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && ! echo "$err" | grep -qi "physical"; then
+	pass "--logical suppresses physical hint"
+else
+	fail "--logical suppresses physical hint" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 62. --physical suppresses the hint too
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" extract --physical --from 1 --to 1 "$TEST_DIR/extract-test.md"
+if [ "$rc" -eq 0 ] && ! echo "$err" | grep -qi "Note:"; then
+	pass "--physical suppresses hint"
+else
+	fail "--physical suppresses hint" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 63. --help mentions --logical and --physical
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" --help
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q -- "--logical" && echo "$out" | grep -q -- "--physical"; then
+	pass "--help mentions --logical and --physical"
+else
+	fail "--help mentions --logical and --physical" "rc=$rc"
+fi
+
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 echo ""

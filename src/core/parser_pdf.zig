@@ -292,6 +292,136 @@ const FlatSection = struct {
 	}
 };
 
+/// Style of page numbering in a PDF /PageLabels entry.
+const PageLabelStyle = enum {
+	decimal,
+	roman_lower,
+	roman_upper,
+	alpha_lower,
+	alpha_upper,
+	none,
+};
+
+/// A single entry from a PDF /PageLabels /Nums array.
+/// Maps a range of physical page indices to a numbering style.
+const PageLabelEntry = struct {
+	start_index: u32, // 0-based physical page index where this range starts
+	style: PageLabelStyle,
+	start_number: u32, // first logical number in this range (default 1)
+};
+
+/// Parse a /PageLabels /Nums array into a slice of PageLabelEntry.
+/// The array alternates: [index1, dict1, index2, dict2, ...].
+/// Returns null if the array is empty or malformed.
+/// Uses a fixed buffer -- returns a slice into it (max 32 entries).
+fn parsePageLabelsFromArray(nums: []const PdfValue) ?[]const PageLabelEntry {
+	const max_entries = 32;
+	const S = struct {
+		var buf: [max_entries]PageLabelEntry = undefined;
+	};
+	var count: usize = 0;
+	var i: usize = 0;
+	while (i + 1 < nums.len and count < max_entries) {
+		// Expect integer, then dict
+		const idx_val = nums[i];
+		const dict_val = nums[i + 1];
+		if (idx_val != .integer or dict_val != .dict) {
+			i += 1;
+			continue;
+		}
+		const start_idx: u32 = if (idx_val.integer >= 0) @intCast(@as(u64, @bitCast(idx_val.integer))) else 0;
+		const dict = dict_val.dict;
+
+		// Parse /S (style)
+		var style: PageLabelStyle = .none;
+		if (pdf_objects.getDictName(dict, "S")) |s| {
+			if (s.len == 1) {
+				style = switch (s[0]) {
+					'D' => .decimal,
+					'r' => .roman_lower,
+					'R' => .roman_upper,
+					'a' => .alpha_lower,
+					'A' => .alpha_upper,
+					else => .none,
+				};
+			}
+		}
+
+		// Parse /St (start number, default 1)
+		const start_num: u32 = if (pdf_objects.getDictInt(dict, "St")) |st|
+			if (st > 0) @intCast(@as(u64, @bitCast(st))) else 1
+		else
+			1;
+
+		S.buf[count] = .{
+			.start_index = start_idx,
+			.style = style,
+			.start_number = start_num,
+		};
+		count += 1;
+		i += 2;
+	}
+	if (count == 0) return null;
+	return S.buf[0..count];
+}
+
+/// Apply page labels to sections. For each section with a page_physical,
+/// find the matching label range and compute page_logical, page_section, page_roman.
+fn applyPageLabels(sections: []Section, labels: []const PageLabelEntry) void {
+	if (labels.len == 0) return;
+	for (sections) |*section| {
+		const pp = section.page_physical orelse continue;
+		// Convert 1-based physical page to 0-based index
+		const page_index: u32 = pp -| 1;
+
+		// Find the last label entry where start_index <= page_index
+		var best: ?usize = null;
+		for (labels, 0..) |entry, li| {
+			if (entry.start_index <= page_index) {
+				best = li;
+			}
+		}
+		const label_idx = best orelse continue;
+		const entry = labels[label_idx];
+
+		section.page_logical = entry.start_number + (page_index - entry.start_index);
+		section.page_section = @as(u32, @intCast(label_idx)) + 1;
+		section.page_roman = (entry.style == .roman_lower or entry.style == .roman_upper);
+	}
+}
+
+/// Parse /PageLabels from the catalog dictionary.
+/// Resolves indirect references for the /PageLabels and /Nums values.
+/// Returns a slice of PageLabelEntry, or null if no labels found.
+fn parsePageLabels(ctx: *PdfContext, catalog: []const pdf_objects.DictEntry) ?[]const PageLabelEntry {
+	// Look for /PageLabels -- it can be a dict directly or an indirect reference
+	for (catalog) |entry| {
+		if (!std.mem.eql(u8, entry.key, "PageLabels")) continue;
+
+		var page_labels_dict: []const pdf_objects.DictEntry = undefined;
+		var resolved_val: ?PdfValue = null;
+
+		if (entry.value == .dict) {
+			page_labels_dict = entry.value.dict;
+		} else if (entry.value == .reference) {
+			resolved_val = (ctx.getObject(entry.value.reference.obj) catch return null) orelse return null;
+			if (resolved_val.? != .dict) {
+				pdf_objects.freePdfValue(ctx.allocator, resolved_val.?);
+				return null;
+			}
+			page_labels_dict = resolved_val.?.dict;
+		} else {
+			return null;
+		}
+		defer if (resolved_val) |rv| pdf_objects.freePdfValue(ctx.allocator, rv);
+
+		// Look for /Nums array inside the PageLabels dict
+		const nums = pdf_objects.getDictArray(page_labels_dict, "Nums") orelse return null;
+		return parsePageLabelsFromArray(nums);
+	}
+	return null;
+}
+
 /// Parse a PDF byte buffer into a Document with inferred heading structure.
 /// Caller owns the returned Document; free with `freeDocument`.
 pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Document {
@@ -331,6 +461,11 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 
 	// Post-process: rejoin falsely-split words using dictionary lookup
 	wordfix.applySections(allocator, sections);
+
+	// Apply page labels from PDF catalog (if present)
+	if (parsePageLabels(&ctx, catalog_val.dict)) |labels| {
+		applyPageLabels(@constCast(sections), labels);
+	}
 
 	// Extract title from first heading or first text
 	var title: ?[]const u8 = null;
@@ -1868,3 +2003,333 @@ test "narrow gap: 'to me' stays spaced when 'tome' exists but gap data says spac
 	// Narrow gap + "tome" is a word → concatenated (trust gap data)
 	try testing.expect(std.mem.indexOf(u8, content, "tome") != null);
 }
+
+// ── PageLabels tests ───────────────────────────────────────────────────
+
+test "applyPageLabels — decimal labels set page_logical" {
+	// Two sections at physical pages 1, 2
+	// Label range: pages 0+ are decimal starting at 1
+	var sections = [_]Section{
+		.{ .heading = null, .level = 0, .content = "text", .children = &.{}, .page_physical = 1 },
+		.{ .heading = null, .level = 0, .content = "text", .children = &.{}, .page_physical = 2 },
+	};
+	const labels = [_]PageLabelEntry{
+		.{ .start_index = 0, .style = .decimal, .start_number = 1 },
+	};
+	applyPageLabels(&sections, &labels);
+
+	try testing.expectEqual(@as(?u32, 1), sections[0].page_logical);
+	try testing.expectEqual(@as(?u32, 2), sections[1].page_logical);
+	try testing.expectEqual(@as(?u32, 1), sections[0].page_section);
+	try testing.expectEqual(@as(?u32, 1), sections[1].page_section);
+	try testing.expectEqual(false, sections[0].page_roman);
+	try testing.expectEqual(false, sections[1].page_roman);
+}
+
+test "applyPageLabels — roman then decimal ranges" {
+	// Pages 0-3: lowercase roman starting at 1 (i, ii, iii, iv)
+	// Pages 4+: decimal starting at 1
+	var sections = [_]Section{
+		.{ .heading = null, .level = 0, .content = "preface", .children = &.{}, .page_physical = 1 },
+		.{ .heading = null, .level = 0, .content = "intro", .children = &.{}, .page_physical = 4 },
+		.{ .heading = null, .level = 0, .content = "ch1", .children = &.{}, .page_physical = 5 },
+		.{ .heading = null, .level = 0, .content = "ch2", .children = &.{}, .page_physical = 7 },
+	};
+	const labels = [_]PageLabelEntry{
+		.{ .start_index = 0, .style = .roman_lower, .start_number = 1 },
+		.{ .start_index = 4, .style = .decimal, .start_number = 1 },
+	};
+	applyPageLabels(&sections, &labels);
+
+	// Physical page 1 -> 0-based index 0, in range 0 (roman, start 1): logical = 1
+	try testing.expectEqual(@as(?u32, 1), sections[0].page_logical);
+	try testing.expectEqual(true, sections[0].page_roman);
+	try testing.expectEqual(@as(?u32, 1), sections[0].page_section);
+
+	// Physical page 4 -> 0-based index 3, in range 0 (roman, start 1): logical = 4
+	try testing.expectEqual(@as(?u32, 4), sections[1].page_logical);
+	try testing.expectEqual(true, sections[1].page_roman);
+	try testing.expectEqual(@as(?u32, 1), sections[1].page_section);
+
+	// Physical page 5 -> 0-based index 4, in range 1 (decimal, start 1): logical = 1
+	try testing.expectEqual(@as(?u32, 1), sections[2].page_logical);
+	try testing.expectEqual(false, sections[2].page_roman);
+	try testing.expectEqual(@as(?u32, 2), sections[2].page_section);
+
+	// Physical page 7 -> 0-based index 6, in range 1 (decimal, start 1): logical = 3
+	try testing.expectEqual(@as(?u32, 3), sections[3].page_logical);
+	try testing.expectEqual(false, sections[3].page_roman);
+	try testing.expectEqual(@as(?u32, 2), sections[3].page_section);
+}
+
+test "applyPageLabels — no labels leaves page_logical null" {
+	var sections = [_]Section{
+		.{ .heading = null, .level = 0, .content = "text", .children = &.{}, .page_physical = 3 },
+	};
+	const labels = [_]PageLabelEntry{};
+	applyPageLabels(&sections, &labels);
+	try testing.expectEqual(@as(?u32, null), sections[0].page_logical);
+}
+
+test "applyPageLabels — null page_physical is skipped" {
+	var sections = [_]Section{
+		.{ .heading = null, .level = 0, .content = "text", .children = &.{} },
+	};
+	const labels = [_]PageLabelEntry{
+		.{ .start_index = 0, .style = .decimal, .start_number = 1 },
+	};
+	applyPageLabels(&sections, &labels);
+	try testing.expectEqual(@as(?u32, null), sections[0].page_logical);
+}
+
+test "applyPageLabels — start_number offset applied correctly" {
+	// Range starting at page index 10, decimal, starting at 42
+	var sections = [_]Section{
+		.{ .heading = null, .level = 0, .content = "text", .children = &.{}, .page_physical = 13 },
+	};
+	const labels = [_]PageLabelEntry{
+		.{ .start_index = 0, .style = .decimal, .start_number = 1 },
+		.{ .start_index = 10, .style = .decimal, .start_number = 42 },
+	};
+	applyPageLabels(&sections, &labels);
+	// Physical 13 -> 0-based index 12, in range 1 (start_index=10, start_number=42)
+	// logical = 42 + (12 - 10) = 44
+	try testing.expectEqual(@as(?u32, 44), sections[0].page_logical);
+	try testing.expectEqual(@as(?u32, 2), sections[0].page_section);
+}
+
+test "parsePageLabelsFromArray — simple decimal" {
+	// Simulate /Nums [ 0 << /S /D /St 1 >> ]
+	const dict_entries = [_]pdf_objects.DictEntry{
+		.{ .key = "S", .value = .{ .name = "D" } },
+		.{ .key = "St", .value = .{ .integer = 1 } },
+	};
+	const nums_array = [_]PdfValue{
+		.{ .integer = 0 },
+		.{ .dict = &dict_entries },
+	};
+	const result = parsePageLabelsFromArray(&nums_array);
+	try testing.expect(result != null);
+	const labels = result.?;
+	try testing.expectEqual(@as(usize, 1), labels.len);
+	try testing.expectEqual(@as(u32, 0), labels[0].start_index);
+	try testing.expectEqual(PageLabelStyle.decimal, labels[0].style);
+	try testing.expectEqual(@as(u32, 1), labels[0].start_number);
+}
+
+test "parsePageLabelsFromArray — roman then decimal" {
+	const dict0 = [_]pdf_objects.DictEntry{
+		.{ .key = "S", .value = .{ .name = "r" } },
+	};
+	const dict1 = [_]pdf_objects.DictEntry{
+		.{ .key = "S", .value = .{ .name = "D" } },
+		.{ .key = "St", .value = .{ .integer = 1 } },
+	};
+	const nums_array = [_]PdfValue{
+		.{ .integer = 0 },
+		.{ .dict = &dict0 },
+		.{ .integer = 4 },
+		.{ .dict = &dict1 },
+	};
+	const result = parsePageLabelsFromArray(&nums_array);
+	try testing.expect(result != null);
+	const labels = result.?;
+	try testing.expectEqual(@as(usize, 2), labels.len);
+	try testing.expectEqual(@as(u32, 0), labels[0].start_index);
+	try testing.expectEqual(PageLabelStyle.roman_lower, labels[0].style);
+	try testing.expectEqual(@as(u32, 1), labels[0].start_number);
+	try testing.expectEqual(@as(u32, 4), labels[1].start_index);
+	try testing.expectEqual(PageLabelStyle.decimal, labels[1].style);
+	try testing.expectEqual(@as(u32, 1), labels[1].start_number);
+}
+
+test "parsePageLabelsFromArray — empty array returns null" {
+	const nums_array = [_]PdfValue{};
+	const result = parsePageLabelsFromArray(&nums_array);
+	try testing.expectEqual(@as(?[]const PageLabelEntry, null), result);
+}
+
+test "parsePageLabelsFromArray — upper roman and alpha styles" {
+	const dict0 = [_]pdf_objects.DictEntry{
+		.{ .key = "S", .value = .{ .name = "R" } },
+	};
+	const dict1 = [_]pdf_objects.DictEntry{
+		.{ .key = "S", .value = .{ .name = "A" } },
+		.{ .key = "St", .value = .{ .integer = 3 } },
+	};
+	const dict2 = [_]pdf_objects.DictEntry{
+		.{ .key = "S", .value = .{ .name = "a" } },
+	};
+	const nums_array = [_]PdfValue{
+		.{ .integer = 0 },
+		.{ .dict = &dict0 },
+		.{ .integer = 5 },
+		.{ .dict = &dict1 },
+		.{ .integer = 10 },
+		.{ .dict = &dict2 },
+	};
+	const result = parsePageLabelsFromArray(&nums_array);
+	try testing.expect(result != null);
+	const labels = result.?;
+	try testing.expectEqual(@as(usize, 3), labels.len);
+	try testing.expectEqual(PageLabelStyle.roman_upper, labels[0].style);
+	try testing.expectEqual(PageLabelStyle.alpha_upper, labels[1].style);
+	try testing.expectEqual(@as(u32, 3), labels[1].start_number);
+	try testing.expectEqual(PageLabelStyle.alpha_lower, labels[2].style);
+}
+
+test "PDF with PageLabels — integration" {
+	// Build a PDF with page labels in the catalog
+	const pdf = try buildTestPdfWithPageLabels(testing.allocator, &.{
+		.{ .text_items = &.{.{ .text = "Preface", .font_size = 12, .y_pos = 700 }} },
+		.{ .text_items = &.{.{ .text = "More preface", .font_size = 12, .y_pos = 700 }} },
+		.{ .text_items = &.{.{ .text = "Chapter 1", .font_size = 12, .y_pos = 700 }} },
+		.{ .text_items = &.{.{ .text = "Chapter 2", .font_size = 12, .y_pos = 700 }} },
+	}, &.{
+		// Pages 0-1: roman, starting at 1
+		.{ .start_index = 0, .style_char = 'r', .start_number = 1 },
+		// Pages 2+: decimal, starting at 1
+		.{ .start_index = 2, .style_char = 'D', .start_number = 1 },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/pagelabels.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	try testing.expect(doc.sections.len > 0);
+
+	// Find sections and verify page_logical / page_roman
+	var found_roman = false;
+	var found_decimal = false;
+	for (doc.sections) |s| {
+		if (s.page_physical) |pp| {
+			if (pp <= 2) {
+				// Roman section
+				if (s.page_logical != null) {
+					try testing.expect(s.page_roman);
+					try testing.expectEqual(@as(?u32, 1), s.page_section);
+					found_roman = true;
+				}
+			} else {
+				// Decimal section
+				if (s.page_logical != null) {
+					try testing.expect(!s.page_roman);
+					try testing.expectEqual(@as(?u32, 2), s.page_section);
+					found_decimal = true;
+				}
+			}
+		}
+	}
+	try testing.expect(found_roman);
+	try testing.expect(found_decimal);
+}
+
+const TestPageLabelSpec = struct {
+	start_index: u32,
+	style_char: u8, // 'D', 'r', 'R', 'a', 'A'
+	start_number: u32,
+};
+
+/// Build a test PDF with /PageLabels in the catalog.
+fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, label_specs: []const TestPageLabelSpec) ![]const u8 {
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(allocator);
+
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+
+	// Track object offsets for xref
+	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	defer obj_offsets.deinit(allocator);
+
+	// Build /PageLabels /Nums array string
+	var labels_buf = std.ArrayList(u8){};
+	defer labels_buf.deinit(allocator);
+	try labels_buf.appendSlice(allocator, "/PageLabels << /Nums [ ");
+	for (label_specs) |spec| {
+		try std.fmt.format(labels_buf.writer(allocator), "{d} << /S /{c}", .{ spec.start_index, spec.style_char });
+		if (spec.start_number != 1) {
+			try std.fmt.format(labels_buf.writer(allocator), " /St {d}", .{spec.start_number});
+		}
+		try labels_buf.appendSlice(allocator, " >> ");
+	}
+	try labels_buf.appendSlice(allocator, "] >> ");
+
+	// Object 1: Catalog with /PageLabels
+	try obj_offsets.append(allocator, .{ .num = 1, .offset = buf.items.len });
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
+	try buf.appendSlice(allocator, labels_buf.items);
+	try buf.appendSlice(allocator, ">>\nendobj\n");
+
+	// Object 2: Pages
+	try obj_offsets.append(allocator, .{ .num = 2, .offset = buf.items.len });
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [");
+	for (pages, 0..) |_, i| {
+		const page_obj: u32 = @intCast(3 + i * 2);
+		if (i > 0) try buf.append(allocator, ' ');
+		try std.fmt.format(buf.writer(allocator), "{d} 0 R", .{page_obj});
+	}
+	try std.fmt.format(buf.writer(allocator), "] /Count {d} >>\nendobj\n", .{pages.len});
+
+	// For each page, create Page + Contents objects
+	for (pages, 0..) |page, i| {
+		const page_obj: u32 = @intCast(3 + i * 2);
+		const contents_obj: u32 = page_obj + 1;
+
+		// Build content stream
+		var stream_buf = std.ArrayList(u8){};
+		defer stream_buf.deinit(allocator);
+
+		for (page.text_items) |item| {
+			try stream_buf.appendSlice(allocator, "BT\n");
+			try std.fmt.format(stream_buf.writer(allocator), "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
+			try std.fmt.format(stream_buf.writer(allocator), "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });
+			try stream_buf.appendSlice(allocator, "(");
+			try stream_buf.appendSlice(allocator, item.text);
+			try stream_buf.appendSlice(allocator, ") Tj\n");
+			try stream_buf.appendSlice(allocator, "ET\n");
+		}
+
+		// Page object
+		try obj_offsets.append(allocator, .{ .num = page_obj, .offset = buf.items.len });
+		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n<< /Type /Page /Parent 2 0 R /Contents {d} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n", .{ page_obj, contents_obj });
+
+		// Contents object (uncompressed stream)
+		try obj_offsets.append(allocator, .{ .num = contents_obj, .offset = buf.items.len });
+		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n<< /Length {d} >>\nstream\n", .{ contents_obj, stream_buf.items.len });
+		try buf.appendSlice(allocator, stream_buf.items);
+		try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	}
+
+	// Find max object number
+	var max_obj: u32 = 0;
+	for (obj_offsets.items) |o| {
+		if (o.num > max_obj) max_obj = o.num;
+	}
+
+	// Xref table
+	const xref_offset = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n");
+	try std.fmt.format(buf.writer(allocator), "0 {d}\n", .{max_obj + 1});
+	try buf.appendSlice(allocator, "0000000000 65535 f\n");
+
+	var obj_idx: u32 = 1;
+	while (obj_idx <= max_obj) : (obj_idx += 1) {
+		var found = false;
+		for (obj_offsets.items) |o| {
+			if (o.num == obj_idx) {
+				try std.fmt.format(buf.writer(allocator), "{d:0>10} 00000 n\n", .{o.offset});
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			try buf.appendSlice(allocator, "0000000000 00000 f\n");
+		}
+	}
+
+	try std.fmt.format(buf.writer(allocator), "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
+	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
+
+	return try buf.toOwnedSlice(allocator);
+}
+

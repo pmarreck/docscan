@@ -137,6 +137,8 @@ static int g_extract_from = 0;      /* --from page (0 = no filter) */
 static int g_extract_to = 0;        /* --to page (0 = no filter) */
 static int g_extract_from_line = 0;  /* --from-line (0 = no filter) */
 static int g_extract_to_line = 0;    /* --to-line (0 = no filter) */
+static int g_extract_page_mode = 0;  /* 0=physical(default), 1=logical */
+static int g_page_mode_explicit = 0; /* 1 if --logical or --physical was set */
 #define ANSI_RESET   "\033[0m"
 #define ANSI_BOLD    "\033[1m"
 #define ANSI_DIM     "\033[2m"
@@ -1707,6 +1709,8 @@ static void print_help(void) {
 		"  --format <fmt>        Override format detection (md|txt|docx|pdf|doc|rtf|epub)\n"
 		"  --from N              Extract from page N (PDF/DOCX)\n"
 		"  --to N                Extract to page N (PDF/DOCX)\n"
+		"  --logical             Use logical page numbers with --from/--to\n"
+		"  --physical            Use physical page numbers with --from/--to (default)\n"
 		"  --from-line N         Extract from source line N\n"
 		"  --to-line N           Extract to source line N\n"
 		"  --limit N             Limit search results (default: 10)\n"
@@ -3833,7 +3837,9 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 		char* heading = NULL;
 		int level = 0;
 		char* content = NULL;
-		int page = -1;  /* -1 = not set */
+		int page = -1;  /* -1 = not set (page_physical) */
+		int page_logical = -1;  /* -1 = not set */
+		int page_roman = 0;
 		const char* children_start = NULL;
 		extract_section_counter++;		while (*p && *p != '}') {
 			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
@@ -3867,6 +3873,12 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 			} else if (key && strcmp(key, "page_physical") == 0) {
 				if (*p != 'n') page = atoi(p); /* skip "null" */
 				p = json_skip_value(p);
+			} else if (key && strcmp(key, "page_logical") == 0) {
+				if (*p != 'n') page_logical = atoi(p);
+				p = json_skip_value(p);
+			} else if (key && strcmp(key, "page_roman") == 0) {
+				if (*p == 't') page_roman = 1;
+				p = json_skip_value(p);
 			} else {
 				p = json_skip_value(p);
 			}
@@ -3880,7 +3892,12 @@ static const char* extract_walk_sections(const char* p, int markdown_mode) {
 
 		/* Filter by page range (--from/--to) */
 		if (g_extract_from > 0 || g_extract_to > 0) {
-			int effective_page = (page > 0) ? page : extract_section_counter;
+			int effective_page;
+			if (g_extract_page_mode == 1 && page_logical > 0) {
+				effective_page = page_logical;
+			} else {
+				effective_page = (page > 0) ? page : extract_section_counter;
+			}
 			if (g_extract_from > 0 && effective_page < g_extract_from) {
 				free(heading); free(content);
 				if (*p == '}') p++;
@@ -4017,6 +4034,11 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 	if (!json) {
 		err_msg("parse failed: %s", err_buf[0] ? err_buf : "unknown error");
 		return 1;
+	}
+
+	/* Hint about page mode when --from/--to used without explicit --logical/--physical */
+	if ((g_extract_from > 0 || g_extract_to > 0) && !g_page_mode_explicit) {
+		fprintf(stderr, "Note: using physical page numbers. Use --logical for document page numbers (if available).\n");
 	}
 
 	/* Output based on mode */
@@ -4173,7 +4195,18 @@ int main(int argc, char** argv) {
 		if (strcmp(argv[i], "--to-line") == 0 && i + 1 < argc) {
 			g_extract_to_line = atoi(argv[++i]);
 			continue;
-		}		/* Named flags with values */
+		}
+		if (strcmp(argv[i], "--logical") == 0) {
+			g_extract_page_mode = 1;
+			g_page_mode_explicit = 1;
+			continue;
+		}
+		if (strcmp(argv[i], "--physical") == 0) {
+			g_extract_page_mode = 0;
+			g_page_mode_explicit = 1;
+			continue;
+		}
+		/* Named flags with values */
 		if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
 			db_path_arg = argv[++i];
 			continue;
