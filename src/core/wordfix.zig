@@ -631,7 +631,77 @@ fn splitCamelBoundaries(allocator: Allocator, text: []const u8) ![]const u8 {
 	return try result.toOwnedSlice(allocator);
 }
 
-pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
+/// Rejoin word fragments split across a single newline boundary.
+/// When the last token on line N and the first token on line N+1
+/// combine into a dictionary word (and at least one part isn't a
+/// standalone word), merge them and move the newline after the
+/// joined word.
+fn rejoinAcrossNewlines(allocator: Allocator, text: []const u8) ![]const u8 {
+	var result = std.ArrayList(u8){};
+	errdefer result.deinit(allocator);
+
+	var lines = std.mem.splitScalar(u8, text, '\n');
+	var prev_line: ?[]const u8 = null;
+
+	while (lines.next()) |line| {
+		if (prev_line) |prev| {
+			// Find last word of prev line
+			var end = prev.len;
+			while (end > 0 and prev[end - 1] == ' ') end -= 1;
+			var last_start = end;
+			while (last_start > 0 and std.ascii.isAlphabetic(prev[last_start - 1])) last_start -= 1;
+			const last_word = prev[last_start..end];
+
+			// Find first word of current line
+			var start: usize = 0;
+			while (start < line.len and line[start] == ' ') start += 1;
+			var first_end = start;
+			while (first_end < line.len and std.ascii.isAlphabetic(line[first_end])) first_end += 1;
+			const first_word = line[start..first_end];
+
+			if (last_word.len >= 2 and first_word.len >= 2 and last_word.len + first_word.len <= 128) {
+				var combined_buf: [128]u8 = undefined;
+				@memcpy(combined_buf[0..last_word.len], last_word);
+				@memcpy(combined_buf[last_word.len..][0..first_word.len], first_word);
+				const combined = combined_buf[0 .. last_word.len + first_word.len];
+
+				const last_is_word = isWord(last_word);
+				const first_is_word = isWord(first_word);
+				const combined_is_word = isWord(combined);
+
+				if (combined_is_word and (!last_is_word or !first_is_word)) {
+					// Merge: emit prev line up to last_word start, then combined word, then newline, then rest of current line
+					try result.appendSlice(allocator, prev[0..last_start]);
+					try result.appendSlice(allocator, combined);
+					try result.append(allocator, '\n');
+					// Skip leading space after the merged fragment
+					var rest_start = first_end;
+					while (rest_start < line.len and line[rest_start] == ' ') rest_start += 1;
+					if (rest_start < line.len) {
+						try result.appendSlice(allocator, line[rest_start..]);
+					}					prev_line = null;
+					// We've consumed this line — store remainder as "prev" for next iteration
+					// Actually, the remainder after first_end was already appended with \n
+					// We need prev_line to hold what we just emitted, but that's in result already
+					// So just continue without setting prev_line — next line becomes the new prev
+					continue;
+				}
+			}
+
+			// No merge — emit prev line with newline
+			try result.appendSlice(allocator, prev);
+			try result.append(allocator, '\n');
+		}
+		prev_line = line;
+	}
+
+	// Emit final line (no trailing newline)
+	if (prev_line) |prev| {
+		try result.appendSlice(allocator, prev);
+	}
+
+	return try result.toOwnedSlice(allocator);
+}pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	ensureInit();
 
 	// Phase 0-pre-a: expand ligatures and fix punctuation spacing
@@ -664,12 +734,19 @@ pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 	const dehyphenated = try normalizeHyphens(allocator, stripped.items);
 	defer allocator.free(dehyphenated);
 
-	// Phase 1: rejoin pass
+	// Phase 1: rejoin pass (within lines)
 	const pass1 = try rejoinPass(allocator, dehyphenated);
 	defer allocator.free(pass1);
-	// Pass 2
-	return try rejoinPass(allocator, pass1);
-}
+	// Pass 2 (within lines)
+	const pass2 = try rejoinPass(allocator, pass1);
+	defer allocator.free(pass2);
+
+	// Phase 2: cross-newline rejoin — OCR tools like ocrmypdf strip
+	// hyphens at line breaks but keep the newline, leaving "lit\ntle".
+	// Join the last word of a line with the first word of the next line
+	// when the combined form is a dictionary word and at least one part
+	// is not a standalone word.
+	return try rejoinAcrossNewlines(allocator, pass2);}
 
 
 const document = @import("document.zig");
@@ -1003,6 +1080,20 @@ test "rejoinWords: full pipeline ligature + punctuation + camel" {
 	try testing.expectEqualStrings("Artificial Intelligence", result);
 }
 
+test "rejoinWords: cross-newline rejoin 'lit\\ntle' -> 'little'" {
+	const alloc = testing.allocator;
+	const result = try rejoinWords(alloc, "homely lit\ntle punishment");
+	defer alloc.free(result);
+	try testing.expectEqualStrings("homely little\npunishment", result);
+}
+
+test "rejoinWords: cross-newline keeps valid words 'the\ndog'" {
+	const alloc = testing.allocator;
+	const result = try rejoinWords(alloc, "the\ndog ran");
+	defer alloc.free(result);
+	// Both are real words — don't join across newline
+	try testing.expectEqualStrings("the\ndog ran", result);
+}
 test "textQuality: garbled OCR text scores below 30" {
 	// Garbled text from a bad OCR scan — should score very low quality
 	const garbled = "@FDA6G5F;A@ A8 +L77@F5:\n*96 FC?:?8 @7 &C@DA6C@\n*96 (F3C:4 @7 9C:>2?";
