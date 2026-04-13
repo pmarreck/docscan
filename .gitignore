@@ -6,3 +6,7 @@ result-*
 .direnv/
 .codescan/
 *.DS_Store
+.docscan
+AGENTS.md
+CLAUDE.md
+ZIG_RECENT_API_CHANGES.md
