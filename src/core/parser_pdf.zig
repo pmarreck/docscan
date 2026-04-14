@@ -2542,3 +2542,62 @@ test "parse extracts text from form XObjects (OCR'd PDFs)" {
 	}
 	try testing.expect(found);
 }
+
+test "parse decodes MacRomanEncoding byte 0xDE as fi ligature" {
+	const alloc = testing.allocator;
+	var buf = std.ArrayList(u8){};
+	errdefer buf.deinit(alloc);
+	var offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	defer offsets.deinit(alloc);
+
+	try buf.appendSlice(alloc, "%PDF-1.4\n");
+
+	try offsets.append(alloc, .{ .num = 1, .offset = buf.items.len });
+	try buf.appendSlice(alloc, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+	try offsets.append(alloc, .{ .num = 2, .offset = buf.items.len });
+	try buf.appendSlice(alloc, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+	// Content stream: (\xDEnally) Tj — byte 0xDE should become fi via MacRoman
+	const stream = "BT\n/F1 12 Tf\n72 700 Td\n(\xDEnally) Tj\nET\n";
+	try offsets.append(alloc, .{ .num = 4, .offset = buf.items.len });
+	try std.fmt.format(buf.writer(alloc), "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(alloc, stream);
+	try buf.appendSlice(alloc, "\nendstream\nendobj\n");
+
+	// Page with MacRomanEncoding font
+	try offsets.append(alloc, .{ .num = 3, .offset = buf.items.len });
+	try buf.appendSlice(alloc,
+		"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R" ++
+		" /Resources << /Font << /F1 << /Type /Font /Subtype /Type1" ++
+		" /BaseFont /Sabon-Roman /Encoding /MacRomanEncoding >> >> >> >>\nendobj\n");
+
+	// Xref
+	const xref_offset = buf.items.len;
+	try buf.appendSlice(alloc, "xref\n");
+	try std.fmt.format(buf.writer(alloc), "0 5\n", .{});
+	try buf.appendSlice(alloc, "0000000000 65535 f\n");
+	var idx: u32 = 1;
+	while (idx <= 4) : (idx += 1) {
+		var found = false;
+		for (offsets.items) |o| {
+			if (o.num == idx) {
+				try std.fmt.format(buf.writer(alloc), "{d:0>10} 00000 n\n", .{o.offset});
+				found = true;
+				break;
+			}
+		}
+		if (!found) try buf.appendSlice(alloc, "0000000000 00000 f\n");
+	}
+	try std.fmt.format(buf.writer(alloc), "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{d}\n%%EOF", .{xref_offset});
+
+	const pdf = try buf.toOwnedSlice(alloc);
+	defer alloc.free(pdf);
+	const doc = try parse(alloc, pdf, "test-macroman.pdf");
+	defer freeDocument(alloc, doc);
+
+	try testing.expect(doc.sections.len > 0);
+	const content = doc.sections[0].content;
+	// After CMap decode + normalizeText ligature expansion
+	try testing.expect(std.mem.indexOf(u8, content, "finally") != null);
+}

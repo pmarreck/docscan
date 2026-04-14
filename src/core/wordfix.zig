@@ -515,6 +515,21 @@ fn normalizeText(allocator: Allocator, text: []const u8) ![]const u8 {
 			}
 		}
 
+		// 1b. Unicode ligature expansion (U+FB00-U+FB06)
+		// These are 3-byte UTF-8 sequences: EF AC 80-86
+		if (i + 2 < text.len and text[i] == 0xEF and text[i + 1] == 0xAC) {
+			switch (text[i + 2]) {
+				0x80 => { try result.appendSlice(allocator, "ff"); i += 3; continue; },  // U+FB00
+				0x81 => { try result.appendSlice(allocator, "fi"); i += 3; continue; },  // U+FB01
+				0x82 => { try result.appendSlice(allocator, "fl"); i += 3; continue; },  // U+FB02
+				0x83 => { try result.appendSlice(allocator, "ffi"); i += 3; continue; }, // U+FB03
+				0x84 => { try result.appendSlice(allocator, "ffl"); i += 3; continue; }, // U+FB04
+				0x85 => { try result.appendSlice(allocator, "st"); i += 3; continue; },  // U+FB05 (long st)
+				0x86 => { try result.appendSlice(allocator, "st"); i += 3; continue; },  // U+FB06
+				else => {},
+			}
+		}
+
 		// 1. Ligature expansion / control char stripping
 		if (text[i] < 0x20 and text[i] != '\n' and text[i] != '\r' and text[i] != '\t') {
 			switch (text[i]) {
@@ -525,9 +540,7 @@ fn normalizeText(allocator: Allocator, text: []const u8) ![]const u8 {
 			}
 			i += 1;
 			continue;
-
 		}
-
 		// 2. Period + uppercase: "spirit.Winston" → "spirit. Winston"
 		//    Exception: don't touch if prev is uppercase (abbreviation "U.S.")
 		//    or digit (decimal "3.14")
