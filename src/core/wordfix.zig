@@ -795,45 +795,79 @@ pub fn applySections(allocator: Allocator, sections: []const document.Section) v
 /// Also factors in alpha density — garbled OCR text has sparse alphabetic
 /// runs mixed with symbols/digits, which is a strong garbled-text signal
 /// independent of whether the few alpha fragments happen to match words.
-pub fn textQuality(text: []const u8) u8 {	ensureInit();
+/// Dictionary-based text quality scoring (0-100%).
+/// Combines multiple signals to detect garbled text:
+/// 1. Alpha density — low means symbols/digits dominate
+/// 2. Dictionary word recognition — low means nonsense letter sequences
+/// 3. Control char density — high means custom font encoding garbage
+/// 4. Replacement char (U+FFFD) density — high means encoding failures
+pub fn textQuality(text: []const u8) u8 {
+	ensureInit();
 	if (text.len == 0) return 100;
 
-	// Alpha density: what fraction of bytes are alphabetic
-	var alpha_count: u32 = 0;
-	for (text) |c| {
-		if (std.ascii.isAlphabetic(c)) alpha_count += 1;
-	}
 	const text_len: u32 = @intCast(@min(text.len, std.math.maxInt(u32)));
-	const alpha_pct: u32 = (alpha_count * 100) / text_len;
 
+	// Count character categories in a single pass
+	var alpha_count: u32 = 0;
+	var control_count: u32 = 0; // bytes < 0x20 except \n \r \t
+	var fffd_count: u32 = 0; // U+FFFD = 0xEF 0xBF 0xBD
+	var bad_high_count: u32 = 0; // 0x80-0x9F not valid UTF-8 (Win-1252 range)
+
+	var j: usize = 0;
+	while (j < text.len) {
+		const c = text[j];
+		if (std.ascii.isAlphabetic(c)) {
+			alpha_count += 1;
+		} else if (c < 0x20 and c != '\n' and c != '\r' and c != '\t') {
+			control_count += 1;
+		} else if (c >= 0x80 and c <= 0x9F) {
+			// Check if it's a valid UTF-8 continuation byte (10xxxxxx)
+			// If so, it's fine. If not, it's a bare Win-1252 byte.
+			if (j > 0 and text[j - 1] >= 0xC0) {
+				// Valid continuation of a multi-byte sequence
+			} else {
+				bad_high_count += 1;
+			}
+		}
+		// Check for U+FFFD: EF BF BD
+		if (j + 2 < text.len and c == 0xEF and text[j + 1] == 0xBF and text[j + 2] == 0xBD) {
+			fffd_count += 3; // count all 3 bytes as bad
+			j += 3;
+			continue;
+		}
+		j += 1;
+	}
+
+	const alpha_pct: u32 = (alpha_count * 100) / text_len;
+	const bad_bytes = control_count + fffd_count + bad_high_count;
+	const bad_pct: u32 = if (text_len > 0) (bad_bytes * 100) / text_len else 0;
+
+	// If >5% of bytes are control/replacement chars, text is likely garbled.
+	// Any presence of these chars is abnormal in clean text — penalize steeply.
+	var quality_cap: u32 = 100;
+	if (bad_pct > 5) {
+		quality_cap = if (bad_pct >= 33) 0 else 100 - (bad_pct * 3);
+	}
+
+	// Sample up to 200 words for dictionary check
 	var total: u32 = 0;
 	var recognized: u32 = 0;
 	var i: usize = 0;
-
-	// Sample up to 200 words
 	while (i < text.len and total < 200) {
-		// Skip non-alpha
 		while (i < text.len and !std.ascii.isAlphabetic(text[i])) : (i += 1) {}
 		if (i >= text.len) break;
-
-		// Collect word
 		const start = i;
 		while (i < text.len and std.ascii.isAlphabetic(text[i])) : (i += 1) {}
 		const word = text[start..i];
-
-		// Skip very short words (1-2 chars) — too many false positives
 		if (word.len < 3) continue;
-
 		total += 1;
 		if (isWord(word)) recognized += 1;
 	}
 
 	const word_pct: u32 = if (total > 0) (recognized * 100) / total else 100;
 
-	// Quality is the lower of alpha density and word recognition rate.
-	// Both need to be high for genuine text — garbled text fails on alpha density,
-	// random letter sequences fail on word recognition.
-	return @intCast(@min(alpha_pct, word_pct));
+	// Quality is the minimum of all signals
+	return @intCast(@min(quality_cap, @min(alpha_pct, word_pct)));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -1135,4 +1169,21 @@ test "textQuality: normal English text scores above 70" {
 	const english = "The quick brown fox jumps over the lazy dog and runs through the forest";
 	const quality = textQuality(english);
 	try testing.expect(quality > 70);
+}
+
+test "textQuality: control char heavy text scores below 30" {
+	// Simulates custom font encoding garbage — lots of control chars
+	// mixed with some alpha chars. Big History (DK) had this pattern.
+	const garbage = "\x01\x02\x03\x04hello\x05\x06\x07\x08world\x0b\x0c\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+	const quality = textQuality(garbage);
+	try testing.expect(quality < 30);
+}
+
+test "textQuality: U+FFFD replacement chars score below 30" {
+	// Real encoding failures have FFFD on nearly every word — apostrophes,
+	// quotes, dashes all become replacement chars
+	const bad = "the Emperor\xef\xbf\xbds army\xef\xbf\xbds \xef\xbf\xbd" ++
+		"great\xef\xbf\xbd power\xef\xbf\xbd and\xef\xbf\xbd glory\xef\xbf\xbd";
+	const quality = textQuality(bad);
+	try testing.expect(quality < 30);
 }
