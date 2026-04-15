@@ -4138,6 +4138,7 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 					int debug_mode = debug_env &&
 						(strcmp(debug_env, "1") == 0 || strcasecmp(debug_env, "true") == 0);
 
+#ifndef _WIN32  /* auto-preprocess requires POSIX pipe/dup (gs, ocrmypdf) */
 					if (do_auto_preprocess) {
 						fprintf(stderr,
 							"info: Low text quality (%d%%). "
@@ -4272,6 +4273,7 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 							return 0;
 						}
 					}
+#endif /* !_WIN32 */
 
 auto_preprocess_fallback:
 					/* Fallback: just warn the user */
