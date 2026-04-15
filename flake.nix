@@ -120,7 +120,10 @@
 					jq
 					hyperfine
 					ocrmypdf
-				];					shellHook = ''
+					vips          # image preprocessing (future: C API for in-process use)
+					ghostscript   # PDF page rasterization for preprocessing
+				];
+				shellHook = ''
 						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
 						export ZIG_GLOBAL_CACHE_DIR="$HOME/.cache/zig"
 						export ZIG_LOCAL_CACHE_DIR="$PWD/zig-cache"
