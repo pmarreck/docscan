@@ -865,6 +865,51 @@ if [ "$rc" -eq 0 ] && echo "$err" | grep -qi "quality\|garbled\|OCR\|ocrmypdf"; 
 else
 	fail "extract warns on low-quality text" "rc=$rc, err='$err'"
 fi
+
+# ──────────────────────────────────────────────
+# 65. preprocess requires file argument
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" preprocess
+if [ "$rc" -ne 0 ] && echo "$err" | grep -qi "requires"; then
+	pass "preprocess requires file argument"
+else
+	fail "preprocess requires file argument" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 66. preprocess rejects non-existent file
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" preprocess "/tmp/docscan-no-such-file-$$.pdf"
+if [ "$rc" -ne 0 ] && echo "$err" | grep -qi "cannot read\|not found\|no such"; then
+	pass "preprocess rejects non-existent file"
+else
+	fail "preprocess rejects non-existent file" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 67. preprocess rejects non-PDF file
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" preprocess "$TEST_DIR/contract.md"
+if [ "$rc" -ne 0 ] && echo "$err" | grep -qi "pdf"; then
+	pass "preprocess rejects non-PDF file"
+else
+	fail "preprocess rejects non-PDF file" "rc=$rc, err='$err'"
+fi
+
+# ──────────────────────────────────────────────
+# 68. --help mentions preprocess command
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+capture "$BINARY" --help
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "preprocess"; then
+	pass "--help mentions preprocess command"
+else
+	fail "--help mentions preprocess command" "rc=$rc"
+fi
+
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────

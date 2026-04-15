@@ -20,7 +20,7 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [x] Task 14: MCP Tests — 14 tests (2026-04-09)
 - [x] Task 17: Ignore Patterns — 14 tests (2026-04-09)
 - [x] Task 18: Final Integration + Documentation (2026-04-09)
-
+- [x] `docscan preprocess` CLI command — PDF page rasterization + text isolation via FFI + reassembly (2026-04-13 EST)
 ## Deferred
 
 - [ ] Task 15: Integration Tests — requires running Ollama
@@ -28,6 +28,10 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] Wire ignore patterns into CLI directory walker
 - [ ] `docscan_list_documents` FFI function
 - [ ] DIFAT chain support in OLE2 (>7MB .doc files)
+
+## Known Limitations
+
+- **Word rejoining ambiguity**: When a PDF/OCR split produces two fragments that are BOTH valid dictionary words but the combined form is also a word (e.g., "met hod" → "method", "car go" → "cargo", "for age" → "forage"), the pipeline conservatively keeps them separate. Resolving this requires sentence-level semantic context — a statistical language model or LLM, not a dictionary lookup. Same applies to 3+ way splits like "pr operl y" → "properly" where no pairwise combination is a word. Out of scope for the current dictionary-based approach.
 - [x] Xref stream support in PDF parser (2026-04-08 EST)
 - [x] CIDFont/ToUnicode mapping in PDF (2026-04-08 EST)
 - [x] Object stream decompression cache + re-enable CMap/ToUnicode parsing (2026-04-10 EST)

@@ -34,7 +34,7 @@ All pure computation — no I/O.
 
 ## Source — C FFI (`src/ffi/`)
 
-- **`c_api.zig`** (1009 lines) — C FFI boundary. 14 exported functions: open/close DB, parse, chunk, index_file, search, needs_reindex, remove_document, status, read_chunk, config get/set, free. Hand-rolled JSON serialization. 14 tests.
+- **`c_api.zig`** (1134 lines) — C FFI boundary. 16 exported functions: open/close DB, parse, chunk, index_file, search, needs_reindex, remove_document, status, read_chunk, config get/set, free, normalize, text_quality, preprocess_page, free_bytes. Hand-rolled JSON serialization. 14 tests.
 
 ## FFI Header (`ffi/`)
 
@@ -48,13 +48,13 @@ All pure computation — no I/O.
   - Recursive directory walker with format filtering
   - Terminal-aware progress bar
   - MCP server (JSON-RPC 2.0 over stdio, 7 tools)
-  - Commands: index, update, search, status, config, config debug, extract, mcp-serve
+  - Commands: index, update, search, status, config, config debug, extract, normalize, preprocess, mcp-serve
   - Flags: --help, --about, --json, --limit, --exact, --similar, --model, --db, --no-color, --no-progress, --simple, --lang, --markdown, --format
 
 ## Tests
 
 - **`src/all_tests.zig`** — Aggregated Zig unit tests (~153 tests across all modules)
-- **`tests/cli/test-cli`** — 39 Bash black-box CLI tests
+- **`tests/cli/test-cli`** — 68 Bash black-box CLI tests
 - **`tests/mcp/test-mcp`** (316 lines) — 14 Bash MCP protocol tests
 - **`tests/integration/`** — Placeholder for Ollama-dependent tests
 - **`tests/unit/`** — Test fixture directory

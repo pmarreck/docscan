@@ -70,6 +70,8 @@
   #include <strings.h>
   #include <pthread.h>
   static void ensure_wsa(void) {}
+  /* mkdtemp may not be declared under -std=c11; provide prototype */
+  extern char* mkdtemp(char* template);
 #endif
 
 #include <stdatomic.h>
@@ -1695,7 +1697,8 @@ static void print_help(void) {
 		"  update [path]         Re-index changed files only\n"
 		"  search <query>        Search indexed documents\n"
 		"  normalize              Normalize text from stdin (word rejoining, dehyphenation)\n"
-	"  extract <file>        Extract text from a document\n"
+		"  extract <file>        Extract text from a document\n"
+		"  preprocess <file.pdf> Preprocess PDF pages for OCR (text isolation)\n"
 		"  status                Show index statistics\n"
 		"  config [key] [value]  Get/set configuration\n"
 		"  config debug          Show effective config with sources\n"
@@ -1752,6 +1755,7 @@ static void print_help(void) {
 		"  docscan extract --from 5 --to 10 book.pdf\n"
 		"  cat file.md | docscan extract --format md -\n"
 		"  echo 'kn own' | docscan normalize\n"
+		"  docscan preprocess scanned-doc.pdf\n"
 		"  docscan config embedding.api openai\n",		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
 		color(ANSI_BOLD), color(ANSI_RESET),
@@ -4171,6 +4175,289 @@ static int cmd_normalize(void) {
 	return 0;
 }
 
+/*
+ * cmd_preprocess — rasterize PDF pages, preprocess each to isolate text
+ * from backgrounds (via docscan_preprocess_page FFI), then reassemble
+ * into a new PDF suitable for OCR.
+ *
+ * Pipeline: PDF → gs (PPM per page) → preprocess_page → PPM → img2pdf → PDF
+ *
+ * Requires: gs (ghostscript), img2pdf — both available in the Nix devShell.
+ */
+static int cmd_preprocess(const char* file_path) {
+	/* Validate input is a PDF */
+	{
+		const char* dot = strrchr(file_path, '.');
+		if (!dot || strcasecmp(dot + 1, "pdf") != 0) {
+			err_msg("preprocess only supports PDF files");
+			return 1;
+		}
+	}
+
+	/* Verify file exists and is readable */
+	{
+		FILE* f = fopen(file_path, "rb");
+		if (!f) {
+			err_msg("cannot read file: %s", file_path);
+			return 1;
+		}
+		fclose(f);
+	}
+
+	/* Get DOCSCAN_DEBUG flag */
+	int debug = 0;
+	{
+		const char* dbg = getenv("DOCSCAN_DEBUG");
+		if (dbg && (strcmp(dbg, "1") == 0 || strcasecmp(dbg, "true") == 0)) {
+			debug = 1;
+		}
+	}
+
+	/* Create temp directory */
+	const char* tmpbase = getenv("TMPDIR");
+	if (!tmpbase || !tmpbase[0]) tmpbase = "/tmp";
+	char tmpdir[1024];
+	snprintf(tmpdir, sizeof(tmpdir), "%s/docscan-preprocess-XXXXXX", tmpbase);
+#ifdef _WIN32
+	/* Windows: mkdtemp not available, use _mktemp + mkdir */
+	if (_mktemp(tmpdir) == NULL || _mkdir(tmpdir) != 0) {
+		err_msg("cannot create temp directory");
+		return 1;
+	}
+#else
+	if (mkdtemp(tmpdir) == NULL) {
+		err_msg("cannot create temp directory: %s", strerror(errno));
+		return 1;
+	}
+#endif
+
+	/* Get PDF page count via gs */
+	int page_count = 0;
+	{
+		char cmd[2048];
+		snprintf(cmd, sizeof(cmd),
+			"gs -dNODISPLAY -dQUIET -c "
+			"\"(%s) (r) file runpdfbegin pdfpagecount = quit\" 2>/dev/null",
+			file_path);
+		FILE* pipe = popen(cmd, "r");
+		if (!pipe) {
+			err_msg("failed to run ghostscript for page count");
+			/* Clean up tmpdir */
+			rmdir(tmpdir);
+			return 1;
+		}
+		char line[64];
+		if (fgets(line, sizeof(line), pipe)) {
+			page_count = atoi(line);
+		}
+		pclose(pipe);
+
+		if (page_count <= 0) {
+			err_msg("failed to determine PDF page count (is ghostscript installed?)");
+			rmdir(tmpdir);
+			return 1;
+		}
+	}
+
+	if (debug) {
+		fprintf(stderr, "preprocess: %d page(s) in %s\n", page_count, file_path);
+	}
+
+	/* Process each page */
+	for (int page = 1; page <= page_count; page++) {
+		char ppm_path[1200];
+		char prep_ppm_path[1200];
+		char prep_png_path[1200];
+		snprintf(ppm_path, sizeof(ppm_path), "%s/page_%04d.ppm", tmpdir, page);
+		snprintf(prep_ppm_path, sizeof(prep_ppm_path), "%s/prep_%04d.ppm", tmpdir, page);
+		snprintf(prep_png_path, sizeof(prep_png_path), "%s/prep_%04d.png", tmpdir, page);
+
+		/* Rasterize page to PPM via gs */
+		{
+			char cmd[2048];
+			snprintf(cmd, sizeof(cmd),
+				"gs -dNOPAUSE -dBATCH -dQUIET -sDEVICE=pnmraw -r600 "
+				"-dFirstPage=%d -dLastPage=%d "
+				"-sOutputFile=\"%s\" \"%s\" 2>/dev/null",
+				page, page, ppm_path, file_path);
+			int rc = system(cmd);
+			if (rc != 0) {
+				err_msg("ghostscript failed on page %d (exit %d)", page, rc);
+				goto cleanup;
+			}
+		}
+
+		/* Read PPM file: P6 format = "P6\nWIDTH HEIGHT\nMAXVAL\n<raw RGB>" */
+		int width = 0, height = 0;
+		uint8_t* pixels = NULL;
+		size_t pixel_len = 0;
+		{
+			FILE* f = fopen(ppm_path, "rb");
+			if (!f) {
+				err_msg("cannot read rasterized page %d", page);
+				goto cleanup;
+			}
+
+			/* Parse PPM header */
+			char magic[4];
+			if (fscanf(f, "%2s", magic) != 1 || strcmp(magic, "P6") != 0) {
+				err_msg("unexpected PPM format on page %d (got '%s')", page, magic);
+				fclose(f);
+				goto cleanup;
+			}
+
+			/* Skip comments */
+			int ch = fgetc(f);
+			while (ch == '#' || ch == '\n' || ch == ' ' || ch == '\t' || ch == '\r') {
+				if (ch == '#') {
+					while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
+				}
+				ch = fgetc(f);
+			}
+			ungetc(ch, f);
+
+			int maxval = 0;
+			if (fscanf(f, "%d %d %d", &width, &height, &maxval) != 3) {
+				err_msg("cannot parse PPM header on page %d", page);
+				fclose(f);
+				goto cleanup;
+			}
+
+			/* Skip single whitespace after maxval */
+			fgetc(f);
+
+			pixel_len = (size_t)width * (size_t)height * 3;
+			pixels = malloc(pixel_len);
+			if (!pixels) {
+				err_msg("out of memory for page %d (%dx%d)", page, width, height);
+				fclose(f);
+				goto cleanup;
+			}
+
+			size_t rd = fread(pixels, 1, pixel_len, f);
+			fclose(f);
+			if (rd != pixel_len) {
+				err_msg("short read on page %d PPM (expected %zu, got %zu)", page, pixel_len, rd);
+				free(pixels);
+				goto cleanup;
+			}
+		}
+
+		/* Remove raw PPM to save disk */
+		unlink(ppm_path);
+
+		/* Call FFI preprocess */
+		size_t out_len = 0;
+		unsigned char* preprocessed = docscan_preprocess_page(pixels, (uint32_t)width,
+			(uint32_t)height, 3, &out_len);
+		free(pixels);
+
+		if (!preprocessed || out_len == 0) {
+			err_msg("preprocessing failed on page %d", page);
+			goto cleanup;
+		}
+
+		/* Write preprocessed pixels as PPM */
+		{
+			FILE* f = fopen(prep_ppm_path, "wb");
+			if (!f) {
+				err_msg("cannot write preprocessed page %d", page);
+				docscan_free_bytes(preprocessed, out_len);
+				goto cleanup;
+			}
+			fprintf(f, "P6\n%d %d\n255\n", width, height);
+			size_t wr = fwrite(preprocessed, 1, out_len, f);
+			fclose(f);
+			docscan_free_bytes(preprocessed, out_len);
+
+			if (wr != out_len) {
+				err_msg("short write on preprocessed page %d", page);
+				goto cleanup;
+			}
+		}
+
+		/* Convert PPM to PNG via vips (img2pdf needs PNG/JPEG, not PPM) */
+		{
+			char cmd[2560];
+			snprintf(cmd, sizeof(cmd),
+				"vips copy \"%s\" \"%s\" 2>/dev/null",
+				prep_ppm_path, prep_png_path);
+			int rc = system(cmd);
+			if (rc != 0) {
+				err_msg("vips PPM→PNG conversion failed on page %d (exit %d)", page, rc);
+				goto cleanup;
+			}
+			/* Remove intermediate PPM */
+			unlink(prep_ppm_path);
+		}
+
+		if (debug) {
+			fprintf(stderr, "preprocess: page %d/%d done (%dx%d)\n", page, page_count, width, height);
+		}
+	}
+
+	/* Assemble all prep_*.png into a PDF via img2pdf */
+	char output_pdf[1200];
+	snprintf(output_pdf, sizeof(output_pdf), "%s/preprocessed.pdf", tmpdir);
+	{
+		/* Build the img2pdf command with all PNG files */
+		size_t cmd_cap = 4096;
+		char* cmd = malloc(cmd_cap);
+		if (!cmd) {
+			err_msg("out of memory for img2pdf command");
+			goto cleanup;
+		}
+
+		int pos = snprintf(cmd, cmd_cap, "img2pdf");
+		for (int page = 1; page <= page_count; page++) {
+			char png_path[1200];
+			snprintf(png_path, sizeof(png_path), "%s/prep_%04d.png", tmpdir, page);
+			size_t needed = (size_t)pos + strlen(png_path) + 4;
+			if (needed >= cmd_cap) {
+				cmd_cap = needed + 4096;
+				char* nb = realloc(cmd, cmd_cap);
+				if (!nb) { free(cmd); err_msg("out of memory"); goto cleanup; }
+				cmd = nb;
+			}
+			pos += snprintf(cmd + pos, cmd_cap - (size_t)pos, " \"%s\"", png_path);
+		}
+		snprintf(cmd + pos, cmd_cap - (size_t)pos, " -o \"%s\" 2>/dev/null", output_pdf);
+
+		int rc = system(cmd);
+		free(cmd);
+		if (rc != 0) {
+			err_msg("img2pdf assembly failed (exit %d)", rc);
+			goto cleanup;
+		}
+	}
+
+	/* Output the path to the preprocessed PDF on stdout */
+	printf("%s\n", output_pdf);
+	if (debug) {
+		fprintf(stderr, "preprocess: output → %s\n", output_pdf);
+	}
+
+	/* Clean up intermediate PNG files (keep output PDF) */
+	for (int page = 1; page <= page_count; page++) {
+		char png_path[1200];
+		snprintf(png_path, sizeof(png_path), "%s/prep_%04d.png", tmpdir, page);
+		unlink(png_path);
+	}
+
+	return 0;
+
+cleanup:
+	/* Clean up all temp files on error */
+	{
+		char cmd[1200];
+		/* Remove all files in tmpdir, then the dir itself */
+		snprintf(cmd, sizeof(cmd), "rm -f \"%s\"/*.ppm \"%s\"/*.png \"%s\"/*.pdf 2>/dev/null", tmpdir, tmpdir, tmpdir);
+		system(cmd);
+		rmdir(tmpdir);
+	}
+	return 1;
+}
+
 int main(int argc, char** argv) {
 #ifndef NDEBUG
 	fprintf(stderr, "\033[33mDEBUG BUILD\033[0m\n");
@@ -4537,6 +4824,16 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		return cmd_extract(file_arg, g_extract_format);
+	}
+
+	if (strcmp(command, "preprocess") == 0) {
+		const char* file_arg = (positional_count > 0) ? positionals[0] : NULL;
+		if (!file_arg) {
+			err_msg("preprocess requires a file argument");
+			fprintf(stderr, "Usage: docscan preprocess <file.pdf>\n");
+			return 1;
+		}
+		return cmd_preprocess(file_arg);
 	}
 
 	/* Unknown command */
