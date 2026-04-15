@@ -124,6 +124,15 @@ char* docscan_config_get(docscan_db* db, const char* key,
 int docscan_config_set(docscan_db* db, const char* key, const char* value,
                         char* err_buf, size_t err_buf_len);
 
+/* ── Image preprocessing ───────────────────────────────────────── */
+
+/* Preprocess a rasterized page image to isolate text from backgrounds.
+ * Returns preprocessed RGB pixel data. Caller frees with docscan_free_bytes(). */
+unsigned char* docscan_preprocess_page(const unsigned char* pixels,
+                                        uint32_t width, uint32_t height,
+                                        uint32_t channels, size_t* out_len);
+void docscan_free_bytes(unsigned char* ptr, size_t len);
+
 /* ── Memory ──────────────────────────────────────────────────────── */
 
 /* Free any string returned by docscan_* functions (NULL-safe). */

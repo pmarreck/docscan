@@ -869,6 +869,29 @@ export fn docscan_free(ptr: ?[*:0]u8) void {
 	}
 }
 
+/// Preprocess a rasterized page image to isolate text from backgrounds.
+/// Input: raw RGB/RGBA pixel data. Output: preprocessed RGB data.
+/// Caller frees result with docscan_free_bytes(). Returns null on error.
+export fn docscan_preprocess_page(
+	pixels: ?[*]const u8,
+	width: u32,
+	height: u32,
+	channels: u32,
+	out_len: *usize,
+) ?[*]u8 {
+	const input = if (pixels) |p| p[0 .. @as(usize, width) * height * channels] else return null;
+	const result = core.preprocess.preprocessPage(gpa, input, width, height, channels) catch return null;
+	out_len.* = result.len;
+	return result.ptr;
+}
+
+/// Free a byte buffer returned by docscan_preprocess_page.
+export fn docscan_free_bytes(ptr: ?[*]u8, len: usize) void {
+	if (ptr) |p| {
+		gpa.free(p[0..len]);
+	}
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
