@@ -22,3 +22,4 @@ pub const ole2 = @import("ole2.zig");
 pub const ignore = @import("ignore.zig");
 pub const encoding = @import("encoding.zig");
 pub const wordfix = @import("wordfix.zig");
+pub const preprocess = @import("preprocess.zig");

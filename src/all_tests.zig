@@ -25,4 +25,5 @@ test {
 	_ = @import("core/ignore.zig");
 	_ = @import("core/encoding.zig");
 	_ = @import("core/wordfix.zig");
+	_ = @import("core/preprocess.zig");
 }
