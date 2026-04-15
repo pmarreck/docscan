@@ -1218,7 +1218,11 @@ fn extractTJArray(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*c
 			continue;
 		}
 		if (c == '(') {
-			const str = try extractStreamString(allocator, data, &p);
+			const raw_str = try extractStreamString(allocator, data, &p);
+			// Decode through CMap for CID/encoded fonts (same as Tj handler)
+			const str = if (cmap) |cm| (decodeThroughCMap(allocator, raw_str, cm) orelse raw_str) else raw_str;
+			const str_is_decoded = (str.ptr != raw_str.ptr);
+			if (str_is_decoded) allocator.free(raw_str);
 			defer allocator.free(str);
 			try buf.appendSlice(allocator, str);
 		} else if (c == '-' or c == '+' or c == '.' or (c >= '0' and c <= '9')) {
