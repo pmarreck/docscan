@@ -4236,7 +4236,7 @@ static int cmd_preprocess(const char* file_path) {
 	{
 		char cmd[2048];
 		snprintf(cmd, sizeof(cmd),
-			"gs -dNODISPLAY -dQUIET -c "
+			"gs -dNODISPLAY -dNOSAFER -dQUIET -c "
 			"\"(%s) (r) file runpdfbegin pdfpagecount = quit\" 2>/dev/null",
 			file_path);
 		FILE* pipe = popen(cmd, "r");
@@ -4276,7 +4276,7 @@ static int cmd_preprocess(const char* file_path) {
 		{
 			char cmd[2048];
 			snprintf(cmd, sizeof(cmd),
-				"gs -dNOPAUSE -dBATCH -dQUIET -sDEVICE=pnmraw -r600 "
+				"gs -dNOPAUSE -dBATCH -dNOSAFER -dQUIET -sDEVICE=pnmraw -r600 "
 				"-dFirstPage=%d -dLastPage=%d "
 				"-sOutputFile=\"%s\" \"%s\" 2>/dev/null",
 				page, page, ppm_path, file_path);
@@ -4298,13 +4298,15 @@ static int cmd_preprocess(const char* file_path) {
 				goto cleanup;
 			}
 
-			/* Parse PPM header */
+			/* Parse PPM/PGM header: P6 = RGB, P5 = grayscale */
 			char magic[4];
-			if (fscanf(f, "%2s", magic) != 1 || strcmp(magic, "P6") != 0) {
+			int is_grayscale = 0;
+			if (fscanf(f, "%2s", magic) != 1 || (strcmp(magic, "P6") != 0 && strcmp(magic, "P5") != 0)) {
 				err_msg("unexpected PPM format on page %d (got '%s')", page, magic);
 				fclose(f);
 				goto cleanup;
 			}
+			is_grayscale = (strcmp(magic, "P5") == 0);
 
 			/* Skip comments */
 			int ch = fgetc(f);
@@ -4326,20 +4328,41 @@ static int cmd_preprocess(const char* file_path) {
 			/* Skip single whitespace after maxval */
 			fgetc(f);
 
-			pixel_len = (size_t)width * (size_t)height * 3;
-			pixels = malloc(pixel_len);
-			if (!pixels) {
+			size_t raw_channels = is_grayscale ? 1 : 3;
+			size_t raw_len = (size_t)width * (size_t)height * raw_channels;
+			uint8_t* raw_pixels = malloc(raw_len);
+			if (!raw_pixels) {
 				err_msg("out of memory for page %d (%dx%d)", page, width, height);
 				fclose(f);
 				goto cleanup;
 			}
 
-			size_t rd = fread(pixels, 1, pixel_len, f);
+			size_t rd = fread(raw_pixels, 1, raw_len, f);
 			fclose(f);
-			if (rd != pixel_len) {
-				err_msg("short read on page %d PPM (expected %zu, got %zu)", page, pixel_len, rd);
-				free(pixels);
+			if (rd != raw_len) {
+				err_msg("short read on page %d (expected %zu, got %zu)", page, raw_len, rd);
+				free(raw_pixels);
 				goto cleanup;
+			}
+
+			/* Convert grayscale to RGB if needed */
+			if (is_grayscale) {
+				pixel_len = (size_t)width * (size_t)height * 3;
+				pixels = malloc(pixel_len);
+				if (!pixels) {
+					free(raw_pixels);
+					err_msg("out of memory converting grayscale page %d", page);
+					goto cleanup;
+				}
+				for (size_t p = 0; p < (size_t)width * (size_t)height; p++) {
+					pixels[p * 3 + 0] = raw_pixels[p];
+					pixels[p * 3 + 1] = raw_pixels[p];
+					pixels[p * 3 + 2] = raw_pixels[p];
+				}
+				free(raw_pixels);
+			} else {
+				pixels = raw_pixels;
+				pixel_len = raw_len;
 			}
 		}
 
