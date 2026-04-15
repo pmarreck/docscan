@@ -4124,7 +4124,7 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 			}
 			if (buf_used > 20) {
 				unsigned char quality = docscan_text_quality(sample_buf, buf_used);
-				if (quality < 30) {
+				if (quality < 60) { /* published books score 80%+; below 60 = significant OCR issues */
 					/* Check if auto-preprocess is applicable:
 					 * must be PDF format, file large enough (>500KB),
 					 * and not reading from stdin (need a real file path) */

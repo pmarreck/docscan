@@ -1187,3 +1187,16 @@ test "textQuality: U+FFFD replacement chars score below 30" {
 	const quality = textQuality(bad);
 	try testing.expect(quality < 30);
 }
+
+test "textQuality: OCR near-miss text with letter swaps" {
+	// OCR errors from colored backgrounds: f↔r, b↔m swaps.
+	// Published books should score 80%+; this has ~40% garbled words.
+	const ocr_bad = "Chofdate a pfoto-fish with onlb a notochofd " ++
+		"Cfaniate pfotofish with a bfaincase bandible is actually " ++
+		"a former set of gill arches reshaped by evolution into a jaw";
+	const quality = textQuality(ocr_bad);
+	// Should be well below 80 (the "good text" bar for published books)
+	try testing.expect(quality < 70);
+	// But above 30 (not totally garbled — most chars are correct)
+	try testing.expect(quality > 30);
+}
