@@ -3996,6 +3996,10 @@ static uint8_t* read_stdin_all(size_t* out_len) {
 	return buf;
 }
 
+/* Forward declaration — cmd_preprocess is defined after cmd_extract but
+ * called from cmd_extract's auto-preprocess path. */
+static int cmd_preprocess(const char* file_path);
+
 /*
  * cmd_extract — extract text from a document and output to stdout.
  *
@@ -4077,7 +4081,9 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 	/* Check text quality — warn if extracted text looks garbled.
 	 * Sample from multiple "content": fields spread across the JSON so we
 	 * don't just test the title page (which is often clean even when the
-	 * body is garbled from custom font encoding). */
+	 * body is garbled from custom font encoding).
+	 * If quality is low, the file is a PDF, and it's large enough to
+	 * warrant it (>500KB), auto-preprocess with rasterization + OCR. */
 	{
 		/* Count total "content": occurrences */
 		size_t n_content = 0;
@@ -4119,6 +4125,156 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 			if (buf_used > 20) {
 				unsigned char quality = docscan_text_quality(sample_buf, buf_used);
 				if (quality < 30) {
+					/* Check if auto-preprocess is applicable:
+					 * must be PDF format, file large enough (>500KB),
+					 * and not reading from stdin (need a real file path) */
+					int is_pdf = (format && strcasecmp(format, "pdf") == 0);
+					int is_large = (data_len > 500 * 1024);
+					int is_file = (strcmp(file_path, "-") != 0 && strcmp(file_path, "@stdin") != 0);
+					int do_auto_preprocess = is_pdf && is_large && is_file;
+
+					/* Check DOCSCAN_DEBUG env var */
+					const char* debug_env = getenv("DOCSCAN_DEBUG");
+					int debug_mode = debug_env &&
+						(strcmp(debug_env, "1") == 0 || strcasecmp(debug_env, "true") == 0);
+
+					if (do_auto_preprocess) {
+						fprintf(stderr,
+							"info: Low text quality (%d%%). "
+							"Auto-preprocessing with rasterization + OCR...\n",
+							(int)quality);
+
+						/* Step 1: Call cmd_preprocess, capturing its stdout
+						 * to get the preprocessed PDF path */
+						int pipefd[2];
+						if (pipe(pipefd) != 0) {
+							err_msg("auto-preprocess: pipe() failed: %s", strerror(errno));
+							goto auto_preprocess_fallback;
+						}
+
+						int saved_stdout = dup(STDOUT_FILENO);
+						if (saved_stdout < 0) {
+							close(pipefd[0]);
+							close(pipefd[1]);
+							err_msg("auto-preprocess: dup() failed: %s", strerror(errno));
+							goto auto_preprocess_fallback;
+						}
+						dup2(pipefd[1], STDOUT_FILENO);
+						close(pipefd[1]);
+
+						int prep_rc = cmd_preprocess(file_path);
+
+						/* Restore stdout */
+						dup2(saved_stdout, STDOUT_FILENO);
+						close(saved_stdout);
+
+						/* Read the preprocessed PDF path from the pipe */
+						char prep_path[MAX_PATH_LEN];
+						ssize_t nread = read(pipefd[0], prep_path, sizeof(prep_path) - 1);
+						close(pipefd[0]);
+
+						if (prep_rc != 0 || nread <= 0) {
+							err_msg("auto-preprocess: preprocessing step failed");
+							goto auto_preprocess_fallback;
+						}
+						prep_path[nread] = '\0';
+						/* Trim trailing whitespace */
+						while (nread > 0 && (prep_path[nread-1] == '\n' ||
+								prep_path[nread-1] == '\r' ||
+								prep_path[nread-1] == ' '))
+							prep_path[--nread] = '\0';
+
+						if (debug_mode) {
+							fprintf(stderr, "debug: preprocessed PDF: %s\n", prep_path);
+						}
+
+						/* Step 2: Run ocrmypdf on the preprocessed PDF */
+						char ocr_path[MAX_PATH_LEN];
+						snprintf(ocr_path, sizeof(ocr_path), "%s-ocr.pdf", prep_path);
+
+						{
+							char cmd[4096];
+							snprintf(cmd, sizeof(cmd),
+								"ocrmypdf --force-ocr --jobs 8 --oversample 600 "
+								"--output-type pdf --optimize 0 --tesseract-timeout 120 "
+								"\"%s\" \"%s\" 2>/dev/null",
+								prep_path, ocr_path);
+
+							int ocr_rc = system(cmd);
+							if (ocr_rc != 0) {
+								err_msg("auto-preprocess: ocrmypdf failed (exit %d)", ocr_rc);
+								unlink(prep_path);
+								goto auto_preprocess_fallback;
+							}
+						}
+
+						if (debug_mode) {
+							fprintf(stderr, "debug: OCR'd PDF: %s\n", ocr_path);
+						}
+
+						/* Step 3: Re-read and re-parse the OCR'd PDF */
+						{
+							size_t ocr_data_len = 0;
+							uint8_t* ocr_data = read_file(ocr_path, &ocr_data_len);
+							if (!ocr_data) {
+								err_msg("auto-preprocess: cannot read OCR'd PDF: %s", ocr_path);
+								unlink(prep_path);
+								unlink(ocr_path);
+								goto auto_preprocess_fallback;
+							}
+
+							char err_buf2[ERR_BUF_LEN];
+							err_buf2[0] = '\0';
+							char* new_json = docscan_parse(ocr_data, ocr_data_len,
+								display_path, format, err_buf2, sizeof(err_buf2));
+							free(ocr_data);
+
+							/* Clean up temp files */
+							unlink(prep_path);
+							unlink(ocr_path);
+							/* Try to remove the parent tmpdir of prep_path */
+							{
+								char prep_dir[MAX_PATH_LEN];
+								strncpy(prep_dir, prep_path, sizeof(prep_dir) - 1);
+								prep_dir[sizeof(prep_dir) - 1] = '\0';
+								char* last_slash = strrchr(prep_dir, '/');
+								if (last_slash) {
+									*last_slash = '\0';
+									rmdir(prep_dir); /* best-effort */
+								}
+							}
+
+							if (!new_json) {
+								err_msg("auto-preprocess: re-parse failed: %s",
+									err_buf2[0] ? err_buf2 : "unknown error");
+								goto auto_preprocess_fallback;
+							}
+
+							/* Success — output the re-extracted text */
+							docscan_free(json);
+							json = new_json;
+
+							if (g_json_output) {
+								printf("%s\n", json);
+							} else {
+								const char* new_sects = strstr(json, "\"sections\"");
+								if (new_sects) {
+									new_sects += 10;
+									while (*new_sects == ' ' || *new_sects == ':') new_sects++;
+									extract_walk_sections(new_sects,
+										g_extract_mode == EXTRACT_MARKDOWN);
+								}
+							}
+
+							fprintf(stderr,
+								"info: Auto-preprocessed document with rasterization + OCR.\n");
+							docscan_free(json);
+							return 0;
+						}
+					}
+
+auto_preprocess_fallback:
+					/* Fallback: just warn the user */
 					fprintf(stderr,
 						"warn: Low text quality (%d%% of words recognized). "
 						"This document may have garbled text from custom font encoding or poor OCR.\n"
