@@ -910,6 +910,95 @@ else
 	fail "--help mentions preprocess command" "rc=$rc"
 fi
 
+# Isolate global-config discovery for env-var expansion tests so Peter's real
+# ~/.config/docscan/config.ini can't bleed its api_key into test fixtures.
+EMPTY_XDG="$(mktemp -d "${TMPDIR:-/tmp}/docscan-empty-xdg-XXXXXX")"
+export XDG_CONFIG_HOME="$EMPTY_XDG"
+
+# ──────────────────────────────────────────────
+# 69. config.ini expands ${VAR} env var references
+# ──────────────────────────────────────────────
+ENV_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR/.docscan"
+cat > "$ENV_TEST_DIR/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api = openai
+url = http://127.0.0.1:8000
+model = test-model
+api_key = ${DOCSCAN_TEST_EXPAND_KEY}
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR/doc.md"
+out="" ; err="" ; rc=""
+capture "$BINARY" index "$ENV_TEST_DIR"
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_EXPAND_KEY="sk-secret-from-env-42" \
+	capture "$BINARY" config --db "$ENV_TEST_DIR/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "sk-secret-from-env-42" ]; then
+	pass "config.ini expands \${VAR} env references at load time"
+else
+	fail "config.ini expands \${VAR} env references" "expected 'sk-secret-from-env-42', got '$out' (rc=$rc)"
+fi
+
+# ──────────────────────────────────────────────
+# 70. config.ini ${VAR} references survive save roundtrip
+# ──────────────────────────────────────────────
+# Re-indexing triggers save_config; the resolved secret must NOT be persisted.
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_EXPAND_KEY="sk-secret-from-env-42" \
+	capture "$BINARY" index "$ENV_TEST_DIR"
+ini_after=$(cat "$ENV_TEST_DIR/.docscan/config.ini")
+if echo "$ini_after" | grep -qF 'api_key = ${DOCSCAN_TEST_EXPAND_KEY}' && \
+   ! echo "$ini_after" | grep -q 'sk-secret-from-env-42'; then
+	pass "config.ini \${VAR} references survive save roundtrip"
+else
+	fail "config.ini \${VAR} survive save roundtrip" "ini after index: $ini_after"
+fi
+
+# ──────────────────────────────────────────────
+# 71. config.ini supports $VAR (no braces) form
+# ──────────────────────────────────────────────
+ENV_TEST_DIR2="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test2-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR2/.docscan"
+cat > "$ENV_TEST_DIR2/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api_key = $DOCSCAN_TEST_EXPAND_KEY2
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR2/doc.md"
+out="" ; err="" ; rc=""
+capture "$BINARY" index "$ENV_TEST_DIR2"
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_EXPAND_KEY2="brace-less-secret" \
+	capture "$BINARY" config --db "$ENV_TEST_DIR2/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "brace-less-secret" ]; then
+	pass "config.ini expands \$VAR (no braces) form"
+else
+	fail "config.ini expands \$VAR form" "expected 'brace-less-secret', got '$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 72. unset ${VAR} expands to empty string
+# ──────────────────────────────────────────────
+ENV_TEST_DIR3="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test3-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR3/.docscan"
+cat > "$ENV_TEST_DIR3/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api_key = ${DOCSCAN_DEFINITELY_NOT_SET_VAR_XYZ}
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR3/doc.md"
+out="" ; err="" ; rc=""
+capture "$BINARY" index "$ENV_TEST_DIR3"
+out="" ; err="" ; rc=""
+unset DOCSCAN_DEFINITELY_NOT_SET_VAR_XYZ
+capture "$BINARY" config --db "$ENV_TEST_DIR3/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
+	pass "unset \${VAR} expands to empty string"
+else
+	fail "unset \${VAR} expands to empty" "expected empty, got '$out' (rc=$rc)"
+fi
+
+mv "$ENV_TEST_DIR" "$ENV_TEST_DIR2" "$ENV_TEST_DIR3" "$EMPTY_XDG" "$TEST_DIR/" 2>/dev/null || true
+unset XDG_CONFIG_HOME
+
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────

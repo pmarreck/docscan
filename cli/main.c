@@ -1276,6 +1276,11 @@ typedef struct {
 	char embedding_url[512];
 	char embedding_model[256];
 	char embedding_api_key[512];
+	/* Pre-expansion form of api_key if it originally contained $VAR / ${VAR}
+	 * references. Preserved so save_config() can write back the reference
+	 * rather than baking the resolved secret into the file. Empty string
+	 * means the loaded value had no references (or no file was loaded). */
+	char embedding_api_key_raw[512];
 	int  embedding_dim;
 
 	/* [search] */
@@ -1318,6 +1323,7 @@ static void config_defaults(DocscanConfig* cfg) {
 	snprintf(cfg->embedding_url, sizeof(cfg->embedding_url), "http://127.0.0.1:11434");
 	snprintf(cfg->embedding_model, sizeof(cfg->embedding_model), "%s", DEFAULT_MODEL);
 	cfg->embedding_api_key[0] = '\0';
+	cfg->embedding_api_key_raw[0] = '\0';
 	cfg->embedding_dim = DEFAULT_EMBEDDING_DIM;
 	cfg->search_limit = DEFAULT_LIMIT;
 	cfg->weight_vector = 0.7f;
@@ -1333,6 +1339,79 @@ static char* str_trim(char* s) {
 	while (end > s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
 		*end-- = '\0';
 	return s;
+}
+
+/* Return 1 if s contains a $VAR or ${VAR} reference (ignoring escaped $$). */
+static int str_has_env_ref(const char* s) {
+	for (const char* p = s; *p; p++) {
+		if (*p != '$') continue;
+		char next = *(p + 1);
+		if (next == '$') { p++; continue; }           /* $$ escapes to literal $ */
+		if (next == '{') return 1;                     /* ${VAR} */
+		if ((next >= 'A' && next <= 'Z') ||
+		    (next >= 'a' && next <= 'z') || next == '_') return 1;  /* $VAR */
+	}
+	return 0;
+}
+
+/* Expand $VAR and ${VAR} references in `in` using getenv(). Undefined vars
+ * expand to empty string. $$ produces a literal $. Writes to out (NUL-terminated,
+ * truncated to out_sz-1 chars). Other $-sequences (e.g. $1, $$ already handled)
+ * are passed through unchanged. */
+static void expand_env_vars(const char* in, char* out, size_t out_sz) {
+	if (out_sz == 0) return;
+	size_t oi = 0;
+	for (size_t i = 0; in[i] && oi + 1 < out_sz; i++) {
+		if (in[i] != '$') {
+			out[oi++] = in[i];
+			continue;
+		}
+		char next = in[i + 1];
+		if (next == '$') {
+			out[oi++] = '$';
+			i++;
+			continue;
+		}
+		char name[128];
+		size_t nlen = 0;
+		size_t consumed = 0;
+		if (next == '{') {
+			/* ${VAR} — read until matching } */
+			size_t j = i + 2;
+			while (in[j] && in[j] != '}' && nlen + 1 < sizeof(name)) {
+				name[nlen++] = in[j++];
+			}
+			if (in[j] != '}') {
+				/* Unterminated ${ — pass through literally */
+				out[oi++] = in[i];
+				continue;
+			}
+			consumed = (j - i) + 1;  /* skip past the closing } */
+		} else if ((next >= 'A' && next <= 'Z') ||
+		           (next >= 'a' && next <= 'z') || next == '_') {
+			/* $VAR — read a run of [A-Za-z0-9_] */
+			size_t j = i + 1;
+			while (in[j] && ((in[j] >= 'A' && in[j] <= 'Z') ||
+			                  (in[j] >= 'a' && in[j] <= 'z') ||
+			                  (in[j] >= '0' && in[j] <= '9') ||
+			                  in[j] == '_') && nlen + 1 < sizeof(name)) {
+				name[nlen++] = in[j++];
+			}
+			consumed = j - i;
+		} else {
+			/* $ followed by something else — pass through */
+			out[oi++] = in[i];
+			continue;
+		}
+		name[nlen] = '\0';
+		const char* val = getenv(name);
+		if (val) {
+			for (size_t k = 0; val[k] && oi + 1 < out_sz; k++)
+				out[oi++] = val[k];
+		}
+		i += consumed - 1;  /* -1 because the for-loop will i++ */
+	}
+	out[oi] = '\0';
 }
 
 /* Derive config.ini path from a .docscan directory path.
@@ -1413,15 +1492,34 @@ static int load_config(const char* config_path, DocscanConfig* cfg) {
 		}
 
 		/* Map section.key -> config field */
+		/* Map section.key -> config field. Values containing $VAR / ${VAR}
+		 * are expanded via the process environment (see expand_env_vars).
+		 * For api_key specifically, the pre-expansion form is preserved in
+		 * embedding_api_key_raw so save_config can round-trip references
+		 * instead of persisting the resolved secret. */
 		if (strcmp(section, "embedding") == 0) {
 			if (strcmp(key, "api") == 0) {
-				snprintf(cfg->embedding_api, sizeof(cfg->embedding_api), "%s", val);
+				char expanded[sizeof(cfg->embedding_api)];
+				expand_env_vars(val, expanded, sizeof(expanded));
+				snprintf(cfg->embedding_api, sizeof(cfg->embedding_api), "%s", expanded);
 			} else if (strcmp(key, "url") == 0) {
-				snprintf(cfg->embedding_url, sizeof(cfg->embedding_url), "%s", val);
+				char expanded[sizeof(cfg->embedding_url)];
+				expand_env_vars(val, expanded, sizeof(expanded));
+				snprintf(cfg->embedding_url, sizeof(cfg->embedding_url), "%s", expanded);
 			} else if (strcmp(key, "model") == 0) {
-				snprintf(cfg->embedding_model, sizeof(cfg->embedding_model), "%s", val);
+				char expanded[sizeof(cfg->embedding_model)];
+				expand_env_vars(val, expanded, sizeof(expanded));
+				snprintf(cfg->embedding_model, sizeof(cfg->embedding_model), "%s", expanded);
 			} else if (strcmp(key, "api_key") == 0) {
-				snprintf(cfg->embedding_api_key, sizeof(cfg->embedding_api_key), "%s", val);
+				if (str_has_env_ref(val)) {
+					snprintf(cfg->embedding_api_key_raw, sizeof(cfg->embedding_api_key_raw), "%s", val);
+					char expanded[sizeof(cfg->embedding_api_key)];
+					expand_env_vars(val, expanded, sizeof(expanded));
+					snprintf(cfg->embedding_api_key, sizeof(cfg->embedding_api_key), "%s", expanded);
+				} else {
+					cfg->embedding_api_key_raw[0] = '\0';
+					snprintf(cfg->embedding_api_key, sizeof(cfg->embedding_api_key), "%s", val);
+				}
 			} else if (strcmp(key, "dim") == 0) {
 				int d = atoi(val);
 				if (d > 0) cfg->embedding_dim = d;
@@ -1513,10 +1611,18 @@ static int save_config(const char* config_path, const DocscanConfig* cfg) {
 	else
 		fprintf(f, "#model = nomic-embed-text\n");
 
-	if (cfg->embedding_api_key[0])
+	/* Prefer the raw $VAR reference form (if present) over the resolved
+	 * secret, so committed configs keep their placeholder on roundtrip. */
+	if (cfg->embedding_api_key_raw[0]) {
+		fprintf(f, "api_key = %s\n", cfg->embedding_api_key_raw);
+	} else if (cfg->embedding_api_key[0]) {
 		fprintf(f, "api_key = %s\n", cfg->embedding_api_key);
-	else
-		fprintf(f, "#api_key =\n");
+	} else {
+		fprintf(f, "# api_key = your-secret-key\n");
+		fprintf(f, "# Tip: use $VAR or ${VAR} to reference an env var\n");
+		fprintf(f, "# (e.g. api_key = ${DOCSCAN_EMBEDDING_API_KEY}) —\n");
+		fprintf(f, "# the reference is preserved on save, so configs can be committed safely.\n");
+	}
 
 	if (cfg->embedding_dim != defaults.embedding_dim)
 		fprintf(f, "dim = %d\n", cfg->embedding_dim);
@@ -1596,7 +1702,15 @@ static int config_ini_set(const char* config_path, const char* dotkey, const cha
 		} else if (strcmp(key, "model") == 0) {
 			snprintf(cfg.embedding_model, sizeof(cfg.embedding_model), "%s", value);
 		} else if (strcmp(key, "api_key") == 0) {
-			snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key), "%s", value);
+			/* Explicit set: store verbatim. If the user passed a $VAR
+			 * reference, preserve it as raw so it round-trips on save. */
+			if (str_has_env_ref(value)) {
+				snprintf(cfg.embedding_api_key_raw, sizeof(cfg.embedding_api_key_raw), "%s", value);
+				expand_env_vars(value, cfg.embedding_api_key, sizeof(cfg.embedding_api_key));
+			} else {
+				cfg.embedding_api_key_raw[0] = '\0';
+				snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key), "%s", value);
+			}
 		} else if (strcmp(key, "dim") == 0) {
 			int d = atoi(value);
 			if (d > 0) cfg.embedding_dim = d;
@@ -2616,8 +2730,17 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 			snprintf(cfg.embedding_model, sizeof(cfg.embedding_model),
 				"%s", model);
 			if (g_api_key[0]) {
-				snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key),
-					"%s", g_api_key);
+				/* g_api_key comes either from the CLI -k flag or from
+				 * an earlier load_config that populated it from the
+				 * same file we just re-read. Only clobber the _raw
+				 * reference if the value actually differs — matching
+				 * means we're just round-tripping the expanded form
+				 * and the $VAR placeholder should be preserved. */
+				if (strcmp(g_api_key, cfg.embedding_api_key) != 0) {
+					cfg.embedding_api_key_raw[0] = '\0';
+					snprintf(cfg.embedding_api_key, sizeof(cfg.embedding_api_key),
+						"%s", g_api_key);
+				}
 			}
 			if (embedding_dim != DEFAULT_EMBEDDING_DIM) {
 				cfg.embedding_dim = embedding_dim;
