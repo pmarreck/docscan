@@ -1347,19 +1347,57 @@ static int str_has_env_ref(const char* s) {
 		if (*p != '$') continue;
 		char next = *(p + 1);
 		if (next == '$') { p++; continue; }           /* $$ escapes to literal $ */
-		if (next == '{') return 1;                     /* ${VAR} */
+		if (next == '{') return 1;                     /* ${VAR} or ${VAR:-default} */
 		if ((next >= 'A' && next <= 'Z') ||
 		    (next >= 'a' && next <= 'z') || next == '_') return 1;  /* $VAR */
 	}
 	return 0;
 }
 
-/* Expand $VAR and ${VAR} references in `in` using getenv(). Undefined vars
- * expand to empty string. $$ produces a literal $. Writes to out (NUL-terminated,
- * truncated to out_sz-1 chars). Other $-sequences (e.g. $1, $$ already handled)
- * are passed through unchanged. */
-static void expand_env_vars(const char* in, char* out, size_t out_sz) {
+/* Find the index of the matching `}` for an opening `${` starting at idx i
+ * (where in[i]=='$' and in[i+1]=='{'). Respects nested `${...}` so that
+ * `${A:-${B}}` finds the outer `}`. Returns the index of the matching `}`
+ * or (size_t)-1 if unterminated. */
+static size_t find_matching_brace(const char* in, size_t i) {
+	/* Caller guarantees in[i]=='$' && in[i+1]=='{' */
+	int depth = 1;
+	for (size_t j = i + 2; in[j]; j++) {
+		if (in[j] == '$' && in[j + 1] == '{') {
+			depth++;
+			j++;  /* skip the { so it isn't double-counted */
+		} else if (in[j] == '}') {
+			depth--;
+			if (depth == 0) return j;
+		}
+	}
+	return (size_t)-1;
+}
+
+#define DOCSCAN_MAX_EXPANSION_DEPTH 10
+
+/* Expand environment-variable references in `in`, writing the result to
+ * `out` (NUL-terminated, truncated to out_sz-1 bytes).
+ *
+ * Supported forms:
+ *   $$            literal $
+ *   $VAR          simple reference ([A-Za-z_][A-Za-z0-9_]*)
+ *   ${VAR}        braced reference
+ *   ${VAR:-DEF}   braced with default: use DEF if VAR is unset OR empty
+ *   ${VAR-DEF}    braced with default: use DEF if VAR is unset (empty is kept)
+ *
+ * DEF may itself contain nested references up to DOCSCAN_MAX_EXPANSION_DEPTH
+ * (10) levels deep. Undefined references without a default expand to empty.
+ * Unterminated `${` is passed through literally.
+ *
+ * The depth parameter is internal — external callers pass 0. */
+static void expand_env_vars_depth(const char* in, char* out, size_t out_sz, int depth) {
 	if (out_sz == 0) return;
+	if (depth > DOCSCAN_MAX_EXPANSION_DEPTH) {
+		/* Runaway recursion (e.g. MY_VAR=${MY_VAR}). Bail with empty. */
+		out[0] = '\0';
+		return;
+	}
+
 	size_t oi = 0;
 	for (size_t i = 0; in[i] && oi + 1 < out_sz; i++) {
 		if (in[i] != '$') {
@@ -1372,24 +1410,94 @@ static void expand_env_vars(const char* in, char* out, size_t out_sz) {
 			i++;
 			continue;
 		}
-		char name[128];
-		size_t nlen = 0;
-		size_t consumed = 0;
+
 		if (next == '{') {
-			/* ${VAR} — read until matching } */
-			size_t j = i + 2;
-			while (in[j] && in[j] != '}' && nlen + 1 < sizeof(name)) {
-				name[nlen++] = in[j++];
-			}
-			if (in[j] != '}') {
+			size_t close = find_matching_brace(in, i);
+			if (close == (size_t)-1) {
 				/* Unterminated ${ — pass through literally */
 				out[oi++] = in[i];
 				continue;
 			}
-			consumed = (j - i) + 1;  /* skip past the closing } */
-		} else if ((next >= 'A' && next <= 'Z') ||
-		           (next >= 'a' && next <= 'z') || next == '_') {
+
+			/* Contents between `${` and the matching `}` */
+			size_t body_start = i + 2;
+			size_t body_len = close - body_start;
+
+			/* Look for `:-` or bare `-` separator at brace-depth 0 within
+			 * the body, so we don't get confused by nested `${...}`. */
+			int has_colon_dash = 0, has_bare_dash = 0;
+			size_t sep = 0;
+			{
+				int bd = 0;
+				for (size_t k = 0; k < body_len; k++) {
+					char c = in[body_start + k];
+					if (c == '$' && in[body_start + k + 1] == '{' && k + 1 < body_len) {
+						bd++;
+						k++;
+						continue;
+					}
+					if (c == '}') { bd--; continue; }
+					if (bd != 0) continue;
+					if (c == ':' && k + 1 < body_len && in[body_start + k + 1] == '-') {
+						has_colon_dash = 1;
+						sep = k;
+						break;
+					}
+					if (c == '-') {
+						/* Only count as separator if it comes after at least
+						 * one name char and no `:` was seen before it. */
+						has_bare_dash = 1;
+						sep = k;
+						break;
+					}
+				}
+			}
+
+			/* Extract the variable name portion */
+			char name[256];
+			size_t name_end = (has_colon_dash || has_bare_dash) ? sep : body_len;
+			if (name_end >= sizeof(name)) name_end = sizeof(name) - 1;
+			memcpy(name, in + body_start, name_end);
+			name[name_end] = '\0';
+
+			const char* val = getenv(name);
+			int use_default = 0;
+			if (has_colon_dash) {
+				/* ${VAR:-DEF} — default fires on unset OR empty */
+				if (!val || !val[0]) use_default = 1;
+			} else if (has_bare_dash) {
+				/* ${VAR-DEF} — default fires on unset only */
+				if (!val) use_default = 1;
+			}
+
+			if (use_default) {
+				/* Default portion lives after the separator */
+				size_t def_offset = has_colon_dash ? (sep + 2) : (sep + 1);
+				size_t def_len = body_len - def_offset;
+				char def_raw[1024];
+				if (def_len >= sizeof(def_raw)) def_len = sizeof(def_raw) - 1;
+				memcpy(def_raw, in + body_start + def_offset, def_len);
+				def_raw[def_len] = '\0';
+
+				char def_expanded[1024];
+				expand_env_vars_depth(def_raw, def_expanded, sizeof(def_expanded), depth + 1);
+				for (size_t k = 0; def_expanded[k] && oi + 1 < out_sz; k++)
+					out[oi++] = def_expanded[k];
+			} else if (val) {
+				for (size_t k = 0; val[k] && oi + 1 < out_sz; k++)
+					out[oi++] = val[k];
+			}
+			/* else: no default and unset/empty → expand to nothing */
+
+			i = close;  /* skip past the closing } (for-loop i++ will advance) */
+			continue;
+		}
+
+		if ((next >= 'A' && next <= 'Z') ||
+		    (next >= 'a' && next <= 'z') || next == '_') {
 			/* $VAR — read a run of [A-Za-z0-9_] */
+			char name[128];
+			size_t nlen = 0;
 			size_t j = i + 1;
 			while (in[j] && ((in[j] >= 'A' && in[j] <= 'Z') ||
 			                  (in[j] >= 'a' && in[j] <= 'z') ||
@@ -1397,21 +1505,24 @@ static void expand_env_vars(const char* in, char* out, size_t out_sz) {
 			                  in[j] == '_') && nlen + 1 < sizeof(name)) {
 				name[nlen++] = in[j++];
 			}
-			consumed = j - i;
-		} else {
-			/* $ followed by something else — pass through */
-			out[oi++] = in[i];
+			name[nlen] = '\0';
+			const char* val = getenv(name);
+			if (val) {
+				for (size_t k = 0; val[k] && oi + 1 < out_sz; k++)
+					out[oi++] = val[k];
+			}
+			i = j - 1;
 			continue;
 		}
-		name[nlen] = '\0';
-		const char* val = getenv(name);
-		if (val) {
-			for (size_t k = 0; val[k] && oi + 1 < out_sz; k++)
-				out[oi++] = val[k];
-		}
-		i += consumed - 1;  /* -1 because the for-loop will i++ */
+
+		/* $ followed by something else — pass through */
+		out[oi++] = in[i];
 	}
 	out[oi] = '\0';
+}
+
+static void expand_env_vars(const char* in, char* out, size_t out_sz) {
+	expand_env_vars_depth(in, out, out_sz, 0);
 }
 
 /* Derive config.ini path from a .docscan directory path.

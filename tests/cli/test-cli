@@ -996,6 +996,116 @@ else
 	fail "unset \${VAR} expands to empty" "expected empty, got '$out' (rc=$rc)"
 fi
 
+# ──────────────────────────────────────────────
+# 73. ${VAR:-default} falls back to default when VAR is unset
+# ──────────────────────────────────────────────
+ENV_TEST_DIR4="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test4-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR4/.docscan"
+cat > "$ENV_TEST_DIR4/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api_key = ${DOCSCAN_TEST_UNSET_VAR:-fallback-value}
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR4/doc.md"
+out="" ; err="" ; rc=""
+unset DOCSCAN_TEST_UNSET_VAR
+capture "$BINARY" index "$ENV_TEST_DIR4"
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$ENV_TEST_DIR4/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "fallback-value" ]; then
+	pass "\${VAR:-default} uses default when VAR is unset"
+else
+	fail "\${VAR:-default} default fallback" "expected 'fallback-value', got '$out' (rc=$rc)"
+fi
+
+# ──────────────────────────────────────────────
+# 74. ${VAR:-default} uses VAR when set
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_UNSET_VAR="real-value" \
+	capture "$BINARY" config --db "$ENV_TEST_DIR4/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "real-value" ]; then
+	pass "\${VAR:-default} uses VAR when set"
+else
+	fail "\${VAR:-default} VAR wins when set" "expected 'real-value', got '$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 75. Nested ${A:-${B:-${C:-bottom}}} resolves from innermost when all unset
+# ──────────────────────────────────────────────
+ENV_TEST_DIR5="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test5-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR5/.docscan"
+cat > "$ENV_TEST_DIR5/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api_key = ${DOCSCAN_A_XYZ:-${DOCSCAN_B_XYZ:-${DOCSCAN_C_XYZ:-bottom-default}}}
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR5/doc.md"
+out="" ; err="" ; rc=""
+unset DOCSCAN_A_XYZ DOCSCAN_B_XYZ DOCSCAN_C_XYZ
+capture "$BINARY" index "$ENV_TEST_DIR5"
+out="" ; err="" ; rc=""
+capture "$BINARY" config --db "$ENV_TEST_DIR5/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "bottom-default" ]; then
+	pass "nested \${A:-\${B:-\${C:-bottom}}} falls through to innermost default"
+else
+	fail "nested default chain" "expected 'bottom-default', got '$out' (rc=$rc)"
+fi
+
+# ──────────────────────────────────────────────
+# 76. Nested ${A:-${B:-default}} middle layer wins when B is set
+# ──────────────────────────────────────────────
+out="" ; err="" ; rc=""
+DOCSCAN_B_XYZ="middle-value" \
+	capture "$BINARY" config --db "$ENV_TEST_DIR5/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "middle-value" ]; then
+	pass "nested default chain: middle layer wins when set"
+else
+	fail "nested middle-layer" "expected 'middle-value', got '$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 77. ${VAR-default} (no colon) treats empty VAR as set
+# ──────────────────────────────────────────────
+ENV_TEST_DIR6="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test6-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR6/.docscan"
+cat > "$ENV_TEST_DIR6/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api_key = ${DOCSCAN_TEST_EMPTY_VAR-should-not-see-this}
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR6/doc.md"
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_EMPTY_VAR="" capture "$BINARY" index "$ENV_TEST_DIR6"
+out="" ; err="" ; rc=""
+# With the colon-less form, empty string is "set" and should NOT trigger fallback.
+DOCSCAN_TEST_EMPTY_VAR="" \
+	capture "$BINARY" config --db "$ENV_TEST_DIR6/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
+	pass "\${VAR-default} empty VAR suppresses default (colonless form)"
+else
+	fail "\${VAR-default} colonless empty" "expected empty, got '$out'"
+fi
+
+# ──────────────────────────────────────────────
+# 78. ${VAR:-default} empty VAR triggers default (colon form)
+# ──────────────────────────────────────────────
+ENV_TEST_DIR7="$(mktemp -d "${TMPDIR:-/tmp}/docscan-env-test7-XXXXXX")"
+mkdir -p "$ENV_TEST_DIR7/.docscan"
+cat > "$ENV_TEST_DIR7/.docscan/config.ini" << 'FIXTURE'
+[embedding]
+api_key = ${DOCSCAN_TEST_EMPTY_VAR2:-fallback-when-empty}
+FIXTURE
+echo "# doc" > "$ENV_TEST_DIR7/doc.md"
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_EMPTY_VAR2="" capture "$BINARY" index "$ENV_TEST_DIR7"
+out="" ; err="" ; rc=""
+DOCSCAN_TEST_EMPTY_VAR2="" \
+	capture "$BINARY" config --db "$ENV_TEST_DIR7/.docscan/index.db" embedding.api_key
+if [ "$rc" -eq 0 ] && [ "$out" = "fallback-when-empty" ]; then
+	pass "\${VAR:-default} empty VAR triggers default (colon form)"
+else
+	fail "\${VAR:-default} colon empty" "expected 'fallback-when-empty', got '$out'"
+fi
+
+mv "$ENV_TEST_DIR4" "$ENV_TEST_DIR5" "$ENV_TEST_DIR6" "$ENV_TEST_DIR7" "$TEST_DIR/" 2>/dev/null || true
 mv "$ENV_TEST_DIR" "$ENV_TEST_DIR2" "$ENV_TEST_DIR3" "$EMPTY_XDG" "$TEST_DIR/" 2>/dev/null || true
 unset XDG_CONFIG_HOME
 
