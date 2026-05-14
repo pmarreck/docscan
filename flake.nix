@@ -17,31 +17,30 @@
 					stripRoot = true;
 				};
 
-				# Pre-fetch Zig build.zig.zon dependencies for sandboxed builds
-				sqlite-vec-src = pkgs.fetchgit {
-					url = "https://github.com/pmarreck/sqlite-vec.git";
-					rev = "742ac1607d5490c71758c9fde80820387391910d";
-					hash = "sha256-CFZAditwPGoWpAK7AG8BaxksfxjEzyGdlMvuZPsJ7CQ=";
-				};
+				# Fixed-output derivation that pre-fetches all Zig deps declared in
+				# build.zig.zon (URL deps for sqlite_vec, uchardetz). This is the
+				# only step with network access; the consumer builds offline.
+				# To recompute: set zigDepsHash = ""; nix build; copy printed hash.
+				zigDepsHash = "sha256-6RDUzlXOKUNx302PH2PiYdgId1lMY2CxMctiXwYjVhw=";
 
-				uchardetz-src = pkgs.fetchgit {
-					url = "https://github.com/pmarreck/uchardetz.git";
-					rev = "c8e00e37f2b1d615e59df4158d1245d28c4d16b5";
-					hash = "sha256-KON5YWftYlcqaou1PlHJYsM+k6OOKbHyOQ6AunN2Fns=";
+				zigDeps = pkgs.stdenv.mkDerivation {
+					pname = "docscan-zig-deps";
+					version = "0.1.0";
+					src = ./.;
+					nativeBuildInputs = [ pkgs.zig_0_16 pkgs.git pkgs.cacert ];
+					outputHashMode = "recursive";
+					outputHashAlgo = "sha256";
+					outputHash = zigDepsHash;
+					buildPhase = ''
+						export HOME=$TMPDIR
+						export ZIG_GLOBAL_CACHE_DIR=$out
+						export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+						export GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+						zig build --fetch=all
+					'';
+					dontInstall = true;
+					dontFixup = true;
 				};
-
-				# Create a directory matching Zig's package cache layout
-				# so we can pass it via --system to avoid network fetches
-				zigPkgCache = pkgs.linkFarm "zig-pkg-cache" [
-					{
-						name = "sqlite_vec-0.1.7-alpha.2-4Cdt0OvwBACYsEQvfmbSw0sUHuXhcwD5PgjGyslHXU2q";
-						path = sqlite-vec-src;
-					}
-					{
-						name = "uchardetz-0.0.6-koAyw7NFCwDRxaKK3hCecnFZVHhvUcs5HCfrJlrRmTzr";
-						path = uchardetz-src;
-					}
-				];
 
 				buildDocscan = { optimize ? "ReleaseFast", extraFlags ? [] }:
 					pkgs.stdenv.mkDerivation {
@@ -55,13 +54,15 @@
 						dontFixup = true;
 
 						buildPhase = ''
+							export HOME=$TMPDIR
 							export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
 							export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
 							export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
 							mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+							cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+							chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
 
 							zig build \
-								--system ${zigPkgCache} \
 								-Doptimize=${optimize} \
 								--color off \
 								${builtins.concatStringsSep " " extraFlags}
@@ -96,13 +97,15 @@
 						dontFixup = true;
 
 						buildPhase = ''
+							export HOME=$TMPDIR
 							export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
 							export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
 							export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
 							mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+							cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+							chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
 
 							timeout 600 zig build test \
-								--system ${zigPkgCache} \
 								--color off \
 								|| { echo "Tests failed"; exit 1; }
 						'';
