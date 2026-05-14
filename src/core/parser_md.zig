@@ -95,7 +95,7 @@ fn buildTree(
 	start: usize,
 	end: usize,
 ) ![]const Section {
-	var sections: std.ArrayList(Section) = .{};
+	var sections: std.ArrayList(Section) = .empty;
 	errdefer {
 		for (sections.items) |s| freeSectionContents(gpa, s);
 		sections.deinit(gpa);
@@ -162,7 +162,7 @@ fn freeSectionContents(gpa: Allocator, section: Section) void {
 /// Headings (ATX-style: `# `, `## `, etc.) define section boundaries and nesting.
 /// Memory: all returned slices are allocated via `gpa`; free with `freeDocument`.
 pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
-	var flat_sections: std.ArrayList(FlatSection) = .{};
+	var flat_sections: std.ArrayList(FlatSection) = .empty;
 	defer {
 		for (flat_sections.items) |*fs| fs.deinit(gpa);
 		flat_sections.deinit(gpa);
@@ -178,7 +178,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 			try flat_sections.append(gpa, FlatSection{
 				.heading = heading.text,
 				.level = heading.level,
-				.content_lines = .{},
+				.content_lines = .empty,
 				.source_line = line_num,
 			});
 			current = flat_sections.items.len - 1;
@@ -191,7 +191,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 				try flat_sections.append(gpa, FlatSection{
 					.heading = null,
 					.level = 0,
-					.content_lines = .{},
+					.content_lines = .empty,
 					.source_line = line_num,
 				});
 				current = flat_sections.items.len - 1;

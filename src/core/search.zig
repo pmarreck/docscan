@@ -102,7 +102,7 @@ pub fn search(
 	}
 
 	// Compute fused RRF score for each candidate, applying heading boost.
-	var candidates: std.ArrayListUnmanaged(ScoredCandidate) = .{};
+	var candidates: std.ArrayListUnmanaged(ScoredCandidate) = .empty;
 	defer candidates.deinit(allocator);
 
 	var it = chunk_map.iterator();
@@ -140,7 +140,7 @@ pub fn search(
 	}.lessThan);
 
 	// Resolve candidates to full SearchResult structs, applying format filter.
-	var results: std.ArrayListUnmanaged(document.SearchResult) = .{};
+	var results: std.ArrayListUnmanaged(document.SearchResult) = .empty;
 	errdefer {
 		for (results.items) |*r| freeResult(allocator, r);
 		results.deinit(allocator);

@@ -70,7 +70,7 @@ pub const Pattern = struct {
 /// Patterns are processed in order — later patterns override earlier ones,
 /// and negation patterns (`!`) un-ignore previously matched paths.
 pub const IgnoreList = struct {
-	patterns: std.ArrayListUnmanaged(Pattern) = .{},
+	patterns: std.ArrayListUnmanaged(Pattern) = .empty,
 	allocator: std.mem.Allocator,
 
 	pub fn init(allocator: std.mem.Allocator) IgnoreList {

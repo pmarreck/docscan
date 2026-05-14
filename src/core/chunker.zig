@@ -67,7 +67,7 @@ fn buildBreadcrumb(allocator: std.mem.Allocator, parent_path: []const u8, headin
 /// Returns slices into the original content (no allocation for the text itself).
 /// Split content on single newlines (fallback when no \n\n boundaries exist).
 fn splitOnSingleNewline(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
-	var lines: std.ArrayListUnmanaged([]const u8) = .{};
+	var lines: std.ArrayListUnmanaged([]const u8) = .empty;
 	defer lines.deinit(allocator);
 
 	var start: usize = 0;
@@ -148,7 +148,7 @@ fn forceSplitByBytes(
 }
 
 fn splitParagraphs(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
-	var paragraphs: std.ArrayListUnmanaged([]const u8) = .{};
+	var paragraphs: std.ArrayListUnmanaged([]const u8) = .empty;
 	defer paragraphs.deinit(allocator);
 
 	var start: usize = 0;
@@ -349,7 +349,7 @@ fn mergeSmallChunks(
 ) ![]ProtoChunk {
 	if (proto_chunks.len == 0) return try allocator.alloc(ProtoChunk, 0);
 
-	var result: std.ArrayListUnmanaged(ProtoChunk) = .{};
+	var result: std.ArrayListUnmanaged(ProtoChunk) = .empty;
 	defer result.deinit(allocator);
 
 	var i: usize = 0;
@@ -427,7 +427,7 @@ fn mergeSmallChunks(
 /// Caller must free via `freeChunks`.
 pub fn chunk(allocator: std.mem.Allocator, doc: document.Document, options: ChunkOptions) ![]document.Chunk {
 	// Phase 1: recursively produce proto-chunks
-	var proto_list: std.ArrayListUnmanaged(ProtoChunk) = .{};
+	var proto_list: std.ArrayListUnmanaged(ProtoChunk) = .empty;
 	defer proto_list.deinit(allocator);
 
 	for (doc.sections) |section| {

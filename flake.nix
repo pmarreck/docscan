@@ -49,7 +49,7 @@
 						version = "0.1.0";
 						src = ./.;
 
-						nativeBuildInputs = [ pkgs.zig_0_15 ];
+						nativeBuildInputs = [ pkgs.zig_0_16 ];
 
 						dontConfigure = true;
 						dontFixup = true;
@@ -90,7 +90,7 @@
 						version = "0.1.0";
 						src = ./.;
 
-						nativeBuildInputs = [ pkgs.zig_0_15 ];
+						nativeBuildInputs = [ pkgs.zig_0_16 ];
 
 						dontConfigure = true;
 						dontFixup = true;
@@ -116,7 +116,7 @@
 
 				devShells.default = pkgs.mkShell {
 				packages = with pkgs; [
-					zig_0_15
+					zig_0_16
 					jq
 					hyperfine
 					ocrmypdf

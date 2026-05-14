@@ -695,7 +695,7 @@ pub fn searchVector(db: *Db, allocator: std.mem.Allocator, query_embedding: []co
 
 	try bindInt32(stmt, 2, @intCast(limit));
 
-	var results: std.ArrayListUnmanaged(VectorResult) = .{};
+	var results: std.ArrayListUnmanaged(VectorResult) = .empty;
 	errdefer results.deinit(allocator);
 
 	while (true) {
@@ -723,7 +723,7 @@ pub fn searchFts(db: *Db, allocator: std.mem.Allocator, query: []const u8, limit
 	try bindText(stmt, 1, query);
 	try bindInt32(stmt, 2, @intCast(limit));
 
-	var results: std.ArrayListUnmanaged(FtsResult) = .{};
+	var results: std.ArrayListUnmanaged(FtsResult) = .empty;
 	errdefer results.deinit(allocator);
 
 	while (true) {
@@ -786,7 +786,7 @@ test "open and close DB — schema is created" {
 	);
 	defer finalize(stmt);
 
-	var tables: std.ArrayListUnmanaged([]const u8) = .{};
+	var tables: std.ArrayListUnmanaged([]const u8) = .empty;
 	defer {
 		for (tables.items) |t| std.testing.allocator.free(t);
 		tables.deinit(std.testing.allocator);

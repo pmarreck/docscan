@@ -117,7 +117,7 @@ pub fn arabicToRoman(allocator: std.mem.Allocator, n: u32) !?[]const u8 {
 	if (n == 0 or n > 3999) return null;
 	const values = [_]u32{ 1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1 };
 	const symbols = [_][]const u8{ "m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i" };
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 	var remaining = n;
 	for (values, symbols) |val, sym| {

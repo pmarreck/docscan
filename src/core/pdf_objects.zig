@@ -725,7 +725,7 @@ fn parseName(data: []const u8, pos: *usize) PdfValue {
 /// Parse a PDF literal string: (text with \escapes and (balanced parens))
 fn parseStringLiteral(allocator: Allocator, data: []const u8, pos: *usize) PdfError!PdfValue {
 	var p = pos.* + 1; // skip '('
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 	var depth: u32 = 1;
 
@@ -820,7 +820,7 @@ fn parseStringLiteral(allocator: Allocator, data: []const u8, pos: *usize) PdfEr
 /// Parse a PDF hex string: <48656C6C6F>
 fn parseHexString(allocator: Allocator, data: []const u8, pos: *usize) PdfError!PdfValue {
 	var p = pos.* + 1; // skip '<'
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	var high_nibble: ?u4 = null;
@@ -861,7 +861,7 @@ fn parseHexString(allocator: Allocator, data: []const u8, pos: *usize) PdfError!
 /// Parse a PDF dictionary: << /Key Value ... >>
 fn parseDict(allocator: Allocator, data: []const u8, pos: *usize) PdfError!PdfValue {
 	var p = pos.* + 2; // skip '<<'
-	var entries = std.ArrayList(DictEntry){};
+	var entries = std.ArrayList(DictEntry).empty;
 	errdefer {
 		for (entries.items) |entry| {
 			allocator.free(entry.key);
@@ -904,7 +904,7 @@ fn parseDict(allocator: Allocator, data: []const u8, pos: *usize) PdfError!PdfVa
 /// Parse a PDF array: [ value value ... ]
 fn parseArray(allocator: Allocator, data: []const u8, pos: *usize) PdfError!PdfValue {
 	var p = pos.* + 1; // skip '['
-	var items = std.ArrayList(PdfValue){};
+	var items = std.ArrayList(PdfValue).empty;
 	errdefer {
 		for (items.items) |item| freePdfValue(allocator, item);
 		items.deinit(allocator);
@@ -1558,18 +1558,18 @@ const TestObj = struct {
 };
 
 fn buildMinimalPdf(allocator: Allocator, objects: []const TestObj, trailer_dict: []const u8) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	try buf.appendSlice(allocator, "%PDF-1.4\n");
 
 	// Track object offsets
-	var offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	var offsets = std.ArrayList(struct { num: u32, offset: usize }).empty;
 	defer offsets.deinit(allocator);
 
 	for (objects) |obj| {
 		try offsets.append(allocator, .{ .num = obj.num, .offset = buf.items.len });
-		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n", .{obj.num});
+		try buf.print(allocator, "{d} 0 obj\n", .{obj.num});
 		try buf.appendSlice(allocator, obj.body);
 		try buf.appendSlice(allocator, "\nendobj\n");
 	}
@@ -1582,7 +1582,7 @@ fn buildMinimalPdf(allocator: Allocator, objects: []const TestObj, trailer_dict:
 
 	const xref_offset = buf.items.len;
 	try buf.appendSlice(allocator, "xref\n");
-	try std.fmt.format(buf.writer(allocator), "0 {d}\n", .{max_obj + 1});
+	try buf.print(allocator, "0 {d}\n", .{max_obj + 1});
 
 	// Entry 0: free head
 	try buf.appendSlice(allocator, "0000000000 65535 f\n");
@@ -1593,7 +1593,7 @@ fn buildMinimalPdf(allocator: Allocator, objects: []const TestObj, trailer_dict:
 		var found = false;
 		for (offsets.items) |o| {
 			if (o.num == obj_idx) {
-				try std.fmt.format(buf.writer(allocator), "{d:0>10} 00000 n\n", .{o.offset});
+				try buf.print(allocator, "{d:0>10} 00000 n\n", .{o.offset});
 				found = true;
 				break;
 			}
@@ -1606,7 +1606,7 @@ fn buildMinimalPdf(allocator: Allocator, objects: []const TestObj, trailer_dict:
 	try buf.appendSlice(allocator, "trailer\n");
 	try buf.appendSlice(allocator, trailer_dict);
 	try buf.appendSlice(allocator, "\n");
-	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_offset});
 
 	return try buf.toOwnedSlice(allocator);
 }
@@ -1625,9 +1625,8 @@ test "xref stream — basic type-1 entries" {
 	//   1 = in-use: byte_offset, gen
 	//   2 = compressed: obj_stream_num, index
 
-	var pdf_buf = std.ArrayList(u8){};
+	var pdf_buf = std.ArrayList(u8).empty;
 	defer pdf_buf.deinit(testing.allocator);
-	const w = pdf_buf.writer(testing.allocator);
 
 	try pdf_buf.appendSlice(testing.allocator, "%PDF-1.5\n");
 
@@ -1659,11 +1658,11 @@ test "xref stream — basic type-1 entries" {
 	stream_data[10] = @intCast(obj2_offset & 0xFF);
 	stream_data[11] = 0; // gen
 
-	try std.fmt.format(w, "2 0 obj\n<< /Type /XRef /Size 3 /W [1 2 1] /Length {d} /Root 1 0 R >>\nstream\n", .{stream_data.len});
+	try pdf_buf.print(testing.allocator, "2 0 obj\n<< /Type /XRef /Size 3 /W [1 2 1] /Length {d} /Root 1 0 R >>\nstream\n", .{stream_data.len});
 	try pdf_buf.appendSlice(testing.allocator, &stream_data);
 	try pdf_buf.appendSlice(testing.allocator, "\nendstream\nendobj\n");
 
-	try std.fmt.format(w, "startxref\n{d}\n%%EOF", .{obj2_offset});
+	try pdf_buf.print(testing.allocator, "startxref\n{d}\n%%EOF", .{obj2_offset});
 
 	var ctx = try PdfContext.init(testing.allocator, pdf_buf.items);
 	defer ctx.deinit();
@@ -1707,9 +1706,9 @@ test "FlateDecode stream decompression" {
 	const expected_text = "Hello PDF Stream";
 
 	// Build the stream object body manually (dict + stream data)
-	var body_buf = std.ArrayList(u8){};
+	var body_buf = std.ArrayList(u8).empty;
 	defer body_buf.deinit(testing.allocator);
-	try std.fmt.format(body_buf.writer(testing.allocator), "<< /Length {d} /Filter /FlateDecode >>\nstream\n", .{compressed.len});
+	try body_buf.print(testing.allocator, "<< /Length {d} /Filter /FlateDecode >>\nstream\n", .{compressed.len});
 	try body_buf.appendSlice(testing.allocator, compressed);
 	try body_buf.appendSlice(testing.allocator, "\nendstream");
 

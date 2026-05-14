@@ -168,13 +168,13 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 		return emptyDocument(allocator, path);
 	}
 
-	var spans = std.ArrayList(TextSpan){};
+	var spans = std.ArrayList(TextSpan).empty;
 	defer {
 		for (spans.items) |span| allocator.free(span.text);
 		spans.deinit(allocator);
 	}
 
-	var metadata_list = std.ArrayList(MetadataEntry){};
+	var metadata_list = std.ArrayList(MetadataEntry).empty;
 	defer {
 		// Only free on error — on success, ownership transfers to Document
 	}
@@ -190,7 +190,7 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	errdefer if (title) |t| allocator.free(t);
 
 	// Parser state stack (for group nesting)
-	var state_stack = std.ArrayList(ParserState){};
+	var state_stack = std.ArrayList(ParserState).empty;
 	defer state_stack.deinit(allocator);
 
 	var state = ParserState{
@@ -205,11 +205,11 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	var depth: u32 = 0;
 
 	// Text accumulator for the current span
-	var text_buf = std.ArrayList(u8){};
+	var text_buf = std.ArrayList(u8).empty;
 	defer text_buf.deinit(allocator);
 
 	// Metadata value accumulator
-	var meta_buf = std.ArrayList(u8){};
+	var meta_buf = std.ArrayList(u8).empty;
 	defer meta_buf.deinit(allocator);
 
 	var current_font_size: f32 = 12.0;
@@ -629,7 +629,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 
 	// Collect unique heading sizes (sizes significantly larger than dominant)
 	const size_threshold = dominant_size * 1.15; // 15% larger = heading
-	var heading_sizes = std.ArrayList(f32){};
+	var heading_sizes = std.ArrayList(f32).empty;
 	defer heading_sizes.deinit(allocator);
 
 	for (spans) |span| {
@@ -655,7 +655,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 	}.f);
 
 	// Build flat sections
-	var flat_sections = std.ArrayList(FlatSection){};
+	var flat_sections = std.ArrayList(FlatSection).empty;
 	defer {
 		for (flat_sections.items) |*fs| fs.deinit(allocator);
 		flat_sections.deinit(allocator);
@@ -672,7 +672,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 			try flat_sections.append(allocator, FlatSection{
 				.heading = try allocator.dupe(u8, span.text),
 				.level = level,
-				.content_buf = .{},
+				.content_buf = .empty,
 				.page = span.page,
 			});
 			current = flat_sections.items.len - 1;
@@ -682,7 +682,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 				try flat_sections.append(allocator, FlatSection{
 					.heading = null,
 					.level = 0,
-					.content_buf = .{},
+					.content_buf = .empty,
 					.page = span.page,
 				});
 				current = flat_sections.items.len - 1;
@@ -714,7 +714,7 @@ fn buildTree(
 	start: usize,
 	end: usize,
 ) ![]const Section {
-	var sections = std.ArrayList(Section){};
+	var sections = std.ArrayList(Section).empty;
 	errdefer {
 		for (sections.items) |s| freeSectionContents(allocator, s);
 		sections.deinit(allocator);

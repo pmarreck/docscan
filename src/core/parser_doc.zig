@@ -222,7 +222,7 @@ fn windows1252ToCodepoint(byte: u8) u21 {
 
 /// Decode compressed text (Windows-1252, 1 byte per char) to UTF-8.
 fn decodeCompressedText(allocator: Allocator, data: []const u8) ![]u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	for (data) |byte| {
@@ -242,7 +242,7 @@ fn extractTextFromPieces(
 	word_doc: []const u8,
 	pieces: []const PieceDescriptor,
 ) ![]u8 {
-	var text_buf = std.ArrayList(u8){};
+	var text_buf = std.ArrayList(u8).empty;
 	errdefer text_buf.deinit(allocator);
 
 	for (pieces) |piece| {
@@ -314,7 +314,7 @@ fn extractTextDirect(allocator: Allocator, word_doc: []const u8) !?[]const u8 {
 	}
 
 	// Strategy 2: Scan for ASCII/Latin-1 text anywhere in the document
-	var text_buf = std.ArrayList(u8){};
+	var text_buf = std.ArrayList(u8).empty;
 	defer text_buf.deinit(allocator);
 
 	var in_text_run = false;
@@ -371,7 +371,7 @@ fn splitIntoSections(allocator: Allocator, text: []const u8) ![]const Section {
 		return try allocator.alloc(Section, 0);
 	}
 
-	var sections = std.ArrayList(Section){};
+	var sections = std.ArrayList(Section).empty;
 	errdefer {
 		for (sections.items) |s| freeSectionContents(allocator, s);
 		sections.deinit(allocator);
@@ -381,7 +381,7 @@ fn splitIntoSections(allocator: Allocator, text: []const u8) ![]const Section {
 	var lines = std.mem.splitSequence(u8, text, "\n");
 	var current_heading: ?[]const u8 = null;
 	var current_level: u8 = 0;
-	var content_buf = std.ArrayList(u8){};
+	var content_buf = std.ArrayList(u8).empty;
 	defer content_buf.deinit(allocator);
 
 	while (lines.next()) |line| {
@@ -562,7 +562,7 @@ fn isNumberedSection(line: []const u8) ?u8 {
 
 /// Clean extracted text: normalize line endings, trim excess whitespace.
 fn cleanText(allocator: Allocator, raw: []const u8) ![]u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	var i: usize = 0;

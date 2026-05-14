@@ -8,16 +8,32 @@ const Allocator = std.mem.Allocator;
 
 // ── Dictionary state (lazy-initialized, lives for process lifetime) ──
 
-var dict_mutex: std.Thread.Mutex = .{};
+// 0.16: std.Thread.Mutex is gone. Since this is one-shot init, gate with an
+// atomic state machine: uninit (0) -> initializing (1) -> ready (2).
+// Threads that find state==initializing spin briefly until state==ready.
+const InitState = enum(u8) { uninit, initializing, ready };
+var dict_state: std.atomic.Value(InitState) = .init(.uninit);
 var dict: ?std.StringHashMapUnmanaged(void) = null;
 var proper_dict: ?std.StringHashMapUnmanaged(void) = null;
 var dict_arena: ?std.heap.ArenaAllocator = null;
 
 /// Decompress the embedded dictionary and build a hashmap for O(1) lookups.
-/// Thread-safe via mutex; the dictionary is never freed (process-lifetime).
+/// Thread-safe via atomic state; the dictionary is never freed (process-lifetime).
 fn ensureInit() void {
-	dict_mutex.lock();
-	defer dict_mutex.unlock();
+	// Fast-path: already initialized.
+	if (dict_state.load(.acquire) == .ready) return;
+
+	// Try to claim init ownership.
+	const prior = dict_state.cmpxchgStrong(.uninit, .initializing, .acquire, .acquire);
+	if (prior != null) {
+		// Another thread is initializing (or has finished). Spin until ready.
+		while (dict_state.load(.acquire) != .ready) {
+			std.atomic.spinLoopHint();
+		}
+		return;
+	}
+	// We own the init; mark ready on every return path.
+	defer dict_state.store(.ready, .release);
 	if (dict != null) return;
 
 	const compressed = @embedFile("dictionary.zlib");
@@ -34,10 +50,10 @@ fn ensureInit() void {
 	};
 
 	// Build hashmap: lowercase each word for case-insensitive lookup
-	var map = std.StringHashMapUnmanaged(void){};
+	var map = std.StringHashMapUnmanaged(void).empty;
 	var lines = std.mem.splitScalar(u8, raw, '\n');
 	while (lines.next()) |line| {
-		const trimmed = std.mem.trimRight(u8, line, "\r");
+		const trimmed = std.mem.trimEnd(u8, line, "\r");
 		if (trimmed.len == 0) continue;
 		const lower = alloc.alloc(u8, trimmed.len) catch continue;
 		for (trimmed, 0..) |c, i| {
@@ -47,7 +63,7 @@ fn ensureInit() void {
 	}
 
 	// Also load proper nouns into a SEPARATE dict (case-sensitive matching)
-	var pn_map = std.StringHashMapUnmanaged(void){};
+	var pn_map = std.StringHashMapUnmanaged(void).empty;
 	const pn_compressed = @embedFile("proper_nouns.zlib");
 	var pn_reader: std.Io.Reader = .fixed(pn_compressed);
 	var pn_decompress: std.compress.flate.Decompress = .init(&pn_reader, .zlib, &.{});
@@ -59,7 +75,7 @@ fn ensureInit() void {
 
 	var pn_lines = std.mem.splitScalar(u8, pn_raw, '\n');
 	while (pn_lines.next()) |line| {
-		const trimmed = std.mem.trimRight(u8, line, "\r");
+		const trimmed = std.mem.trimEnd(u8, line, "\r");
 		if (trimmed.len == 0) continue;
 		const lower = alloc.alloc(u8, trimmed.len) catch continue;
 		for (trimmed, 0..) |c, i| {
@@ -169,7 +185,7 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 	const Sep = enum { none, space, hyphen };
 	const Token = struct { text: []const u8, sep: Sep };
 
-	var tokens = std.ArrayList(Token){};
+	var tokens = std.ArrayList(Token).empty;
 	defer tokens.deinit(allocator);
 
 	var start: usize = 0;
@@ -241,7 +257,7 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 	}
 
 	// Merge pass: try joining adjacent tokens
-	var merged = std.ArrayList(Token){};
+	var merged = std.ArrayList(Token).empty;
 	defer {
 		for (merged.items) |m| {
 			const ptr = @intFromPtr(m.text.ptr);
@@ -349,7 +365,7 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 	}
 
 	// Build output with original separators
-	var result = std.ArrayList(u8){};
+	var result = std.ArrayList(u8).empty;
 	errdefer result.deinit(allocator);
 
 	for (merged.items) |tok| {
@@ -366,7 +382,7 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 
 /// Perform a single rejoin pass over multi-line text.
 fn rejoinPass(allocator: Allocator, text: []const u8) ![]const u8 {
-	var result = std.ArrayList(u8){};
+	var result = std.ArrayList(u8).empty;
 	errdefer result.deinit(allocator);
 
 	var lines = std.mem.splitScalar(u8, text, '\n');
@@ -391,7 +407,7 @@ fn rejoinPass(allocator: Allocator, text: []const u8) ![]const u8 {
 /// 2. "mis-managed" → "mismanaged" (remove hyphen if unhyphenated form is in dictionary)
 /// 3. "twenty-four" → "twenty-four" (keep hyphen if unhyphenated form is NOT in dictionary)
 fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
-	var result = std.ArrayList(u8){};
+	var result = std.ArrayList(u8).empty;
 	errdefer result.deinit(allocator);
 
 	var i: usize = 0;
@@ -499,7 +515,7 @@ fn normalizeHyphens(allocator: Allocator, text: []const u8) ![]const u8 {
 /// (but not in abbreviations like "U.S." or decimals like "3.14"), and
 /// after ',', ';', ':' when followed by a letter (but not digits like "1,000").
 fn normalizeText(allocator: Allocator, text: []const u8) ![]const u8 {
-	var result = std.ArrayList(u8){};
+	var result = std.ArrayList(u8).empty;
 	errdefer result.deinit(allocator);
 
 	var i: usize = 0;
@@ -585,7 +601,7 @@ fn normalizeText(allocator: Allocator, text: []const u8) ![]const u8 {
 /// where both halves are real standalone words. Prefer the longest left part
 /// (greedy) to avoid spurious short-word splits.
 fn splitCamelBoundaries(allocator: Allocator, text: []const u8) ![]const u8 {
-	var result = std.ArrayList(u8){};
+	var result = std.ArrayList(u8).empty;
 	errdefer result.deinit(allocator);
 
 	var i: usize = 0;
@@ -658,7 +674,7 @@ fn splitCamelBoundaries(allocator: Allocator, text: []const u8) ![]const u8 {
 /// standalone word), merge them and move the newline after the
 /// joined word.
 fn rejoinAcrossNewlines(allocator: Allocator, text: []const u8) ![]const u8 {
-	var result = std.ArrayList(u8){};
+	var result = std.ArrayList(u8).empty;
 	errdefer result.deinit(allocator);
 
 	var lines = std.mem.splitScalar(u8, text, '\n');
@@ -738,7 +754,7 @@ pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 
 	// Phase 0a: strip soft hyphens (U+00AD = 0xC2 0xAD in UTF-8)
 	// These are line-break hints, not real hyphens.
-	var stripped = std.ArrayList(u8){};
+	var stripped = std.ArrayList(u8).empty;
 	defer stripped.deinit(allocator);
 	{
 		var j: usize = 0;

@@ -110,7 +110,7 @@ fn countPageBreaks(p_node: xml.XmlNode) u32 {
 
 /// Extract concatenated text from all `<w:r>/<w:t>` runs in a `<w:p>` paragraph.
 fn extractParagraphText(gpa: Allocator, p_node: xml.XmlNode) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(gpa);
 
 	for (p_node.children) |child| {
@@ -149,7 +149,7 @@ fn buildTree(
 	start: usize,
 	end: usize,
 ) ![]const Section {
-	var sections: std.ArrayList(Section) = .{};
+	var sections: std.ArrayList(Section) = .empty;
 	errdefer {
 		for (sections.items) |s| freeSectionContents(gpa, s);
 		sections.deinit(gpa);
@@ -231,7 +231,7 @@ fn extractMetadata(gpa: Allocator, archive: []const u8) !struct {
 	};
 	defer xml.freeXmlDoc(gpa, doc);
 
-	var entries = std.ArrayList(MetadataEntry){};
+	var entries = std.ArrayList(MetadataEntry).empty;
 	errdefer {
 		for (entries.items) |e| {
 			gpa.free(e.key);
@@ -298,7 +298,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 	const body = if (xml_doc.root) |root| findBody(root) else null;
 
 	// Build flat sections from paragraphs
-	var flat_sections = std.ArrayList(FlatSection){};
+	var flat_sections = std.ArrayList(FlatSection).empty;
 	defer {
 		for (flat_sections.items) |*fs| fs.deinit(gpa);
 		flat_sections.deinit(gpa);
@@ -327,7 +327,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 				try flat_sections.append(gpa, FlatSection{
 					.heading = text,
 					.level = level.?,
-					.content_buf = .{},
+					.content_buf = .empty,
 					.page = current_page,
 				});
 				current = flat_sections.items.len - 1;
@@ -341,7 +341,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 					try flat_sections.append(gpa, FlatSection{
 						.heading = null,
 						.level = 0,
-						.content_buf = .{},
+						.content_buf = .empty,
 						.page = current_page,
 					});
 					current = flat_sections.items.len - 1;
@@ -441,7 +441,7 @@ fn buildTestDocx(gpa: Allocator, body_xml: []const u8, core_xml: ?[]const u8) ![
 	;
 
 	// Build full document.xml
-	var doc_buf = std.ArrayList(u8){};
+	var doc_buf = std.ArrayList(u8).empty;
 	defer doc_buf.deinit(gpa);
 	try doc_buf.appendSlice(gpa, doc_xml_prefix);
 	try doc_buf.appendSlice(gpa, body_xml);

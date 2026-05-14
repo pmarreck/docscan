@@ -62,9 +62,9 @@ pub fn build(b: *std.Build) void {
 		.root_module = ffi_mod,
 		.linkage = .static,
 	});
-	lib.linkLibrary(sqlite3_lib);
-	lib.linkLibrary(vec_static_lib);
-	lib.linkLibrary(uchardet_lib);
+	ffi_mod.linkLibrary(sqlite3_lib);
+	ffi_mod.linkLibrary(vec_static_lib);
+	ffi_mod.linkLibrary(uchardet_lib);
 	ffi_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 	lib.installHeader(b.path("ffi/docscan_core.h"), "docscan_core.h");
 	b.installArtifact(lib);
@@ -84,14 +84,14 @@ pub fn build(b: *std.Build) void {
 		.name = "docscan",
 		.root_module = exe_mod,
 	});
-	exe.linkLibrary(lib);
-	exe.linkLibrary(sqlite3_lib);
-	exe.linkLibrary(vec_static_lib);
-	exe.linkLibrary(uchardet_lib);
-	exe.linkLibC();
+	exe_mod.linkLibrary(lib);
+	exe_mod.linkLibrary(sqlite3_lib);
+	exe_mod.linkLibrary(vec_static_lib);
+	exe_mod.linkLibrary(uchardet_lib);
+	exe_mod.link_libc = true;
 	// Link Windows socket library for networking code
 	if (target.result.os.tag == .windows) {
-		exe.linkSystemLibrary("ws2_32");
+		exe_mod.linkSystemLibrary("ws2_32", .{});
 	}
 	b.installArtifact(exe);
 
@@ -105,9 +105,9 @@ pub fn build(b: *std.Build) void {
 	const unit_tests = b.addTest(.{
 		.root_module = test_mod,
 	});
-	unit_tests.linkLibrary(sqlite3_lib);
-	unit_tests.linkLibrary(vec_static_lib);
-	unit_tests.linkLibrary(uchardet_lib);
+	test_mod.linkLibrary(sqlite3_lib);
+	test_mod.linkLibrary(vec_static_lib);
+	test_mod.linkLibrary(uchardet_lib);
 	test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 
 	const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -123,9 +123,9 @@ pub fn build(b: *std.Build) void {
 	const ffi_tests = b.addTest(.{
 		.root_module = ffi_test_mod,
 	});
-	ffi_tests.linkLibrary(sqlite3_lib);
-	ffi_tests.linkLibrary(vec_static_lib);
-	ffi_tests.linkLibrary(uchardet_lib);
+	ffi_test_mod.linkLibrary(sqlite3_lib);
+	ffi_test_mod.linkLibrary(vec_static_lib);
+	ffi_test_mod.linkLibrary(uchardet_lib);
 	ffi_test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 
 	const run_ffi_tests = b.addRunArtifact(ffi_tests);

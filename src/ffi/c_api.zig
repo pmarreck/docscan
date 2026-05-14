@@ -21,7 +21,7 @@ const parser_epub = core.parser_epub;
 
 // ── Allocator ─────────────────────────────────────────────────────────
 
-var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .{};
+var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
 const gpa = gpa_impl.allocator();
 
 // ── Opaque handle ─────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ fn jsonSection(out: *std.ArrayList(u8), section: document.Section) !void {
 
 /// Serialize a Document to JSON.
 fn jsonDocument(doc: document.Document) ![]const u8 {
-	var out = std.ArrayList(u8){};
+	var out = std.ArrayList(u8).empty;
 	errdefer out.deinit(gpa);
 
 	try out.appendSlice(gpa, "{\"path\":");
@@ -174,7 +174,7 @@ fn jsonDocument(doc: document.Document) ![]const u8 {
 
 /// Serialize a slice of Chunks to a JSON array.
 fn jsonChunks(chunks: []const document.Chunk) ![]const u8 {
-	var out = std.ArrayList(u8){};
+	var out = std.ArrayList(u8).empty;
 	errdefer out.deinit(gpa);
 
 	try out.append(gpa, '[');
@@ -218,7 +218,7 @@ fn jsonChunks(chunks: []const document.Chunk) ![]const u8 {
 
 /// Serialize search results to a JSON array.
 fn jsonSearchResults(results: []const document.SearchResult) ![]const u8 {
-	var out = std.ArrayList(u8){};
+	var out = std.ArrayList(u8).empty;
 	errdefer out.deinit(gpa);
 
 	try out.append(gpa, '[');
@@ -264,7 +264,7 @@ fn jsonSearchResults(results: []const document.SearchResult) ![]const u8 {
 
 /// Serialize a ChunkRecord to JSON.
 fn jsonChunkRecord(rec: storage.ChunkRecord) ![]const u8 {
-	var out = std.ArrayList(u8){};
+	var out = std.ArrayList(u8).empty;
 	errdefer out.deinit(gpa);
 
 	var num_buf: [32]u8 = undefined;
@@ -307,7 +307,7 @@ fn jsonChunkRecord(rec: storage.ChunkRecord) ![]const u8 {
 
 /// Serialize Stats to JSON.
 fn jsonStats(stats: storage.Stats) ![]const u8 {
-	var out = std.ArrayList(u8){};
+	var out = std.ArrayList(u8).empty;
 	errdefer out.deinit(gpa);
 
 	var num_buf: [32]u8 = undefined;

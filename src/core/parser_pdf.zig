@@ -36,7 +36,7 @@ const CMap = struct {
 	fn init(allocator: Allocator) CMap {
 		return .{
 			.char_map = std.AutoHashMap(u16, []const u8).init(allocator),
-			.ranges = std.ArrayList(CMapRange){},
+			.ranges = std.ArrayList(CMapRange).empty,
 			.allocator = allocator,
 		};
 	}
@@ -222,7 +222,7 @@ fn hexToU21(hex: []const u8) u21 {
 /// Convert hex-encoded Unicode codepoints to UTF-8 string.
 /// Input is hex digits like "0042" (= U+0042 = 'B') or "00420043" (= "BC").
 fn hexToUtf8(allocator: Allocator, hex: []const u8) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	var i: usize = 0;
@@ -444,7 +444,7 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	const pages_ref = pdf_objects.getDictRef(catalog_val.dict, "Pages") orelse return emptyDocument(allocator, path);
 
 	// Collect text spans from all pages
-	var spans = std.ArrayList(TextSpan){};
+	var spans = std.ArrayList(TextSpan).empty;
 	defer {
 		for (spans.items) |span| allocator.free(span.text);
 		spans.deinit(allocator);
@@ -996,7 +996,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 /// Extract a string from PDF content stream parenthesized string.
 fn extractStreamString(allocator: Allocator, data: []const u8, pos: *usize) ![]const u8 {
 	var p = pos.* + 1; // skip '('
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 	var depth: u32 = 1;
 
@@ -1077,7 +1077,7 @@ fn getCurrentCMap(font_maps: ?*const FontMap, font_name: ?[]const u8) ?*const CM
 /// fonts use 1-byte codes. We try 2-byte first, then 1-byte fallback.
 /// If no CMap matches are found, returns null (caller keeps the raw string).
 fn decodeThroughCMap(allocator: Allocator, raw: []const u8, cmap: *const CMap) ?[]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 	var decoded_any = false;
 	var i: usize = 0;
@@ -1132,11 +1132,11 @@ fn decodeThroughCMap(allocator: Allocator, raw: []const u8, cmap: *const CMap) ?
 /// glyph IDs via CMap if available, otherwise returning raw bytes.
 fn extractHexStringText(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*const CMap) ![]const u8 {
 	var p = pos.* + 1; // skip '<'
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	// Collect hex digits
-	var hex_buf = std.ArrayList(u8){};
+	var hex_buf = std.ArrayList(u8).empty;
 	defer hex_buf.deinit(allocator);
 	while (p < data.len and data[p] != '>') {
 		const c = data[p];
@@ -1208,7 +1208,7 @@ fn extractHexStringText(allocator: Allocator, data: []const u8, pos: *usize, cma
 /// Hex strings (<XX>) are decoded via CMap if available.
 fn extractTJArray(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*const CMap) ![]const u8 {
 	var p = pos.* + 1; // skip '['
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	while (p < data.len and data[p] != ']') {
@@ -1340,7 +1340,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 
 	// Collect unique heading sizes (sizes significantly larger than dominant)
 	const size_threshold = dominant_size * 1.15; // 15% larger = heading
-	var heading_sizes = std.ArrayList(f32){};
+	var heading_sizes = std.ArrayList(f32).empty;
 	defer heading_sizes.deinit(allocator);
 
 	for (spans) |span| {
@@ -1367,7 +1367,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 	}.f);
 
 	// Build flat sections
-	var flat_sections = std.ArrayList(FlatSection){};
+	var flat_sections = std.ArrayList(FlatSection).empty;
 	defer {
 		for (flat_sections.items) |*fs| fs.deinit(allocator);
 		flat_sections.deinit(allocator);
@@ -1410,7 +1410,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 			try flat_sections.append(allocator, FlatSection{
 				.heading = try allocator.dupe(u8, span.text),
 				.level = level,
-				.content_buf = .{},
+				.content_buf = .empty,
 				.page = span.page,
 			});
 			current = flat_sections.items.len - 1;
@@ -1421,7 +1421,7 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 				try flat_sections.append(allocator, FlatSection{
 					.heading = null,
 					.level = 0,
-					.content_buf = .{},
+					.content_buf = .empty,
 					.page = span.page,
 				});
 				current = flat_sections.items.len - 1;
@@ -1513,7 +1513,7 @@ fn buildTree(
 	start: usize,
 	end: usize,
 ) ![]const Section {
-	var sections: std.ArrayList(Section) = .{};
+	var sections: std.ArrayList(Section) = .empty;
 	errdefer {
 		for (sections.items) |s| freeSectionContents(gpa, s);
 		sections.deinit(gpa);
@@ -1611,13 +1611,13 @@ const testing = std.testing;
 /// Build a minimal valid PDF with text content at a given font size.
 /// The PDF structure is: Catalog -> Pages -> Page -> Contents (uncompressed stream).
 fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	try buf.appendSlice(allocator, "%PDF-1.4\n");
 
 	// Track object offsets for xref
-	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }).empty;
 	defer obj_offsets.deinit(allocator);
 
 	// Object 1: Catalog
@@ -1630,9 +1630,9 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 	for (pages, 0..) |_, i| {
 		const page_obj: u32 = @intCast(3 + i * 2); // page objects at 3, 5, 7, ...
 		if (i > 0) try buf.append(allocator, ' ');
-		try std.fmt.format(buf.writer(allocator), "{d} 0 R", .{page_obj});
+		try buf.print(allocator, "{d} 0 R", .{page_obj});
 	}
-	try std.fmt.format(buf.writer(allocator), "] /Count {d} >>\nendobj\n", .{pages.len});
+	try buf.print(allocator, "] /Count {d} >>\nendobj\n", .{pages.len});
 
 	// For each page, create Page + Contents objects
 	for (pages, 0..) |page, i| {
@@ -1640,13 +1640,13 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 		const contents_obj: u32 = page_obj + 1;
 
 		// Build content stream
-		var stream_buf = std.ArrayList(u8){};
+		var stream_buf = std.ArrayList(u8).empty;
 		defer stream_buf.deinit(allocator);
 
 		for (page.text_items) |item| {
 			try stream_buf.appendSlice(allocator, "BT\n");
-			try std.fmt.format(stream_buf.writer(allocator), "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
-			try std.fmt.format(stream_buf.writer(allocator), "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });			try stream_buf.appendSlice(allocator, "(");
+			try stream_buf.print(allocator, "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
+			try stream_buf.print(allocator, "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });			try stream_buf.appendSlice(allocator, "(");
 			try stream_buf.appendSlice(allocator, item.text);
 			try stream_buf.appendSlice(allocator, ") Tj\n");
 			try stream_buf.appendSlice(allocator, "ET\n");
@@ -1654,11 +1654,11 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 
 		// Page object
 		try obj_offsets.append(allocator, .{ .num = page_obj, .offset = buf.items.len });
-		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n<< /Type /Page /Parent 2 0 R /Contents {d} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n", .{ page_obj, contents_obj });
+		try buf.print(allocator, "{d} 0 obj\n<< /Type /Page /Parent 2 0 R /Contents {d} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n", .{ page_obj, contents_obj });
 
 		// Contents object (uncompressed stream)
 		try obj_offsets.append(allocator, .{ .num = contents_obj, .offset = buf.items.len });
-		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n<< /Length {d} >>\nstream\n", .{ contents_obj, stream_buf.items.len });
+		try buf.print(allocator, "{d} 0 obj\n<< /Length {d} >>\nstream\n", .{ contents_obj, stream_buf.items.len });
 		try buf.appendSlice(allocator, stream_buf.items);
 		try buf.appendSlice(allocator, "\nendstream\nendobj\n");
 	}
@@ -1672,7 +1672,7 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 	// Xref table
 	const xref_offset = buf.items.len;
 	try buf.appendSlice(allocator, "xref\n");
-	try std.fmt.format(buf.writer(allocator), "0 {d}\n", .{max_obj + 1});
+	try buf.print(allocator, "0 {d}\n", .{max_obj + 1});
 	try buf.appendSlice(allocator, "0000000000 65535 f\n");
 
 	var obj_idx: u32 = 1;
@@ -1680,7 +1680,7 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 		var found = false;
 		for (obj_offsets.items) |o| {
 			if (o.num == obj_idx) {
-				try std.fmt.format(buf.writer(allocator), "{d:0>10} 00000 n\n", .{o.offset});
+				try buf.print(allocator, "{d:0>10} 00000 n\n", .{o.offset});
 				found = true;
 				break;
 			}
@@ -1690,8 +1690,8 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 		}
 	}
 
-	try std.fmt.format(buf.writer(allocator), "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
-	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
+	try buf.print(allocator, "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_offset});
 
 	return try buf.toOwnedSlice(allocator);
 }
@@ -1825,7 +1825,7 @@ test "empty page / no text — graceful handling" {
 test "content stream TJ operator — array text extraction" {
 	// Test the TJ array extraction directly
 	const stream = "BT\n/F1 12 Tf\n[(Hello) -10 ( ) -5 (World)] TJ\nET\n";
-	var spans = std.ArrayList(TextSpan){};
+	var spans = std.ArrayList(TextSpan).empty;
 	defer {
 		for (spans.items) |s| testing.allocator.free(s.text);
 		spans.deinit(testing.allocator);
@@ -1868,7 +1868,7 @@ test "TJ array — large kerning inserts space between words" {
 	// In PDF, TJ array numbers are in thousandths of a text space unit.
 	// Large negative values (> ~200) indicate a word boundary.
 	const stream = "BT\n/F1 12 Tf\n[(Hello) -600 (World)] TJ\nET\n";
-	var spans = std.ArrayList(TextSpan){};
+	var spans = std.ArrayList(TextSpan).empty;
 	defer {
 		for (spans.items) |s| testing.allocator.free(s.text);
 		spans.deinit(testing.allocator);
@@ -2359,23 +2359,23 @@ const TestPageLabelSpec = struct {
 
 /// Build a test PDF with /PageLabels in the catalog.
 fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, label_specs: []const TestPageLabelSpec) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	try buf.appendSlice(allocator, "%PDF-1.4\n");
 
 	// Track object offsets for xref
-	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }).empty;
 	defer obj_offsets.deinit(allocator);
 
 	// Build /PageLabels /Nums array string
-	var labels_buf = std.ArrayList(u8){};
+	var labels_buf = std.ArrayList(u8).empty;
 	defer labels_buf.deinit(allocator);
 	try labels_buf.appendSlice(allocator, "/PageLabels << /Nums [ ");
 	for (label_specs) |spec| {
-		try std.fmt.format(labels_buf.writer(allocator), "{d} << /S /{c}", .{ spec.start_index, spec.style_char });
+		try labels_buf.print(allocator, "{d} << /S /{c}", .{ spec.start_index, spec.style_char });
 		if (spec.start_number != 1) {
-			try std.fmt.format(labels_buf.writer(allocator), " /St {d}", .{spec.start_number});
+			try labels_buf.print(allocator, " /St {d}", .{spec.start_number});
 		}
 		try labels_buf.appendSlice(allocator, " >> ");
 	}
@@ -2393,9 +2393,9 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 	for (pages, 0..) |_, i| {
 		const page_obj: u32 = @intCast(3 + i * 2);
 		if (i > 0) try buf.append(allocator, ' ');
-		try std.fmt.format(buf.writer(allocator), "{d} 0 R", .{page_obj});
+		try buf.print(allocator, "{d} 0 R", .{page_obj});
 	}
-	try std.fmt.format(buf.writer(allocator), "] /Count {d} >>\nendobj\n", .{pages.len});
+	try buf.print(allocator, "] /Count {d} >>\nendobj\n", .{pages.len});
 
 	// For each page, create Page + Contents objects
 	for (pages, 0..) |page, i| {
@@ -2403,13 +2403,13 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 		const contents_obj: u32 = page_obj + 1;
 
 		// Build content stream
-		var stream_buf = std.ArrayList(u8){};
+		var stream_buf = std.ArrayList(u8).empty;
 		defer stream_buf.deinit(allocator);
 
 		for (page.text_items) |item| {
 			try stream_buf.appendSlice(allocator, "BT\n");
-			try std.fmt.format(stream_buf.writer(allocator), "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
-			try std.fmt.format(stream_buf.writer(allocator), "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });
+			try stream_buf.print(allocator, "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
+			try stream_buf.print(allocator, "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });
 			try stream_buf.appendSlice(allocator, "(");
 			try stream_buf.appendSlice(allocator, item.text);
 			try stream_buf.appendSlice(allocator, ") Tj\n");
@@ -2418,11 +2418,11 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 
 		// Page object
 		try obj_offsets.append(allocator, .{ .num = page_obj, .offset = buf.items.len });
-		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n<< /Type /Page /Parent 2 0 R /Contents {d} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n", .{ page_obj, contents_obj });
+		try buf.print(allocator, "{d} 0 obj\n<< /Type /Page /Parent 2 0 R /Contents {d} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n", .{ page_obj, contents_obj });
 
 		// Contents object (uncompressed stream)
 		try obj_offsets.append(allocator, .{ .num = contents_obj, .offset = buf.items.len });
-		try std.fmt.format(buf.writer(allocator), "{d} 0 obj\n<< /Length {d} >>\nstream\n", .{ contents_obj, stream_buf.items.len });
+		try buf.print(allocator, "{d} 0 obj\n<< /Length {d} >>\nstream\n", .{ contents_obj, stream_buf.items.len });
 		try buf.appendSlice(allocator, stream_buf.items);
 		try buf.appendSlice(allocator, "\nendstream\nendobj\n");
 	}
@@ -2436,7 +2436,7 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 	// Xref table
 	const xref_offset = buf.items.len;
 	try buf.appendSlice(allocator, "xref\n");
-	try std.fmt.format(buf.writer(allocator), "0 {d}\n", .{max_obj + 1});
+	try buf.print(allocator, "0 {d}\n", .{max_obj + 1});
 	try buf.appendSlice(allocator, "0000000000 65535 f\n");
 
 	var obj_idx: u32 = 1;
@@ -2444,7 +2444,7 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 		var found = false;
 		for (obj_offsets.items) |o| {
 			if (o.num == obj_idx) {
-				try std.fmt.format(buf.writer(allocator), "{d:0>10} 00000 n\n", .{o.offset});
+				try buf.print(allocator, "{d:0>10} 00000 n\n", .{o.offset});
 				found = true;
 				break;
 			}
@@ -2454,8 +2454,8 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 		}
 	}
 
-	try std.fmt.format(buf.writer(allocator), "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
-	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
+	try buf.print(allocator, "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_offset});
 
 	return try buf.toOwnedSlice(allocator);
 }
@@ -2463,9 +2463,9 @@ fn buildTestPdfWithPageLabels(allocator: Allocator, pages: []const TestPage, lab
 /// Build a synthetic PDF where text lives in a form XObject (like OCR'd PDFs).
 /// The page content stream uses `Do` to reference the form, which contains the Tj ops.
 fn buildTestPdfWithFormXObject(allocator: Allocator, form_text: []const u8) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
-	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	var obj_offsets = std.ArrayList(struct { num: u32, offset: usize }).empty;
 	defer obj_offsets.deinit(allocator);
 
 	try buf.appendSlice(allocator, "%PDF-1.4\n");
@@ -2479,23 +2479,21 @@ fn buildTestPdfWithFormXObject(allocator: Allocator, form_text: []const u8) ![]c
 	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
 
 	// Object 5: Form XObject stream with the actual text
-	var form_stream = std.ArrayList(u8){};
+	var form_stream = std.ArrayList(u8).empty;
 	defer form_stream.deinit(allocator);
 	try form_stream.appendSlice(allocator, "BT\n/F1 12 Tf\n72 700 Td\n(");
 	try form_stream.appendSlice(allocator, form_text);
 	try form_stream.appendSlice(allocator, ") Tj\nET\n");
 
 	try obj_offsets.append(allocator, .{ .num = 5, .offset = buf.items.len });
-	try std.fmt.format(buf.writer(allocator),
-		"5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Length {d} >>\nstream\n", .{form_stream.items.len});
+	try buf.print(allocator, "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Length {d} >>\nstream\n", .{form_stream.items.len});
 	try buf.appendSlice(allocator, form_stream.items);
 	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
 
 	// Object 4: Content stream — just references the form XObject via Do
 	const content = "/OCR Do\n";
 	try obj_offsets.append(allocator, .{ .num = 4, .offset = buf.items.len });
-	try std.fmt.format(buf.writer(allocator),
-		"4 0 obj\n<< /Length {d} >>\nstream\n", .{content.len});
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{content.len});
 	try buf.appendSlice(allocator, content);
 	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
 
@@ -2509,22 +2507,22 @@ fn buildTestPdfWithFormXObject(allocator: Allocator, form_text: []const u8) ![]c
 	for (obj_offsets.items) |o| { if (o.num > max_obj) max_obj = o.num; }
 	const xref_offset = buf.items.len;
 	try buf.appendSlice(allocator, "xref\n");
-	try std.fmt.format(buf.writer(allocator), "0 {d}\n", .{max_obj + 1});
+	try buf.print(allocator, "0 {d}\n", .{max_obj + 1});
 	try buf.appendSlice(allocator, "0000000000 65535 f\n");
 	var obj_idx: u32 = 1;
 	while (obj_idx <= max_obj) : (obj_idx += 1) {
 		var found = false;
 		for (obj_offsets.items) |o| {
 			if (o.num == obj_idx) {
-				try std.fmt.format(buf.writer(allocator), "{d:0>10} 00000 n\n", .{o.offset});
+				try buf.print(allocator, "{d:0>10} 00000 n\n", .{o.offset});
 				found = true;
 				break;
 			}
 		}
 		if (!found) try buf.appendSlice(allocator, "0000000000 00000 f\n");
 	}
-	try std.fmt.format(buf.writer(allocator), "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
-	try std.fmt.format(buf.writer(allocator), "startxref\n{d}\n%%EOF", .{xref_offset});
+	try buf.print(allocator, "trailer\n<< /Size {d} /Root 1 0 R >>\n", .{max_obj + 1});
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_offset});
 	return try buf.toOwnedSlice(allocator);
 }
 
@@ -2549,9 +2547,9 @@ test "parse extracts text from form XObjects (OCR'd PDFs)" {
 
 test "parse decodes MacRomanEncoding byte 0xDE as fi ligature" {
 	const alloc = testing.allocator;
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(alloc);
-	var offsets = std.ArrayList(struct { num: u32, offset: usize }){};
+	var offsets = std.ArrayList(struct { num: u32, offset: usize }).empty;
 	defer offsets.deinit(alloc);
 
 	try buf.appendSlice(alloc, "%PDF-1.4\n");
@@ -2565,7 +2563,7 @@ test "parse decodes MacRomanEncoding byte 0xDE as fi ligature" {
 	// Content stream: (\xDEnally) Tj — byte 0xDE should become fi via MacRoman
 	const stream = "BT\n/F1 12 Tf\n72 700 Td\n(\xDEnally) Tj\nET\n";
 	try offsets.append(alloc, .{ .num = 4, .offset = buf.items.len });
-	try std.fmt.format(buf.writer(alloc), "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.print(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
 	try buf.appendSlice(alloc, stream);
 	try buf.appendSlice(alloc, "\nendstream\nendobj\n");
 
@@ -2579,21 +2577,21 @@ test "parse decodes MacRomanEncoding byte 0xDE as fi ligature" {
 	// Xref
 	const xref_offset = buf.items.len;
 	try buf.appendSlice(alloc, "xref\n");
-	try std.fmt.format(buf.writer(alloc), "0 5\n", .{});
+	try buf.print(alloc, "0 5\n", .{});
 	try buf.appendSlice(alloc, "0000000000 65535 f\n");
 	var idx: u32 = 1;
 	while (idx <= 4) : (idx += 1) {
 		var found = false;
 		for (offsets.items) |o| {
 			if (o.num == idx) {
-				try std.fmt.format(buf.writer(alloc), "{d:0>10} 00000 n\n", .{o.offset});
+				try buf.print(alloc, "{d:0>10} 00000 n\n", .{o.offset});
 				found = true;
 				break;
 			}
 		}
 		if (!found) try buf.appendSlice(alloc, "0000000000 00000 f\n");
 	}
-	try std.fmt.format(buf.writer(alloc), "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{d}\n%%EOF", .{xref_offset});
+	try buf.print(alloc, "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{d}\n%%EOF", .{xref_offset});
 
 	const pdf = try buf.toOwnedSlice(alloc);
 	defer alloc.free(pdf);

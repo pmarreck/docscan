@@ -61,7 +61,7 @@ pub fn listEntries(allocator: Allocator, archive: []const u8) ![][]const u8 {
 	const cd_offset = readU32(archive, eocd + 16);
 	const cd_count = readU16(archive, eocd + 10);
 
-	var names = std.ArrayList([]const u8){};
+	var names = std.ArrayList([]const u8).empty;
 	errdefer {
 		for (names.items) |n| allocator.free(n);
 		names.deinit(allocator);
@@ -175,11 +175,11 @@ pub const TestEntry = struct {
 
 /// Build a minimal in-memory ZIP archive for testing.
 pub fn buildTestZip(allocator: Allocator, entries: []const TestEntry) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	// Track local header offsets for central directory
-	var offsets = std.ArrayList(u32){};
+	var offsets = std.ArrayList(u32).empty;
 	defer offsets.deinit(allocator);
 
 	// Write local file headers + data

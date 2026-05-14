@@ -179,7 +179,7 @@ const Parser = struct {
 
 	/// Decode text content until a terminator char, handling XML entities.
 	fn decodeUntil(self: *Parser, terminator: u8) ![]const u8 {
-		var buf: std.ArrayList(u8) = .{};
+		var buf: std.ArrayList(u8) = .empty;
 		errdefer buf.deinit(self.allocator);
 
 		while (self.pos < self.input.len) {
@@ -222,7 +222,7 @@ const Parser = struct {
 	/// Parse attributes within an opening tag until '>' or '/>' is reached.
 	/// Returns the attributes and whether the tag is self-closing.
 	fn parseAttributes(self: *Parser) !struct { attrs: []const Attribute, self_closing: bool } {
-		var attrs: std.ArrayList(Attribute) = .{};
+		var attrs: std.ArrayList(Attribute) = .empty;
 		errdefer {
 			for (attrs.items) |attr| {
 				self.allocator.free(attr.name);
@@ -303,13 +303,13 @@ const Parser = struct {
 		}
 
 		// Parse children and/or text content
-		var children: std.ArrayList(XmlNode) = .{};
+		var children: std.ArrayList(XmlNode) = .empty;
 		errdefer {
 			for (children.items) |child| freeNode(self.allocator, child);
 			children.deinit(self.allocator);
 		}
 
-		var text_buf: std.ArrayList(u8) = .{};
+		var text_buf: std.ArrayList(u8) = .empty;
 		errdefer text_buf.deinit(self.allocator);
 
 		while (self.pos < self.input.len) {

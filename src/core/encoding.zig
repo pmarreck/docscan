@@ -214,7 +214,7 @@ pub const pdfdoc_encoding_to_unicode: [256]u21 = blk: {
 
 /// Convert a byte buffer to UTF-8 using a 256-entry byte-to-codepoint table.
 fn convertWithTable(allocator: Allocator, data: []const u8, table: *const [256]u21) ![]const u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     for (data) |byte| {
@@ -231,7 +231,7 @@ fn convertWithTable(allocator: Allocator, data: []const u8, table: *const [256]u
 /// Convert Latin-1 (ISO-8859-1) bytes to UTF-8.
 /// Latin-1 byte values map directly to Unicode codepoints.
 fn convertLatin1ToUtf8(allocator: Allocator, data: []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     for (data) |byte| {

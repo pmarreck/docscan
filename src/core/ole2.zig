@@ -233,7 +233,7 @@ fn readDirEntries(allocator: Allocator, data: []const u8, fat: []const u32, head
 
 	// Each directory entry is 128 bytes.
 	const entry_count = dir_data.len / 128;
-	var entries = std.ArrayList(DirEntry){};
+	var entries = std.ArrayList(DirEntry).empty;
 	errdefer {
 		for (entries.items) |e| allocator.free(e.name);
 		entries.deinit(allocator);
@@ -352,7 +352,7 @@ pub fn listStreams(allocator: Allocator, data: []const u8, header: Ole2Header) !
 		allocator.free(entries);
 	}
 
-	var names = std.ArrayList([]const u8){};
+	var names = std.ArrayList([]const u8).empty;
 	errdefer {
 		for (names.items) |n| allocator.free(n);
 		names.deinit(allocator);
@@ -390,7 +390,7 @@ fn readU32(data: []const u8, offset: usize) u32 {
 /// Caller owns the returned slice.
 pub fn utf16leToUtf8(allocator: Allocator, utf16_bytes: []const u8) ![]const u8 {
 	const len = utf16_bytes.len / 2;
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
 
 	var i: usize = 0;

@@ -39,7 +39,7 @@ fn stripDoctype(gpa: Allocator, input: []const u8) ![]const u8 {
 		return try gpa.dupe(u8, input);
 	}
 
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(gpa);
 
 	var pos: usize = 0;
@@ -70,7 +70,7 @@ fn stripDoctype(gpa: Allocator, input: []const u8) ![]const u8 {
 /// E.g., base="" + href="chapter1.xhtml" => "chapter1.xhtml"
 fn resolveHref(gpa: Allocator, base: []const u8, href: []const u8) ![]const u8 {
 	if (base.len == 0) return try gpa.dupe(u8, href);
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(gpa);
 	try buf.appendSlice(gpa, base);
 	try buf.appendSlice(gpa, href);
@@ -119,7 +119,7 @@ fn tagMatches(full_tag: []const u8, local: []const u8) bool {
 
 /// Find all children matching a tag (with namespace stripping).
 fn findChildren(gpa: Allocator, node: xml.XmlNode, tag: []const u8) ![]const xml.XmlNode {
-	var result = std.ArrayList(xml.XmlNode){};
+	var result = std.ArrayList(xml.XmlNode).empty;
 	errdefer result.deinit(gpa);
 	for (node.children) |child| {
 		if (tagMatches(child.tag, tag)) {
@@ -167,7 +167,7 @@ fn parseOpf(gpa: Allocator, opf_bytes: []const u8) !struct {
 	const root = doc.root orelse return error.InvalidEpub;
 
 	// --- Metadata ---
-	var meta_entries = std.ArrayList(MetadataEntry){};
+	var meta_entries = std.ArrayList(MetadataEntry).empty;
 	errdefer {
 		for (meta_entries.items) |e| {
 			gpa.free(e.key);
@@ -200,7 +200,7 @@ fn parseOpf(gpa: Allocator, opf_bytes: []const u8) !struct {
 	}
 
 	// --- Manifest ---
-	var manifest = std.ArrayList(ManifestItem){};
+	var manifest = std.ArrayList(ManifestItem).empty;
 	errdefer {
 		for (manifest.items) |m| {
 			gpa.free(m.id);
@@ -222,7 +222,7 @@ fn parseOpf(gpa: Allocator, opf_bytes: []const u8) !struct {
 	}
 
 	// --- Spine ---
-	var spine_order = std.ArrayList([]const u8){};
+	var spine_order = std.ArrayList([]const u8).empty;
 	errdefer {
 		for (spine_order.items) |s| gpa.free(s);
 		spine_order.deinit(gpa);
@@ -327,7 +327,7 @@ fn extractXhtmlContent(
 			try flat_sections.append(gpa, FlatSection{
 				.heading = heading_text,
 				.level = level,
-				.content_buf = .{},
+				.content_buf = .empty,
 			});
 			current_idx.* = flat_sections.items.len - 1;
 		} else {
@@ -357,7 +357,7 @@ fn extractXhtmlContent(
 				try flat_sections.append(gpa, FlatSection{
 					.heading = null,
 					.level = 0,
-					.content_buf = .{},
+					.content_buf = .empty,
 				});
 				current_idx.* = flat_sections.items.len - 1;
 			}
@@ -387,7 +387,7 @@ fn extractXhtmlContent(
 
 /// Recursively collect all text from a node and its children.
 fn collectText(gpa: Allocator, node: xml.XmlNode) ![]const u8 {
-	var buf = std.ArrayList(u8){};
+	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(gpa);
 
 	if (node.text) |text| {
@@ -409,7 +409,7 @@ fn buildTree(
 	start: usize,
 	end: usize,
 ) ![]const Section {
-	var sections: std.ArrayList(Section) = .{};
+	var sections: std.ArrayList(Section) = .empty;
 	errdefer {
 		for (sections.items) |s| freeSectionContents(gpa, s);
 		sections.deinit(gpa);
@@ -520,7 +520,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 	const opf_base = dirName(opf_path);
 
 	// Step 5: Process each spine item
-	var flat_sections = std.ArrayList(FlatSection){};
+	var flat_sections = std.ArrayList(FlatSection).empty;
 	defer {
 		for (flat_sections.items) |*fs| fs.deinit(gpa);
 		flat_sections.deinit(gpa);
@@ -561,7 +561,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 	}
 
 	// Re-duplicate metadata for the Document (OPF metadata will be freed by defer above)
-	var doc_metadata = std.ArrayList(MetadataEntry){};
+	var doc_metadata = std.ArrayList(MetadataEntry).empty;
 	errdefer {
 		for (doc_metadata.items) |m| {
 			gpa.free(m.key);
@@ -646,9 +646,9 @@ fn buildTestEpub(
 	const base = opf_dir orelse "";
 
 	// Build manifest items and spine itemrefs
-	var manifest_buf = std.ArrayList(u8){};
+	var manifest_buf = std.ArrayList(u8).empty;
 	defer manifest_buf.deinit(gpa);
-	var spine_buf = std.ArrayList(u8){};
+	var spine_buf = std.ArrayList(u8).empty;
 	defer spine_buf.deinit(gpa);
 
 	for (chapters, 0..) |ch, idx| {
@@ -668,7 +668,7 @@ fn buildTestEpub(
 	}
 
 	// Build OPF content
-	var opf_buf = std.ArrayList(u8){};
+	var opf_buf = std.ArrayList(u8).empty;
 	defer opf_buf.deinit(gpa);
 	try opf_buf.appendSlice(gpa,
 		\\<?xml version="1.0" encoding="UTF-8"?>
@@ -686,13 +686,13 @@ fn buildTestEpub(
 	try opf_buf.appendSlice(gpa, "</spine>\n</package>\n");
 
 	// Build OPF path
-	var opf_path_buf = std.ArrayList(u8){};
+	var opf_path_buf = std.ArrayList(u8).empty;
 	defer opf_path_buf.deinit(gpa);
 	try opf_path_buf.appendSlice(gpa, base);
 	try opf_path_buf.appendSlice(gpa, "content.opf");
 
 	// Build container.xml
-	var container_buf = std.ArrayList(u8){};
+	var container_buf = std.ArrayList(u8).empty;
 	defer container_buf.deinit(gpa);
 	try container_buf.appendSlice(gpa,
 		\\<?xml version="1.0" encoding="UTF-8"?>
@@ -709,7 +709,7 @@ fn buildTestEpub(
 
 	// Count entries: mimetype + container.xml + opf + chapters
 	const num_entries = 3 + chapters.len;
-	var entries = std.ArrayList(zip.TestEntry){};
+	var entries = std.ArrayList(zip.TestEntry).empty;
 	defer entries.deinit(gpa);
 
 	// mimetype must be first
@@ -729,7 +729,7 @@ fn buildTestEpub(
 	});
 
 	// Chapters need full paths
-	var chapter_paths = std.ArrayList([]const u8){};
+	var chapter_paths = std.ArrayList([]const u8).empty;
 	defer {
 		for (chapter_paths.items) |p| gpa.free(p);
 		chapter_paths.deinit(gpa);
