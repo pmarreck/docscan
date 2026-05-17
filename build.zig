@@ -23,18 +23,12 @@ pub fn build(b: *std.Build) void {
 		.target = target,
 		.optimize = optimize,
 	});
-	const uchardet_lib = blk: {
-		for (uchardetz_dep.builder.install_tls.step.dependencies.items) |dep_step| {
-			const inst = dep_step.cast(std.Build.Step.InstallArtifact) orelse continue;
-			if (std.mem.eql(u8, inst.artifact.name, "uchardet")) {
-				if (inst.artifact.linkage) |lm| {
-					if (lm != .static) continue;
-				}
-				break :blk inst.artifact;
-			}
-		}
-		@panic("unable to find static uchardet artifact");
-	};
+	// uchardetz exposes the static library as "uchardet-static" (the shared
+	// library uses the bare name "uchardet"), so artifact() resolves
+	// unambiguously to the static one. Earlier code walked install_tls deps
+	// to disambiguate, but Zig 0.16's linkLibrary asserts .kind == .lib which
+	// the loop-fallback path didn't always satisfy.
+	const uchardet_lib = uchardetz_dep.artifact("uchardet-static");
 
 	// Core module — root.zig re-exports all sub-modules
 	const core_mod = b.createModule(.{
