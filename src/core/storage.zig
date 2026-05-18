@@ -386,7 +386,25 @@ pub fn setConfig(db: *Db, key: []const u8, value: []const u8) !void {
 
 /// Insert a document and return its rowid.
 pub fn insertDocument(db: *Db, path: []const u8, format: []const u8, title: ?[]const u8, content_hash: []const u8, metadata: ?[]const u8) !i64 {
-	const now = std.time.timestamp();
+	const now = blk: {
+		// std.time.timestamp was removed in Zig 0.16. Compute UNIX epoch
+		// seconds via clock_gettime(CLOCK_REALTIME) which is available
+		// per-OS in std.posix's underlying system module.
+		const builtin = @import("builtin");
+		switch (builtin.os.tag) {
+			.linux => {
+				var ts: std.os.linux.timespec = undefined;
+				_ = std.os.linux.clock_gettime(.REALTIME, &ts);
+				break :blk @as(i64, ts.sec);
+			},
+			.macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+				var ts: std.c.timespec = undefined;
+				_ = std.c.clock_gettime(.REALTIME, &ts);
+				break :blk @as(i64, ts.sec);
+			},
+			else => @compileError("unsupported OS for timestamp"),
+		}
+	};
 	const stmt = try prepareSql(db.handle,
 		"INSERT INTO documents (path, format, title, content_hash, metadata, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
 	);

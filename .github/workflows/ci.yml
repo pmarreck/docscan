@@ -31,10 +31,10 @@ jobs:
         run: |
           mkdir -p zig-out/bin
           cp result/bin/docscan zig-out/bin/docscan
-          nix develop -c bash tests/cli/test-cli
+          nix develop .#ci -c bash tests/cli/test-cli
 
       - name: MCP tests
-        run: nix develop -c bash tests/mcp/test-mcp
+        run: nix develop .#ci -c bash tests/mcp/test-mcp
 
       - name: Upload native binary
         uses: actions/upload-artifact@v4
@@ -57,17 +57,17 @@ jobs:
       - name: Cross-compile Linux aarch64
         run: |
           mkdir -p dist/aarch64-linux-musl/bin
-          nix develop -c zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseFast --color off -p dist/aarch64-linux-musl
+          nix develop .#ci -c zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseFast --color off -p dist/aarch64-linux-musl
 
       - name: Cross-compile Windows x86_64
         run: |
           mkdir -p dist/x86_64-windows/bin
-          nix develop -c zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast --color off -p dist/x86_64-windows
+          nix develop .#ci -c zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast --color off -p dist/x86_64-windows
 
       - name: Cross-compile Windows aarch64
         run: |
           mkdir -p dist/aarch64-windows/bin
-          nix develop -c zig build -Dtarget=aarch64-windows -Doptimize=ReleaseFast --color off -p dist/aarch64-windows
+          nix develop .#ci -c zig build -Dtarget=aarch64-windows -Doptimize=ReleaseFast --color off -p dist/aarch64-windows
 
       - name: Upload cross-compiled binaries
         uses: actions/upload-artifact@v4

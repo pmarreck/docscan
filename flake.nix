@@ -132,6 +132,26 @@
 						export ZIG_LOCAL_CACHE_DIR="$PWD/zig-cache"
 					'';
 				};
+
+				# Minimal shell for CI: omits ocrmypdf (transitively pulls
+				# unpaper, which has failing tests in current nixos-unstable
+				# and blocks dev-shell evaluation). All zig build, cross-
+				# compile, and CLI smoke tests work without ocrmypdf — only
+				# runtime PDF OCR fallback needs it.
+				devShells.ci = pkgs.mkShell {
+					packages = with pkgs; [
+						zig_0_16
+						jq
+						hyperfine
+						vips
+						ghostscript
+					];
+					shellHook = ''
+						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
+						export ZIG_GLOBAL_CACHE_DIR="$HOME/.cache/zig"
+						export ZIG_LOCAL_CACHE_DIR="$PWD/zig-cache"
+					'';
+				};
 			}
 		);
 }
