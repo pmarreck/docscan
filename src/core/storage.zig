@@ -402,6 +402,13 @@ pub fn insertDocument(db: *Db, path: []const u8, format: []const u8, title: ?[]c
 				_ = std.c.clock_gettime(.REALTIME, &ts);
 				break :blk @as(i64, ts.sec);
 			},
+			.windows => {
+				// Windows: NT's RtlGetSystemTimePrecise returns 100ns ticks
+				// since 1601-01-01 UTC. Convert to unix epoch seconds.
+				const hundred_ns_ticks: i64 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+				// 11644473600 seconds between 1601-01-01 and 1970-01-01.
+				break :blk @divTrunc(hundred_ns_ticks, 10_000_000) - 11644473600;
+			},
 			else => @compileError("unsupported OS for timestamp"),
 		}
 	};
