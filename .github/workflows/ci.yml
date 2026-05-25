@@ -13,7 +13,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Nix
         uses: cachix/install-nix-action@v30
@@ -37,7 +37,7 @@ jobs:
         run: nix develop .#ci -c bash tests/mcp/test-mcp
 
       - name: Upload native binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: docscan-${{ matrix.os == 'macos-latest' && 'aarch64-macos' || 'x86_64-linux' }}
           path: result/bin/docscan
@@ -46,7 +46,7 @@ jobs:
   cross-compile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Nix
         uses: cachix/install-nix-action@v30
@@ -70,7 +70,7 @@ jobs:
           nix develop .#ci -c zig build -Dtarget=aarch64-windows -Doptimize=ReleaseFast --color off -p dist/aarch64-windows
 
       - name: Upload cross-compiled binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: docscan-cross-compiled
           path: dist/
