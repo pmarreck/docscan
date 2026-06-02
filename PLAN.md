@@ -23,6 +23,8 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [x] `docscan preprocess` CLI command — PDF page rasterization + text isolation via FFI + reassembly (2026-04-13 EST)
 - [x] Embedding-failure robustness: per-request retry/backoff + HTTP-status diagnostics, and mark-for-reindex on permanent failure (no more silent zero-vector inserts) in both batch and single-threaded paths. New `cli/embed_util.{c,h}` (37 unit checks) + `tests/integration/test-embed-failures` (5 tests, mock server). Fixes intermittent batch failures observed on the 1200-file index run (2026-06-01 EST)
 - [x] flake.nix: default dev shell repaired — overlay disables broken unpaper/ocrmypdf upstream check phases in nixos-unstable so `nix develop` evaluates again (2026-06-01 EST)
+- [x] Phase-3 insertion hang fixed: wrap per-file chunk/embedding inserts in a single transaction + `synchronous=NORMAL`/`busy_timeout` pragmas. ~112s -> a few seconds for 1715 chunks; makes indexing usable when the DB is on a network filesystem. Also: ignore SIGPIPE so a dropped embedding-server connection defers instead of killing the process. 2 new storage tests (2026-06-02 EST)
+- [x] `docscan index` with no path now defaults to the current directory (mirrors `update`) (2026-06-02 EST)
 ## Deferred
 
 - [ ] Task 15: Integration Tests — requires running Ollama

@@ -209,6 +209,15 @@ pub fn openDb(allocator: std.mem.Allocator, path: [*:0]const u8, embedding_dim: 
 		return SqliteError.SqliteError;
 	};
 
+	// synchronous=NORMAL is safe under WAL (no corruption risk; only the last
+	// few committed txns could be lost on power loss) and avoids an fsync on
+	// every commit — a large win for bulk inserts, especially on slower/
+	// networked storage. busy_timeout lets writers wait out brief locks instead
+	// of failing immediately (important on network filesystems). Best-effort:
+	// these are performance tuning, so a failure is not fatal.
+	execSql(handle, "PRAGMA synchronous=NORMAL;") catch {};
+	execSql(handle, "PRAGMA busy_timeout=5000;") catch {};
+
 	// Foreign keys
 	execSql(handle, "PRAGMA foreign_keys=ON;") catch {
 		_ = c.sqlite3_close(handle);
@@ -344,6 +353,28 @@ pub fn openDb(allocator: std.mem.Allocator, path: [*:0]const u8, embedding_dim: 
 /// Close the database handle.
 pub fn closeDb(db: *Db) void {
 	_ = c.sqlite3_close(db.handle);
+}
+
+// ── Transactions ────────────────────────────────────────────────────────
+// Bulk inserts (a document's chunks + embeddings) must be wrapped in one
+// transaction. Without this, every insert is its own autocommit + fsync —
+// catastrophically slow for large documents, and unusable when the DB lives
+// on a network filesystem. Per-file BEGIN/COMMIT also makes each file's
+// indexing atomic: a mid-insert failure ROLLBACKs to leave no partial doc.
+
+/// Begin a transaction.
+pub fn beginTransaction(db: *Db) SqliteError!void {
+	try execSql(db.handle, "BEGIN;");
+}
+
+/// Commit the current transaction.
+pub fn commitTransaction(db: *Db) SqliteError!void {
+	try execSql(db.handle, "COMMIT;");
+}
+
+/// Roll back the current transaction (e.g. on a mid-insert error).
+pub fn rollbackTransaction(db: *Db) SqliteError!void {
+	try execSql(db.handle, "ROLLBACK;");
 }
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -1171,3 +1202,51 @@ test "getStats — verify counts" {
 		try std.testing.expect(stats.last_indexed > 0);
 	}
 }
+
+test "transaction rollback discards inserts (atomic per-file indexing)" {
+	var db = try openTestDb();
+	defer closeDb(&db);
+
+	try beginTransaction(&db);
+	const doc_id = try insertDocument(&db, "/test/rb.md", "md", null, "rbhash", null);
+	const chunk = document.Chunk{
+		.document_path = "/test/rb.md",
+		.section_path = "",
+		.heading = null,
+		.text = "rolled back content",
+		.start_byte = 0,
+		.end_byte = 19,
+		.chunk_index = 0,
+	};
+	_ = try insertChunk(&db, doc_id, chunk);
+	try rollbackTransaction(&db);
+
+	// Nothing should remain — rollback must unwind through FTS/vec triggers too.
+	const stats = try getStats(&db);
+	try std.testing.expectEqual(@as(i64, 0), stats.doc_count);
+	try std.testing.expectEqual(@as(i64, 0), stats.chunk_count);
+}
+
+test "transaction commit persists inserts" {
+	var db = try openTestDb();
+	defer closeDb(&db);
+
+	try beginTransaction(&db);
+	const doc_id = try insertDocument(&db, "/test/cm.md", "md", null, "cmhash", null);
+	const chunk = document.Chunk{
+		.document_path = "/test/cm.md",
+		.section_path = "",
+		.heading = null,
+		.text = "committed content",
+		.start_byte = 0,
+		.end_byte = 17,
+		.chunk_index = 0,
+	};
+	_ = try insertChunk(&db, doc_id, chunk);
+	try commitTransaction(&db);
+
+	const stats = try getStats(&db);
+	try std.testing.expectEqual(@as(i64, 1), stats.doc_count);
+	try std.testing.expectEqual(@as(i64, 1), stats.chunk_count);
+}
+

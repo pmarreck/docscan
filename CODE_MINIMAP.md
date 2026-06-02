@@ -28,7 +28,7 @@ All pure computation — no I/O.
 - **`ole2.zig`** (685 lines) — OLE2 (Compound Binary File) reader. Header parsing, FAT chain following, directory walking, mini stream support, UTF-16LE→UTF-8 conversion. 9 tests.
 - **`parser_doc.zig`** (1138 lines) — Legacy Word (.doc) parser. FIB parsing, Piece Table extraction, Windows-1252 decoding, heuristic heading detection (ALL CAPS, numbered sections, Chapter/Section patterns). 24 tests.
 - **`chunker.zig`** (601 lines) — Structure-aware chunker. Recursive section walking, breadcrumb paths, paragraph-boundary splitting, small-section merging. 10 tests.
-- **`storage.zig`** (1010 lines) — SQLite + sqlite-vec + FTS5. Document/chunk/embedding CRUD, vector KNN search, BM25 full-text search, WAL mode, config table, incremental reindex via hash. 11 tests.
+- **`storage.zig`** (~1040 lines) — SQLite + sqlite-vec + FTS5. Document/chunk/embedding CRUD, vector KNN search, BM25 full-text search, WAL mode (+ `synchronous=NORMAL`, `busy_timeout`), config table, incremental reindex via hash. `beginTransaction`/`commitTransaction`/`rollbackTransaction` wrap per-file inserts in `docscan_index_file` (one fsync per file instead of per row — ~20x faster bulk insert, and atomic per file). 13 tests.
 - **`search.zig`** (518 lines) — Hybrid search engine. Exact (FTS5), hybrid (vector+lexical with RRF fusion), similar (vector-only) modes. Format filtering, document caching. 10 tests.
 - **`ignore.zig`** (607 lines) — Gitignore-compatible pattern matcher. Globs (`*`, `**`, `?`), negation, dir-only, anchored patterns, last-match-wins. Built-in defaults. 14 tests.
 

@@ -125,14 +125,21 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# 6. index with no path exits non-zero
+# 6. index with no path defaults to the current directory
 # ──────────────────────────────────────────────
 out="" ; err="" ; rc=""
-capture "$BINARY" index --db "$DB"
-if [ "$rc" -ne 0 ] && echo "$err" | grep -qi "error"; then
-	pass "index with no path exits non-zero"
+NOPATH_DIR="$TEST_DIR/nopath"
+mkdir -p "$NOPATH_DIR"
+printf '# Default Dir Doc\n\nContent indexed via cwd default.\n' > "$NOPATH_DIR/doc.md"
+NOPATH_DB="$NOPATH_DIR/idx.db"
+_prev_cwd="$PWD"
+cd "$NOPATH_DIR"
+capture "$BINARY" index --db "$NOPATH_DB"
+cd "$_prev_cwd"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
+	pass "index with no path defaults to current directory"
 else
-	fail "index with no path exits non-zero" "rc=$rc"
+	fail "index with no path defaults to current directory" "rc=$rc out=$out err=$err"
 fi
 
 # ──────────────────────────────────────────────

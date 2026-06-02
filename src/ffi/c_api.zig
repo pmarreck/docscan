@@ -558,39 +558,56 @@ export fn docscan_index_file(
 	};
 	defer chunker.freeChunks(gpa, chunks);
 
-	// Insert document
-	const doc_id = storage.insertDocument(
-		&d.db,
-		path_slice,
-		format_slice,
-		if (doc.title) |t| t else null,
-		hash_slice,
-		null,
-	) catch {
+	// Wrap the whole per-file insert in ONE transaction. Without this each
+	// insertChunk/insertEmbedding is its own autocommit (fsync per row) —
+	// thousands of fsyncs for a large document, which is catastrophically slow
+	// and appears to hang when the DB is on a network filesystem. The
+	// transaction also makes indexing atomic per file: any mid-insert error
+	// ROLLBACKs so no partial/orphan document is left behind.
+	storage.beginTransaction(&d.db) catch {
 		writeSqliteError(err_buf, err_buf_len, &d.db);
 		return -1;
 	};
 
-	// Insert chunks + embeddings
-	for (chunks, 0..) |chunk, idx| {
-		const chunk_id = storage.insertChunk(&d.db, doc_id, chunk) catch {
-			writeSqliteError(err_buf, err_buf_len, &d.db);
-			return -1;
-		};
+	const insert_ok = blk: {
+		const doc_id = storage.insertDocument(
+			&d.db,
+			path_slice,
+			format_slice,
+			if (doc.title) |t| t else null,
+			hash_slice,
+			null,
+		) catch break :blk false;
 
-		// Insert embedding if provided
-		if (embeddings) |emb_ptr| {
-			if (idx < num_chunks) {
-				const dim = d.db.embedding_dim;
-				const offset = idx * dim;
-				const emb_slice = emb_ptr[offset .. offset + dim];
-				storage.insertEmbedding(&d.db, chunk_id, emb_slice) catch {
-					writeSqliteError(err_buf, err_buf_len, &d.db);
-					return -1;
-				};
+		// Insert chunks + embeddings
+		for (chunks, 0..) |chunk, idx| {
+			const chunk_id = storage.insertChunk(&d.db, doc_id, chunk) catch break :blk false;
+
+			// Insert embedding if provided
+			if (embeddings) |emb_ptr| {
+				if (idx < num_chunks) {
+					const dim = d.db.embedding_dim;
+					const offset = idx * dim;
+					const emb_slice = emb_ptr[offset .. offset + dim];
+					storage.insertEmbedding(&d.db, chunk_id, emb_slice) catch break :blk false;
+				}
 			}
 		}
+		break :blk true;
+	};
+
+	if (!insert_ok) {
+		// Capture the sqlite error message before ROLLBACK resets connection state.
+		writeSqliteError(err_buf, err_buf_len, &d.db);
+		storage.rollbackTransaction(&d.db) catch {};
+		return -1;
 	}
+
+	storage.commitTransaction(&d.db) catch {
+		writeSqliteError(err_buf, err_buf_len, &d.db);
+		storage.rollbackTransaction(&d.db) catch {};
+		return -1;
+	};
 
 	return 0;
 }

@@ -75,6 +75,7 @@
 #endif
 
 #include <stdatomic.h>
+#include <signal.h>
 #include "docscan_core.h"
 #include "embed_util.h"
 
@@ -1971,7 +1972,7 @@ static void print_help(void) {
 		"  docscan <command> [args...] [flags...]\n"
 		"\n"
 		"%sCOMMANDS%s\n"
-		"  index <path>          Index a directory or file\n"
+		"  index [path]          Index a directory or file (default: current directory)\n"
 		"  update [path]         Re-index changed files only\n"
 		"  search <query>        Search indexed documents\n"
 		"  normalize              Normalize text from stdin (word rejoining, dehyphenation)\n"
@@ -4984,6 +4985,13 @@ int main(int argc, char** argv) {
 	fprintf(stderr, "\033[33mDEBUG BUILD\033[0m\n");
 #endif
 
+#ifndef _WIN32
+	/* A broken embedding-server connection (peer resets/closes mid-write) must
+	 * surface as a write error we retry/defer on — not kill the process with
+	 * SIGPIPE. */
+	signal(SIGPIPE, SIG_IGN);
+#endif
+
 	/* Detect terminal for color defaults */
 	if (!isatty(STDOUT_FILENO)) {
 		g_use_color = 0;
@@ -5295,12 +5303,8 @@ int main(int argc, char** argv) {
 
 	/* Dispatch command */
 	if (strcmp(command, "index") == 0) {
-		target_path = (positional_count > 0) ? positionals[0] : NULL;
-		if (!target_path) {
-			err_msg("index requires a path argument");
-			fprintf(stderr, "Usage: docscan index <path>\n");
-			return 1;
-		}
+		/* Default to the current directory when no path is given (mirrors update). */
+		target_path = (positional_count > 0) ? positionals[0] : ".";
 		return cmd_index(db_path_arg, target_path, model, 0);
 	}
 

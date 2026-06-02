@@ -92,7 +92,10 @@ int main(int argc, char** argv) {
 		if (cl < 0) continue;
 
 		/* Read request: headers until \r\n\r\n, then Content-Length bytes. */
-		char buf[1 << 16];
+		/* 8 MiB static buffer (single-threaded server) — large embedding
+		 * batches produce multi-MB request bodies; a small buffer would
+		 * truncate and force an early close, SIGPIPE-killing the client. */
+		static char buf[8 << 20];
 		size_t total = 0;
 		ssize_t n;
 		char* hdr_end = NULL;
