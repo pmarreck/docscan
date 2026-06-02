@@ -20,6 +20,9 @@ run_suite() {
 	fi
 }
 
+# Pure-C unit tests for embedding-failure helpers (no nix needed)
+run_suite "embed-util" tests/unit/run-embed-util
+
 # Zig unit tests via Nix (sandboxed)
 run_suite "unit" nix build ".#checks.$(nix eval --impure --raw --expr 'builtins.currentSystem').test" --print-build-logs
 
@@ -36,6 +39,11 @@ fi
 # Integration tests (require Ollama — skips gracefully if unavailable)
 if [ -x tests/integration/test-integration ]; then
 	run_suite "integration" nix develop -c tests/integration/test-integration
+fi
+
+# Embedding-failure integration tests (mock server — no Ollama needed)
+if [ -x tests/integration/test-embed-failures ]; then
+	run_suite "embed-failures" nix develop -c tests/integration/test-embed-failures
 fi
 
 if [ "$failed" -eq 0 ]; then

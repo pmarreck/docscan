@@ -44,25 +44,28 @@ All pure computation — no I/O.
 
 - **`main.c`** (2329 lines) — C CLI entry point, dogfoods the C FFI. Includes:
   - SHA-256 (FIPS 180-4) for content hashing
-  - POSIX socket HTTP client for Ollama `/api/embed`
+  - POSIX socket HTTP client (Ollama `/api/embed` + OpenAI `/v1/embeddings`) with per-request retry/backoff on transient failures (5xx, resets) and reported HTTP status. On permanent embedding failure, affected files are deferred (skipped, not stored with zero vectors) and re-indexed on a later run
   - Recursive directory walker with format filtering
   - Terminal-aware progress bar
   - MCP server (JSON-RPC 2.0 over stdio, 7 tools)
   - Commands: index, update, search, status, config, config debug, extract, normalize, preprocess, mcp-serve
   - Flags: --help, --about, --json, --limit, --exact, --similar, --model, --db, --no-color, --no-progress, --simple, --lang, --markdown, --format
 
+- **`embed_util.{c,h}`** — Pure (no-I/O) helpers for embedding-failure policy, separated from `main.c` for deterministic unit testing: `http_status_from_response` (parse HTTP code), `embed_is_retryable` (transient vs permanent classifier), `embed_backoff_ms` (exponential backoff schedule), `file_indices_for_chunk_range` (map a failed chunk range back to the files that own those chunks). 37 checks.
+
 ## Tests
 
 - **`src/all_tests.zig`** — Aggregated Zig unit tests (~153 tests across all modules)
 - **`tests/cli/test-cli`** — 68 Bash black-box CLI tests
 - **`tests/mcp/test-mcp`** (316 lines) — 14 Bash MCP protocol tests
-- **`tests/integration/`** — Placeholder for Ollama-dependent tests
-- **`tests/unit/`** — Test fixture directory
+- **`tests/integration/test-integration`** — Ollama-dependent integration tests (skips if unavailable)
+- **`tests/integration/test-embed-failures`** + **`mock-embed-server.c`** — 5 tests driving the real binary against a scriptable mock embedding server: transient-retry, single-threaded defer, and batch-path defer + re-index
+- **`tests/unit/test-embed-util.c`** + **`run-embed-util`** — Pure-C unit tests for `embed_util` (37 checks)
 
 ## Scripts
 
 - **`build`** — `nix build` wrapper (--test, --debug flags)
-- **`test`** — Master runner: unit + cli + mcp suites
+- **`test`** — Master runner: embed-util + unit + cli + mcp + integration + embed-failures suites
 - **`bm`** — Benchmark runner stub (rejects debug builds)
 - **`build_all`** — Cross-compile for 5 targets
 

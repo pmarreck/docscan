@@ -76,6 +76,7 @@
 
 #include <stdatomic.h>
 #include "docscan_core.h"
+#include "embed_util.h"
 
 /* Cross-platform absolute path check */
 static int is_absolute_path(const char* p) {
@@ -86,6 +87,19 @@ static int is_absolute_path(const char* p) {
 	return 0;
 #else
 	return (p[0] == '/');
+#endif
+}
+
+/* Portable millisecond sleep — used for embedding-retry backoff. */
+static void sleep_ms(int ms) {
+	if (ms <= 0) return;
+#ifdef _WIN32
+	Sleep((DWORD)ms);
+#else
+	struct timespec ts;
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	nanosleep(&ts, NULL);
 #endif
 }
 
@@ -116,6 +130,10 @@ typedef enum {
 static ApiDialect g_api_dialect = API_OLLAMA;
 static char g_embedding_url[512] = "http://127.0.0.1:11434";
 static char g_api_key[512] = "";
+/* Human-readable reason for the most recent embed_texts failure (diagnostics). */
+static char g_embed_last_error[256] = "";
+/* Total attempts per embedding request (1 initial try + retries) for transient failures. */
+#define EMBED_MAX_ATTEMPTS 4
 
 /* ── Color / formatting ─────────────────────────────────────────────── */
 
@@ -404,9 +422,10 @@ static const char* format_for_ext(const char* path) {
  */
 static char* http_post(const char* host, int port, const char* path_url,
                         const char* body, size_t body_len, size_t* out_len,
-                        const char* auth_header)
+                        const char* auth_header, int* out_status)
 {
 	ensure_wsa();
+	if (out_status) *out_status = 0;
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) return NULL;
 
@@ -541,8 +560,10 @@ static char* http_post(const char* host, int port, const char* path_url,
 	if (!body_start) { free(resp); return NULL; }
 	body_start += 4;
 
-	/* Check for HTTP 200 */
-	if (strncmp(resp, "HTTP/1.1 200", 12) != 0 && strncmp(resp, "HTTP/1.0 200", 12) != 0) {
+	/* Parse HTTP status; report via out_status. Only 200 yields a body. */
+	int http_status = http_status_from_response(resp);
+	if (out_status) *out_status = http_status;
+	if (http_status != 200) {
 		free(resp);
 		return NULL;
 	}
@@ -894,36 +915,68 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 	off += snprintf(body + off, body_cap - (size_t)off, "]}");
 	body[off] = '\0';
 
-	/* Send request */
-	size_t resp_len = 0;
-	char* resp = http_post(host, port, path_url, body, (size_t)off, &resp_len,
-	                        auth_hdr[0] ? auth_hdr : NULL);
-	free(body);
-
-	if (!resp) return NULL;
-
-	/* Parse embeddings from response — dialect-specific */
+	/* Send the request, retrying transient failures (connection reset,
+	 * premature close, 5xx, rate-limit) with exponential backoff. The same
+	 * `body` is reused across attempts and freed once after the loop. A
+	 * mismatched vector count or malformed body is also retried, since
+	 * inserting it would misalign the chunk<->vector mapping. On permanent
+	 * failure g_embed_last_error holds the reason for the caller to report. */
 	int max_dim = DEFAULT_EMBEDDING_DIM > 1024 ? DEFAULT_EMBEDDING_DIM : 1024;
 	int max_floats = num_texts * max_dim * 2; /* generous */
 	float* embeddings = malloc(sizeof(float) * (size_t)max_floats);
-	if (!embeddings) { free(resp); return NULL; }
-
-	int dim = 0;
-	int nvecs;
-	if (g_api_dialect == API_OPENAI) {
-		nvecs = parse_openai_embeddings_json(resp, embeddings, max_floats, &dim);
-	} else {
-		nvecs = parse_embeddings_json(resp, embeddings, max_floats, &dim);
-	}
-	free(resp);
-
-	if (nvecs == 0 || dim == 0) {
-		free(embeddings);
+	if (!embeddings) {
+		snprintf(g_embed_last_error, sizeof(g_embed_last_error), "out of memory");
+		free(body);
 		return NULL;
 	}
 
-	*out_dim = dim;
-	return embeddings;
+	float* result = NULL; /* set on success */
+	for (int attempt = 0; attempt < EMBED_MAX_ATTEMPTS; attempt++) {
+		if (attempt > 0) sleep_ms(embed_backoff_ms(attempt - 1));
+
+		size_t resp_len = 0;
+		int status = 0;
+		char* resp = http_post(host, port, path_url, body, (size_t)off, &resp_len,
+		                        auth_hdr[0] ? auth_hdr : NULL, &status);
+
+		if (!resp) {
+			if (status)
+				snprintf(g_embed_last_error, sizeof(g_embed_last_error), "HTTP %d", status);
+			else
+				snprintf(g_embed_last_error, sizeof(g_embed_last_error), "connection failed");
+			if (embed_is_retryable(status)) continue; /* transient — retry */
+			break; /* permanent (e.g. 400/401/403) — give up */
+		}
+
+		int dim = 0;
+		int nvecs;
+		if (g_api_dialect == API_OPENAI) {
+			nvecs = parse_openai_embeddings_json(resp, embeddings, max_floats, &dim);
+		} else {
+			nvecs = parse_embeddings_json(resp, embeddings, max_floats, &dim);
+		}
+		free(resp);
+
+		if (nvecs == 0 || dim == 0) {
+			snprintf(g_embed_last_error, sizeof(g_embed_last_error),
+			         "malformed/truncated embedding response");
+			continue; /* likely a partial read — retry */
+		}
+		if (nvecs != num_texts) {
+			snprintf(g_embed_last_error, sizeof(g_embed_last_error),
+			         "expected %d vectors, got %d", num_texts, nvecs);
+			continue; /* count mismatch would misalign — retry */
+		}
+
+		g_embed_last_error[0] = '\0';
+		*out_dim = dim;
+		result = embeddings;
+		break;
+	}
+
+	free(body);
+	if (!result) { free(embeddings); return NULL; }
+	return result;
 }
 
 /* Check if the embedding server is reachable by connecting to its port. */
@@ -2867,6 +2920,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 	progress_init(&prog, fl.count);
 
 	int indexed = 0, skipped = 0, errors = 0;
+	int deferred = 0; /* files skipped due to embedding-batch failures; retried next run */
 
 #ifndef _WIN32
 	if (g_num_threads > 1) {
@@ -2966,6 +3020,10 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 		float* all_embeddings = NULL;
 		int emb_dim = 0;
+		/* Per-file flag: set when any of a file's chunks were in a batch that
+		 * permanently failed to embed. Such files are NOT inserted, so a later
+		 * re-run re-indexes them instead of storing zero/garbage vectors. */
+		unsigned char* failed_file = calloc((size_t)fl.count, 1);
 
 		if (have_embedder && total_chunks > 0) {
 			/* Build flat array of ALL chunk texts */
@@ -3018,12 +3076,21 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 							       (size_t)batch_size * (size_t)dim * sizeof(float));
 							free(batch_emb);
 						} else {
-							/* Batch failed — zero-fill so indices stay aligned */
+							/* Batch permanently failed (embed_texts already retried
+							 * transient errors). Zero-fill defensively, then mark every
+							 * file owning a chunk in this batch for re-index so we never
+							 * insert a partially/zero-embedded document. */
 							if (emb_dim > 0) {
 								memset(&all_embeddings[batch_start * emb_dim], 0,
 								       (size_t)batch_size * (size_t)emb_dim * sizeof(float));
 							}
-							warn_msg("embedding batch %d/%d failed", batch_idx + 1, total_batches);
+							if (failed_file) {
+								file_indices_for_chunk_range(file_chunk_offsets, fl.count,
+									total_chunks, batch_start, batch_size, failed_file);
+							}
+							warn_msg("embedding batch %d/%d failed (%s) — affected files deferred for re-index",
+								batch_idx + 1, total_batches,
+								g_embed_last_error[0] ? g_embed_last_error : "unknown error");
 						}
 						progress_update(&prog, batch_start + batch_size, NULL);
 					}
@@ -3057,6 +3124,26 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 			if (!r->needs_index) {
 				skipped++;
+				continue;
+			}
+
+			/* An embedding batch covering this file failed permanently. Defer
+			 * it: leave any existing indexed data untouched and skip insertion
+			 * so a later run re-indexes it, rather than storing zero vectors.
+			 * Still advance the embedding offset (same guard as the insert path)
+			 * to keep subsequent files aligned. */
+			if (failed_file && failed_file[i]) {
+				if (all_embeddings && emb_dim > 0 && r->chunk_text_count > 0)
+					emb_global_offset += r->chunk_text_count;
+				deferred++;
+				free(r->file_data);
+				r->file_data = NULL;
+				if (r->chunk_texts) {
+					for (int t = 0; t < r->chunk_text_count; t++)
+						free(r->chunk_texts[t]);
+					free(r->chunk_texts);
+					r->chunk_texts = NULL;
+				}
 				continue;
 			}
 
@@ -3099,6 +3186,7 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		progress_update(&prog, fl.count, NULL);
 
 		free(all_embeddings);
+		free(failed_file);
 		free(results);
 
 	} else
@@ -3140,12 +3228,13 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 				continue;
 			}
 
-			/* Remove old document if it exists (for re-indexing) */
-			docscan_remove_document(db, fpath, err_buf, sizeof(err_buf));
-
-			/* Get chunk count by calling docscan_chunk */
+			/* Compute embeddings first; only remove + insert when they
+			 * succeed, so a deferred file (embedding failed) keeps any prior
+			 * indexed data untouched and is retried on a later run rather than
+			 * being stored text-only or with zero vectors. */
 			float* embeddings = NULL;
 			uint32_t num_chunks = 0;
+			int embed_failed = 0;
 
 			if (have_embedder) {
 				char* chunks_json = docscan_chunk(file_data, file_len, fpath, fmt,
@@ -3161,6 +3250,8 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 							embeddings = embed_texts(model, texts, text_count, &dim);
 							if (embeddings) {
 								num_chunks = (uint32_t)text_count;
+							} else {
+								embed_failed = 1;
 							}
 							for (int t = 0; t < text_count; t++) free(texts[t]);
 							free(texts);
@@ -3169,6 +3260,18 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 					docscan_free(chunks_json);
 				}
 			}
+
+			/* Embedding was expected but failed (after retries) — defer. */
+			if (embed_failed) {
+				warn_msg("embedding failed for %s (%s) — deferred for re-index", fpath,
+					g_embed_last_error[0] ? g_embed_last_error : "unknown error");
+				free(file_data);
+				deferred++;
+				continue;
+			}
+
+			/* Remove old document if it exists (for re-indexing) */
+			docscan_remove_document(db, fpath, err_buf, sizeof(err_buf));
 
 			/* Index the file */
 			int rc = docscan_index_file(db, file_data, file_len, fpath, fmt,
@@ -3193,8 +3296,8 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 
 	/* Summary */
 	if (g_json_output) {
-		printf("{\"indexed\":%d,\"skipped\":%d,\"errors\":%d}\n",
-		       indexed, skipped, errors);
+		printf("{\"indexed\":%d,\"skipped\":%d,\"errors\":%d,\"deferred\":%d}\n",
+		       indexed, skipped, errors, deferred);
 	} else {
 		time_t now = time(NULL);
 		double elapsed = difftime(now, prog.start_time);
@@ -3212,6 +3315,9 @@ static int cmd_index(const char* db_path_arg, const char* target_path,
 		if (errors > 0)
 			printf(", %s%s%d errors%s",
 				color(ANSI_RED), color(ANSI_BOLD), errors, color(ANSI_RESET));
+		if (deferred > 0)
+			printf(", %s%s%d deferred%s (embedding failures — re-run index to retry)",
+				color(ANSI_YELLOW), color(ANSI_BOLD), deferred, color(ANSI_RESET));
 		printf("\n");
 		if (elapsed >= 1.0) {
 			printf("  Time: %.1fs", elapsed);

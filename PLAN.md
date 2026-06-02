@@ -21,6 +21,8 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [x] Task 17: Ignore Patterns — 14 tests (2026-04-09)
 - [x] Task 18: Final Integration + Documentation (2026-04-09)
 - [x] `docscan preprocess` CLI command — PDF page rasterization + text isolation via FFI + reassembly (2026-04-13 EST)
+- [x] Embedding-failure robustness: per-request retry/backoff + HTTP-status diagnostics, and mark-for-reindex on permanent failure (no more silent zero-vector inserts) in both batch and single-threaded paths. New `cli/embed_util.{c,h}` (37 unit checks) + `tests/integration/test-embed-failures` (5 tests, mock server). Fixes intermittent batch failures observed on the 1200-file index run (2026-06-01 EST)
+- [x] flake.nix: default dev shell repaired — overlay disables broken unpaper/ocrmypdf upstream check phases in nixos-unstable so `nix develop` evaluates again (2026-06-01 EST)
 ## Deferred
 
 - [ ] Task 15: Integration Tests — requires running Ollama

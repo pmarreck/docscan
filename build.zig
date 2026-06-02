@@ -68,8 +68,8 @@ pub fn build(b: *std.Build) void {
 		.target = target,
 		.optimize = optimize,
 	});
-	exe_mod.addCSourceFile(.{
-		.file = b.path("cli/main.c"),
+	exe_mod.addCSourceFiles(.{
+		.files = &.{ "cli/main.c", "cli/embed_util.c" },
 		.flags = &.{"-std=c11"},
 	});
 	exe_mod.addIncludePath(b.path("ffi"));

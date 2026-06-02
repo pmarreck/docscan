@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Compile + run the pure-C unit tests for cli/embed_util.
+# Pure C, no project deps — uses the system C compiler. Part of ./test.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CC="${CC:-cc}"
+OUT="$(mktemp "${TMPDIR:-/tmp}/docscan-embed-util-XXXXXX")"
+trap 'rm -f "$OUT"' EXIT
+
+if ! "$CC" -std=c11 -Wall -Wextra -Werror \
+	"$SCRIPT_DIR/test-embed-util.c" \
+	"$ROOT_DIR/cli/embed_util.c" \
+	-o "$OUT"; then
+	echo "embed-util: COMPILE FAILED" >&2
+	exit 1
+fi
+
+"$OUT"
