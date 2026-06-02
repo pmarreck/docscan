@@ -9,7 +9,32 @@
 	outputs = { self, nixpkgs, flake-utils }:
 		flake-utils.lib.eachDefaultSystem (system:
 			let
-				pkgs = import nixpkgs { inherit system; };
+				pkgs = import nixpkgs {
+					inherit system;
+					overlays = [
+						# unpaper 7.0.0 is broken in current nixos-unstable: its own
+						# pytest suite fails AND the binary is SIGKILL'd at runtime, so
+						# ocrmypdf's test suite (which exercises unpaper) fails too. This
+						# blocked `nix develop` because ocrmypdf is in the default shell.
+						#
+						# docscan invokes ocrmypdf WITHOUT --clean/--deskew (see
+						# cli/main.c auto-preprocess), so it never calls unpaper — the
+						# broken unpaper is irrelevant to docscan's actual OCR path. We
+						# skip unpaper's check (so it builds) and ocrmypdf's check (so its
+						# unpaper-integration tests don't gate the package). Both build
+						# fine; only their test suites fail on the upstream regression.
+						(final: prev: {
+							unpaper = prev.unpaper.overrideAttrs (_: {
+								doCheck = false;
+								doInstallCheck = false;
+							});
+							ocrmypdf = prev.ocrmypdf.overrideAttrs (_: {
+								doCheck = false;
+								doInstallCheck = false;
+							});
+						})
+					];
+				};
 
 				sqlite-amalgamation = pkgs.fetchzip {
 					url = "https://www.sqlite.org/2024/sqlite-amalgamation-3450300.zip";
