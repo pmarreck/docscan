@@ -28,6 +28,7 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [x] Phase-2 embedding hang fixed: http_post had a connect timeout but no read timeout, so a server that accepts then stalls blocked read() forever. Added SO_RCVTIMEO/SO_SNDTIMEO (read bounded by DOCSCAN_HTTP_READ_TIMEOUT_SECS, default 120s) — a stalled connection now times out -> retry -> defer. Reproduced via a stalling mock (TDD: hang->recover), locked in as integration Test D (2026-06-02 EST)
 - [x] OLE2 DIFAT chain followed (ole2.zig): files >109 FAT sectors (>~7MB legacy Office/.doc) no longer silently misparse. Loop-guarded against malformed/cyclic chains (CorruptFAT). 2 new tests (2026-06-03 EST)
 - [x] Factored duplicated readU16/readU32 (ole2/zip/parser_doc) into shared src/core/endian.zig (2026-06-03 EST)
+- [x] Chunker oversized-chunk fix (root cause of HTTP 400 "input exceeds 8192 tokens"): oversized boundary-less content and single oversized paragraphs are now force-split to an embed-safe byte budget (max_chunk_tokens / tokens_per_byte, default 6000B) instead of being emitted whole up to the 256KB SQLite ceiling. 2 new tests; verified 100KB blob -> 17 chunks max 6000B (2026-06-03 EST)
 ## Deferred
 
 - [ ] Task 15: Integration Tests — requires running Ollama

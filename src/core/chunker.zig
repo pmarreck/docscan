@@ -90,9 +90,22 @@ fn splitOnSingleNewline(allocator: std.mem.Allocator, content: []const u8) ![]co
 	return try lines.toOwnedSlice(allocator);
 }
 
-/// Force-split content at max_chunk_bytes boundaries when no line boundaries exist.
-/// Tries to split at space boundaries to avoid breaking words.
+/// Maximum bytes per chunk that keeps the estimated token count within
+/// max_chunk_tokens, so a force-split never produces a chunk that overflows the
+/// embedding model's input limit. Capped by max_chunk_bytes (the SQLite/FTS5
+/// 32-bit size-field safety ceiling).
+fn embedSplitBytes(options: ChunkOptions) usize {
+	if (options.tokens_per_byte <= 0) return options.max_chunk_bytes;
+	const f: f32 = @as(f32, @floatFromInt(options.max_chunk_tokens)) / options.tokens_per_byte;
+	const budget: usize = @intFromFloat(f);
+	const b = if (budget == 0) 1 else budget;
+	return @min(b, options.max_chunk_bytes);
+}
+
+/// Force-split content into embed-safe pieces when no line boundaries exist.
+/// Tries to split at sentence/space boundaries to avoid breaking words.
 fn forceSplitByBytes(
+
 	allocator: std.mem.Allocator,
 	content: []const u8,
 	section_path: []const u8,
@@ -104,13 +117,14 @@ fn forceSplitByBytes(
 	page_physical: ?u32,
 	source_line: ?u32,
 ) !void {
+	const split_bytes = embedSplitBytes(options);
 	var offset: usize = 0;
 	var is_first = true;
 	while (offset < content.len) {
-		var end = @min(offset + options.max_chunk_bytes, content.len);
+		var end = @min(offset + split_bytes, content.len);
 		// Single backward scan: find best break point (sentence > word)
 		if (end < content.len) {
-			const min_scan = offset + options.max_chunk_bytes / 2;
+			const min_scan = offset + split_bytes / 2;
 			var best_word: usize = end; // stays at `end` if no word boundary found
 			var found_sentence = false;
 			var scan = end;
@@ -147,7 +161,40 @@ fn forceSplitByBytes(
 	}
 }
 
+/// Emit `text` as one chunk, or force-split it into embed-safe pieces if it
+/// exceeds the per-chunk token budget. `section_path` is consumed by the
+/// emitted chunk(s): the first piece takes it; any further pieces dupe it.
+fn emitOrSplit(
+	allocator: std.mem.Allocator,
+	text: []const u8,
+	section_path: []const u8,
+	parent_path: []const u8,
+	heading: ?[]const u8,
+	heading_level: u8,
+	options: ChunkOptions,
+	out: *std.ArrayListUnmanaged(ProtoChunk),
+	page_physical: ?u32,
+	source_line: ?u32,
+) !void {
+	if (estimateTokens(text, options.tokens_per_byte) <= options.max_chunk_tokens) {
+		const pp = try allocator.dupe(u8, parent_path);
+		try out.append(allocator, .{
+			.section_path = section_path,
+			.heading = heading,
+			.text = text,
+			.parent_path = pp,
+			.text_allocated = false,
+			.heading_level = heading_level,
+			.page_physical = page_physical,
+			.source_line = source_line,
+		});
+	} else {
+		try forceSplitByBytes(allocator, text, section_path, parent_path, heading, heading_level, options, out, page_physical, source_line);
+	}
+}
+
 fn splitParagraphs(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
+
 	var paragraphs: std.ArrayListUnmanaged([]const u8) = .empty;
 	defer paragraphs.deinit(allocator);
 
@@ -255,23 +302,9 @@ fn emitContentChunks(
 
 		if (paragraphs.len <= 1) {
 			allocator.free(paragraphs);
-			// No line boundaries at all — force-split at max_chunk_bytes to avoid
-			// overflowing SQLite/FTS5 32-bit internal size fields.
-			if (content.len > options.max_chunk_bytes) {
-				try forceSplitByBytes(allocator, content, section_path, parent_path, heading, heading_level, options, out, page_physical, source_line);
-			} else {
-				const pp = try allocator.dupe(u8, parent_path);
-				try out.append(allocator, .{
-					.section_path = section_path,
-					.heading = heading,
-					.text = content,
-					.parent_path = pp,
-					.text_allocated = false,
-					.heading_level = heading_level,
-					.page_physical = page_physical,
-					.source_line = source_line,
-				});
-			}
+			// No line boundaries at all — force-split into embed-safe pieces.
+			// (Reached only because token_count > max_chunk_tokens.)
+			try forceSplitByBytes(allocator, content, section_path, parent_path, heading, heading_level, options, out, page_physical, source_line);
 			return;
 		}
 	}
@@ -290,17 +323,7 @@ fn emitContentChunks(
 			// Emit current group [group_start..idx)
 			// The first group reuses the original section_path
 			const sp = if (group_start == 0) section_path else try allocator.dupe(u8, section_path);
-			const pp = try allocator.dupe(u8, parent_path);
-			try out.append(allocator, .{
-				.section_path = sp,
-				.heading = heading,
-				.text = buildGroupText(paragraphs[group_start..idx]),
-				.parent_path = pp,
-				.text_allocated = false,
-				.heading_level = heading_level,
-				.page_physical = page_physical,
-				.source_line = source_line,
-			});
+			try emitOrSplit(allocator, buildGroupText(paragraphs[group_start..idx]), sp, parent_path, heading, heading_level, options, out, page_physical, source_line);
 			group_start = idx;
 			group_tokens = para_tokens;
 			is_first_group = false;
@@ -314,17 +337,7 @@ fn emitContentChunks(
 	// Emit final group
 	if (group_start < paragraphs.len) {
 		const sp = if (group_start == 0) section_path else try allocator.dupe(u8, section_path);
-		const pp = try allocator.dupe(u8, parent_path);
-		try out.append(allocator, .{
-			.section_path = sp,
-			.heading = heading,
-			.text = buildGroupText(paragraphs[group_start..]),
-			.parent_path = pp,
-			.text_allocated = false,
-			.heading_level = heading_level,
-			.page_physical = page_physical,
-			.source_line = source_line,
-		});
+		try emitOrSplit(allocator, buildGroupText(paragraphs[group_start..]), sp, parent_path, heading, heading_level, options, out, page_physical, source_line);
 	}
 }
 
@@ -598,7 +611,46 @@ test "large section splits at paragraphs" {
 	}
 }
 
+test "oversized boundary-less content is force-split to the token budget" {
+	const allocator = testing.allocator;
+	// 1000 bytes with no spaces or newlines: one blob with no split points.
+	const blob = "X" ** 1000;
+	const sections = &[_]document.Section{
+		.{ .heading = "Blob", .level = 1, .content = blob, .children = &.{} },
+	};
+	const doc = makeDoc(sections);
+	const opts = ChunkOptions{ .max_chunk_tokens = 30, .min_chunk_tokens = 1, .tokens_per_byte = 0.25 };
+	const chunks = try chunk(allocator, doc, opts);
+	defer freeChunks(allocator, chunks);
+
+	// Must split (budget = 30/0.25 = 120 bytes) and no chunk may exceed the budget.
+	try testing.expect(chunks.len > 1);
+	for (chunks) |c| {
+		try testing.expect(estimateTokens(c.text, opts.tokens_per_byte) <= opts.max_chunk_tokens);
+	}
+}
+
+test "a single oversized paragraph is split, not emitted whole" {
+	const allocator = testing.allocator;
+	const small = "alpha beta gamma";
+	const big = "Z" ** 800; // one huge paragraph, no internal boundaries
+	const content = small ++ "\n\n" ++ big ++ "\n\n" ++ small;
+	const sections = &[_]document.Section{
+		.{ .heading = "Mix", .level = 1, .content = content, .children = &.{} },
+	};
+	const doc = makeDoc(sections);
+	const opts = ChunkOptions{ .max_chunk_tokens = 30, .min_chunk_tokens = 1, .tokens_per_byte = 0.25 };
+	const chunks = try chunk(allocator, doc, opts);
+	defer freeChunks(allocator, chunks);
+
+	// The big paragraph must be split; every chunk stays within the budget.
+	for (chunks) |c| {
+		try testing.expect(estimateTokens(c.text, opts.tokens_per_byte) <= opts.max_chunk_tokens);
+	}
+}
+
 test "small section merging" {
+
 	// 5 tiny sibling sections, each under min_chunk_tokens
 	const sections = &[_]document.Section{
 		.{ .heading = "A", .level = 1, .content = "tiny a", .children = &.{} },
