@@ -133,6 +133,9 @@ static char g_embedding_url[512] = "http://127.0.0.1:11434";
 static char g_api_key[512] = "";
 /* Human-readable reason for the most recent embed_texts failure (diagnostics). */
 static char g_embed_last_error[256] = "";
+/* Snippet of the most recent non-2xx HTTP response body (server-side reason,
+ * e.g. "input length exceeds model maximum"). Filled by http_post. */
+static char g_http_err_body[256] = "";
 /* Total attempts per embedding request (1 initial try + retries) for transient failures. */
 #define EMBED_MAX_ATTEMPTS 4
 /* Socket read-inactivity timeout (seconds) for embedding HTTP calls. Generous
@@ -432,6 +435,7 @@ static char* http_post(const char* host, int port, const char* path_url,
 {
 	ensure_wsa();
 	if (out_status) *out_status = 0;
+	g_http_err_body[0] = '\0';
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) return NULL;
 
@@ -590,9 +594,20 @@ static char* http_post(const char* host, int port, const char* path_url,
 	int http_status = http_status_from_response(resp);
 	if (out_status) *out_status = http_status;
 	if (http_status != 200) {
+		/* Capture a sanitized snippet of the error body for diagnostics — the
+		 * server usually explains a 400/422 (e.g. "input too long"). */
+		size_t blen = total - (size_t)(body_start - resp);
+		size_t n = blen < sizeof(g_http_err_body) - 1 ? blen : sizeof(g_http_err_body) - 1;
+		size_t j = 0;
+		for (size_t k = 0; k < n; k++) {
+			unsigned char ch = (unsigned char)body_start[k];
+			g_http_err_body[j++] = (ch < 0x20 || ch == 0x7f) ? ' ' : (char)ch;
+		}
+		g_http_err_body[j] = '\0';
 		free(resp);
 		return NULL;
 	}
+
 
 	size_t blen = total - (size_t)(body_start - resp);
 	char* result = malloc(blen + 1);
@@ -967,7 +982,8 @@ static float* embed_texts(const char* model, char** texts, int num_texts,
 
 		if (!resp) {
 			if (status)
-				snprintf(g_embed_last_error, sizeof(g_embed_last_error), "HTTP %d", status);
+				snprintf(g_embed_last_error, sizeof(g_embed_last_error), "HTTP %d%s%s", status,
+					g_http_err_body[0] ? ": " : "", g_http_err_body);
 			else
 				snprintf(g_embed_last_error, sizeof(g_embed_last_error), "connection failed");
 			if (embed_is_retryable(status)) continue; /* transient — retry */
