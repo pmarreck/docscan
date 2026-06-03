@@ -809,13 +809,10 @@ fn freeSectionContents(allocator: Allocator, section: Section) void {
 
 // ── Utility functions ─────────────────────────────────────────────────
 
-fn readU16(data: []const u8, offset: usize) u16 {
-	return std.mem.readInt(u16, data[offset..][0..2], .little);
-}
-
-fn readU32(data: []const u8, offset: usize) u32 {
-	return std.mem.readInt(u32, data[offset..][0..4], .little);
-}
+// Little-endian readers shared across the binary-format parsers.
+const endian = @import("endian.zig");
+const readU16 = endian.readU16;
+const readU32 = endian.readU32;
 
 // ── Tests ─────────────────────────────────────────────────────────────
 

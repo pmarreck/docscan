@@ -153,15 +153,10 @@ fn inflateData(allocator: Allocator, compressed: []const u8) ![]const u8 {
 	return try aw.toOwnedSlice();
 }
 
-/// Read a little-endian u16 from a byte slice at an offset.
-fn readU16(data: []const u8, offset: usize) u16 {
-	return std.mem.readInt(u16, data[offset..][0..2], .little);
-}
-
-/// Read a little-endian u32 from a byte slice at an offset.
-fn readU32(data: []const u8, offset: usize) u32 {
-	return std.mem.readInt(u32, data[offset..][0..4], .little);
-}
+// Little-endian readers shared across the binary-format parsers.
+const endian = @import("endian.zig");
+const readU16 = endian.readU16;
+const readU32 = endian.readU32;
 
 // ── ZIP builder for tests ────────────────────────────────────────────
 

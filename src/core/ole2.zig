@@ -84,22 +84,47 @@ pub fn parseHeader(allocator: Allocator, data: []const u8) !Ole2Header {
 	// DIFAT count (offset 72)
 	const difat_count = readU32(data, 72);
 
-	// Read FAT sector numbers from the header DIFAT (bytes 76..511)
-	// Up to 109 entries in the header itself
+	// FAT sector numbers: the first 109 live in the header DIFAT (bytes 76..511);
+	// any beyond that are stored in the DIFAT chain (MS-CFB §2.5). Collect the
+	// full set so files with >109 FAT sectors (>~7 MB with 512-byte sectors) parse
+	// correctly instead of silently truncating the FAT.
 	const max_header_difat: u32 = 109;
-	const count = @min(fat_sector_count, max_header_difat);
+	const count = fat_sector_count;
 
 	var fat_sectors = try allocator.alloc(u32, count);
 	errdefer allocator.free(fat_sectors);
 
-	for (0..count) |i| {
-		const offset: usize = 76 + i * 4;
-		fat_sectors[i] = readU32(data, offset);
+	const header_n = @min(count, max_header_difat);
+	for (0..header_n) |i| {
+		fat_sectors[i] = readU32(data, 76 + i * 4);
 	}
 
-	// If there are more than 109 FAT sectors, we'd need to follow the DIFAT chain.
-	// For v1, support up to 109 FAT sectors (covers files up to ~7MB with 512-byte sectors).
-	// TODO: Follow DIFAT chain for larger files.
+	// Walk the DIFAT chain for the remaining FAT-sector entries. Each DIFAT
+	// sector holds (sector_size/4 - 1) FAT-sector numbers followed by a pointer
+	// to the next DIFAT sector (or FAT_END_OF_CHAIN).
+	if (count > max_header_difat) {
+		const entries_per_difat: u32 = sector_size / 4 - 1;
+		var idx: u32 = max_header_difat;
+		var difat_sec: u32 = difat_start;
+		var visited: u32 = 0;
+		while (idx < count and difat_sec != FAT_END_OF_CHAIN and difat_sec != FAT_FREE_SECTOR) {
+			// Bound iterations by the declared DIFAT count to reject malformed
+			// or cyclic chains rather than looping forever.
+			if (visited >= difat_count) return Ole2Error.CorruptFAT;
+			visited += 1;
+
+			const off = sectorOffset(difat_sec, sector_size);
+			if (off + @as(usize, sector_size) > data.len) return Ole2Error.SectorOverflow;
+
+			var j: u32 = 0;
+			while (j < entries_per_difat and idx < count) : (j += 1) {
+				fat_sectors[idx] = readU32(data, off + @as(usize, j) * 4);
+				idx += 1;
+			}
+			difat_sec = readU32(data, off + @as(usize, entries_per_difat) * 4);
+		}
+		if (idx < count) return Ole2Error.CorruptFAT; // chain ended before all FAT sectors were found
+	}
 
 	return Ole2Header{
 		.sector_size = sector_size,
@@ -376,15 +401,10 @@ pub fn freeStreamList(allocator: Allocator, list: [][]const u8) void {
 
 // ── Utility functions ─────────────────────────────────────────────────
 
-/// Read a little-endian u16 from a byte slice at the given offset.
-fn readU16(data: []const u8, offset: usize) u16 {
-	return std.mem.readInt(u16, data[offset..][0..2], .little);
-}
-
-/// Read a little-endian u32 from a byte slice at the given offset.
-fn readU32(data: []const u8, offset: usize) u32 {
-	return std.mem.readInt(u32, data[offset..][0..4], .little);
-}
+// Little-endian readers shared across the binary-format parsers.
+const endian = @import("endian.zig");
+const readU16 = endian.readU16;
+const readU32 = endian.readU32;
 
 /// Convert a UTF-16LE byte slice to a UTF-8 string.
 /// Caller owns the returned slice.
@@ -590,7 +610,78 @@ test "OLE2: parse header — verify sector size and FAT sector count" {
 	try testing.expectEqual(@as(u32, 1), header.dir_start);
 }
 
+test "OLE2: parseHeader follows DIFAT chain for >109 FAT sectors" {
+	const allocator = testing.allocator;
+	// 1024 bytes: 512-byte header + one DIFAT sector at sector 0 (offset 512).
+	const buf = try allocator.alloc(u8, 1024);
+	defer allocator.free(buf);
+	@memset(buf, 0);
+
+	@memcpy(buf[0..8], &ole2_magic);
+	std.mem.writeInt(u16, buf[28..30], 0xFFFE, .little); // byte order
+	std.mem.writeInt(u16, buf[30..32], 9, .little); // sector size 2^9 = 512
+	std.mem.writeInt(u16, buf[32..34], 6, .little); // mini sector 2^6 = 64
+	std.mem.writeInt(u32, buf[44..48], 110, .little); // 110 FAT sectors total (>109)
+	std.mem.writeInt(u32, buf[68..72], 0, .little); // DIFAT chain starts at sector 0
+	std.mem.writeInt(u32, buf[72..76], 1, .little); // 1 DIFAT sector
+
+	// 109 FAT-sector numbers in the header DIFAT (bytes 76..511): values 0..108.
+	for (0..109) |i| {
+		std.mem.writeInt(u32, buf[76 + i * 4 ..][0..4], @intCast(i), .little);
+	}
+
+	// DIFAT sector at offset 512: entry 0 holds the 110th FAT sector (109);
+	// the remaining entries are FREE; the final u32 is the next-DIFAT pointer.
+	const dsec: usize = 512;
+	std.mem.writeInt(u32, buf[dsec..][0..4], 109, .little);
+	for (1..127) |j| {
+		std.mem.writeInt(u32, buf[dsec + j * 4 ..][0..4], FAT_FREE_SECTOR, .little);
+	}
+	std.mem.writeInt(u32, buf[dsec + 127 * 4 ..][0..4], FAT_END_OF_CHAIN, .little);
+
+	const header = try parseHeader(allocator, buf);
+	defer freeHeader(allocator, header);
+
+	// All 110 FAT sectors must be collected — header (0..108) + DIFAT chain (109).
+	try testing.expectEqual(@as(u32, 110), header.fat_sector_count);
+	try testing.expectEqual(@as(usize, 110), header.fat_sectors.len);
+	for (0..110) |i| {
+		try testing.expectEqual(@as(u32, @intCast(i)), header.fat_sectors[i]);
+	}
+}
+
+test "OLE2: parseHeader rejects a DIFAT chain longer than its declared count" {
+	const allocator = testing.allocator;
+	// Needs 240 FAT sectors: 109 header + 127 from one DIFAT sector = 236, so a
+	// second DIFAT sector is required — but difat_count says 1. The chain pointer
+	// to a second sector must be rejected (CorruptFAT), not followed forever.
+	const buf = try allocator.alloc(u8, 1024);
+	defer allocator.free(buf);
+	@memset(buf, 0);
+
+	@memcpy(buf[0..8], &ole2_magic);
+	std.mem.writeInt(u16, buf[28..30], 0xFFFE, .little);
+	std.mem.writeInt(u16, buf[30..32], 9, .little);
+	std.mem.writeInt(u16, buf[32..34], 6, .little);
+	std.mem.writeInt(u32, buf[44..48], 240, .little); // 240 FAT sectors total
+	std.mem.writeInt(u32, buf[68..72], 0, .little); // DIFAT chain starts at sector 0
+	std.mem.writeInt(u32, buf[72..76], 1, .little); // but only 1 DIFAT sector declared
+	for (0..109) |i| {
+		std.mem.writeInt(u32, buf[76 + i * 4 ..][0..4], @intCast(i), .little);
+	}
+	const dsec: usize = 512;
+	for (0..127) |j| {
+		std.mem.writeInt(u32, buf[dsec + j * 4 ..][0..4], @intCast(109 + j), .little);
+	}
+	// Next-DIFAT pointer claims a second sector, exceeding difat_count.
+	std.mem.writeInt(u32, buf[dsec + 127 * 4 ..][0..4], 1, .little);
+
+	try testing.expectError(Ole2Error.CorruptFAT, parseHeader(allocator, buf));
+}
+
 test "OLE2: read stream — extract named stream content" {
+
+
 	const test_data = "Hello, OLE2! This is test stream content.";
 	const ole2 = try buildTestOle2(testing.allocator, "TestStream", test_data);
 	defer testing.allocator.free(ole2);
