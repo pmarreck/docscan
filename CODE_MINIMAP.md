@@ -44,7 +44,7 @@ All pure computation — no I/O.
 
 - **`main.c`** (2329 lines) — C CLI entry point, dogfoods the C FFI. Includes:
   - SHA-256 (FIPS 180-4) for content hashing
-  - POSIX socket HTTP client (Ollama `/api/embed` + OpenAI `/v1/embeddings`) with per-request retry/backoff on transient failures (5xx, resets) and reported HTTP status. On permanent embedding failure, affected files are deferred (skipped, not stored with zero vectors) and re-indexed on a later run
+  - POSIX socket HTTP client (Ollama `/api/embed` + OpenAI `/v1/embeddings`) with connect + read/write timeouts (read bounded by `DOCSCAN_HTTP_READ_TIMEOUT_SECS`, default 120s, so a stalled server connection is retried/deferred instead of hanging), per-request retry/backoff on transient failures (5xx, resets, timeouts) and reported HTTP status. SIGPIPE is ignored so a dropped connection defers rather than killing the process. On permanent embedding failure, affected files are deferred (skipped, not stored with zero vectors) and re-indexed on a later run
   - Recursive directory walker with format filtering
   - Terminal-aware progress bar
   - MCP server (JSON-RPC 2.0 over stdio, 7 tools)

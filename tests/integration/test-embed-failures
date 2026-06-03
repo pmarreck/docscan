@@ -46,11 +46,12 @@ fi
 # Args: <fail_csv>. Sets globals MOCK_PID and PORT.
 start_mock() {
 	local fail_csv="$1"
+	local stall_csv="${2:-}"
 	# Pick a port; retry a few times if taken.
 	local attempt port
 	for attempt in 1 2 3 4 5; do
 		port=$(( 20000 + (RANDOM % 20000) ))
-		"$MOCK_BIN" "$port" 8 "$fail_csv" > "$WORK/mock.out" 2>"$WORK/mock.err" &
+		"$MOCK_BIN" "$port" 8 "$fail_csv" "$stall_csv" > "$WORK/mock.out" 2>"$WORK/mock.err" &
 		MOCK_PID=$!
 		# Wait for readiness line (bounded by a poll, not a fixed sleep).
 		local i
@@ -191,7 +192,41 @@ else
 	fail "batch defer" "mock failed to start"
 fi
 
+# ---------- Test D: a stalled connection times out and defers (no hang) ----------
+# The mock accepts the batch request then never responds (req 2..5); the probe
+# (req 1) succeeds. With a short read timeout docscan must time out, retry, then
+# defer — finishing quickly instead of blocking in read() forever. A timeout
+# tool is a hard backstop: if the read-timeout regressed, docscan would hang and
+# be killed with rc 124 -> test fails.
+TIMEOUT_CMD=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD="gtimeout"; fi
+
+if [ -z "$TIMEOUT_CMD" ]; then
+	printf '  \033[33mSKIP\033[0m: stall recovery (no timeout/gtimeout available)\n'
+else
+	mkdir -p "$WORK/corpusD"
+	printf '# Stall Doc\n\nContent to embed against a stalling server.\n' > "$WORK/corpusD/doc.md"
+	if start_mock "" "2,3,4,5"; then
+		out=$(DOCSCAN_DB="$WORK/dbD.db" DOCSCAN_HTTP_READ_TIMEOUT_SECS=2 \
+			DOCSCAN_EMBEDDING_API="openai" DOCSCAN_EMBEDDING_URL="http://127.0.0.1:$PORT" \
+			DOCSCAN_MODEL="mock" DOCSCAN_EMBEDDING_API_KEY="test" \
+			"$TIMEOUT_CMD" 30 "$BINARY" index "$WORK/corpusD" --json --threads 2 --no-progress 2>"$WORK/idx.err")
+		rc=$?
+		dfr=$(json_field "$out" deferred)
+		if [ "$rc" != "124" ] && [ "$dfr" = "1" ]; then
+			pass "stalled connection times out and defers (no hang)"
+		else
+			fail "stall recovery" "rc=$rc (124=hang), expected deferred=1, got '$out' (stderr: $(tr '\n' '|' <"$WORK/idx.err"))"
+		fi
+		stop_mock
+	else
+		fail "stall recovery" "mock failed to start"
+	fi
+fi
+
 echo
 printf '%d tests, %d passed, %d failed\n' "$tests" "$((tests - errors))" "$errors"
 exit "$errors"
+
 

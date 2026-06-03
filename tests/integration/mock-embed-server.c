@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
 	int port = atoi(argv[1]);
 	int dim = atoi(argv[2]);
 	const char* fail_csv = argv[3];
+	const char* stall_csv = (argc > 4) ? argv[4] : "";
 	if (dim < 1) dim = 8;
 
 	signal(SIGPIPE, SIG_IGN);
@@ -121,6 +122,13 @@ int main(int argc, char** argv) {
 			continue;
 		}
 		request_no++;
+		/* Stalled request: hold the connection open without responding so the
+		 * client blocks in read() — exercises the read-timeout path. */
+		if (in_fail_list(stall_csv, request_no)) {
+			sleep(3600);
+			close(cl);
+			continue;
+		}
 		int ninputs = count_input_strings(buf);
 		if (ninputs < 1) ninputs = 1;
 

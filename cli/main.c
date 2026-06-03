@@ -135,6 +135,11 @@ static char g_api_key[512] = "";
 static char g_embed_last_error[256] = "";
 /* Total attempts per embedding request (1 initial try + retries) for transient failures. */
 #define EMBED_MAX_ATTEMPTS 4
+/* Socket read-inactivity timeout (seconds) for embedding HTTP calls. Generous
+ * by default since large batches can take ~30s of server processing; bounds a
+ * stalled connection so it is retried/deferred instead of hanging forever.
+ * Override via DOCSCAN_HTTP_READ_TIMEOUT_SECS. */
+static int g_http_read_timeout_secs = 120;
 
 /* ── Color / formatting ─────────────────────────────────────────────── */
 
@@ -498,8 +503,27 @@ static char* http_post(const char* host, int port, const char* path_url,
 #endif
 	}
 
+	/* Bound read/write so a server that accepts then stalls (no response) times
+	 * out and is retried/deferred instead of blocking read() forever. */
+#ifdef _WIN32
+	{
+		DWORD rcv = (DWORD)g_http_read_timeout_secs * 1000;
+		DWORD snd = 30000;
+		setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv, sizeof(rcv));
+		setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&snd, sizeof(snd));
+	}
+#else
+	{
+		struct timeval rcv = { .tv_sec = g_http_read_timeout_secs, .tv_usec = 0 };
+		struct timeval snd = { .tv_sec = 30, .tv_usec = 0 };
+		setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
+		setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+	}
+#endif
+
 	/* Build HTTP request */
 	char header[1024];
+
 	int hlen;
 	if (auth_header && auth_header[0]) {
 		hlen = snprintf(header, sizeof(header),
@@ -549,7 +573,8 @@ static char* http_post(const char* host, int port, const char* path_url,
 #else
 		ssize_t n = read(sockfd, resp + total, HTTP_BUF_SIZE - total - 1);
 #endif
-		if (n <= 0) break;
+		if (n < 0) { free(resp); close(sockfd); return NULL; } /* timeout/error — caller retries */
+		if (n == 0) break; /* peer closed — response complete */
 		total += (size_t)n;
 		if (total >= HTTP_BUF_SIZE - 1) break;
 	}
@@ -4991,6 +5016,14 @@ int main(int argc, char** argv) {
 	 * SIGPIPE. */
 	signal(SIGPIPE, SIG_IGN);
 #endif
+
+	{
+		const char* rt = getenv("DOCSCAN_HTTP_READ_TIMEOUT_SECS");
+		if (rt && rt[0]) {
+			int v = atoi(rt);
+			if (v > 0) g_http_read_timeout_secs = v;
+		}
+	}
 
 	/* Detect terminal for color defaults */
 	if (!isatty(STDOUT_FILENO)) {

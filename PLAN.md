@@ -25,6 +25,7 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [x] flake.nix: default dev shell repaired — overlay disables broken unpaper/ocrmypdf upstream check phases in nixos-unstable so `nix develop` evaluates again (2026-06-01 EST)
 - [x] Phase-3 insertion hang fixed: wrap per-file chunk/embedding inserts in a single transaction + `synchronous=NORMAL`/`busy_timeout` pragmas. ~112s -> a few seconds for 1715 chunks; makes indexing usable when the DB is on a network filesystem. Also: ignore SIGPIPE so a dropped embedding-server connection defers instead of killing the process. 2 new storage tests (2026-06-02 EST)
 - [x] `docscan index` with no path now defaults to the current directory (mirrors `update`) (2026-06-02 EST)
+- [x] Phase-2 embedding hang fixed: http_post had a connect timeout but no read timeout, so a server that accepts then stalls blocked read() forever. Added SO_RCVTIMEO/SO_SNDTIMEO (read bounded by DOCSCAN_HTTP_READ_TIMEOUT_SECS, default 120s) — a stalled connection now times out -> retry -> defer. Reproduced via a stalling mock (TDD: hang->recover), locked in as integration Test D (2026-06-02 EST)
 ## Deferred
 
 - [ ] Task 15: Integration Tests — requires running Ollama
