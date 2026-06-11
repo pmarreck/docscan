@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
 		"Optimization mode (default: ReleaseFast)",
 	) orelse .ReleaseFast;
 
+	const enable_uchardet = b.option(bool, "enable_uchardet", "Link uchardet (C++ via uchardetz) for charset detection; disabled for the wasm slice (default true)") orelse true;
+	const native_opts = b.addOptions();
+	native_opts.addOption(bool, "enable_uchardet", enable_uchardet);
+
 	// SQLite + sqlite-vec from dependency
 	const sqlite_vec_dep = b.dependency("sqlite_vec", .{
 		.target = target,
@@ -42,6 +46,7 @@ pub fn build(b: *std.Build) void {
 	core_mod.linkLibrary(vec_static_lib);
 	// encoding.zig uses uchardet for heuristic encoding detection
 	core_mod.linkLibrary(uchardet_lib);
+	core_mod.addOptions("build_options", native_opts);
 
 	// Static library for C FFI
 	const ffi_mod = b.createModule(.{
@@ -103,6 +108,7 @@ pub fn build(b: *std.Build) void {
 	test_mod.linkLibrary(vec_static_lib);
 	test_mod.linkLibrary(uchardet_lib);
 	test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
+	test_mod.addOptions("build_options", native_opts);
 
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -128,4 +134,26 @@ pub fn build(b: *std.Build) void {
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_unit_tests.step);
 	test_step.dependOn(&run_ffi_tests.step);
+
+	// ── WASM parse-to-text slice (browser / incitez_web) ──
+	// wasm32-freestanding, reactor module, ZERO imports. Comptime-excludes the
+	// sqlite/search/embedding machinery and uchardet (C++); parses docx/pdf/md/txt.
+	const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+	const wasm_opts = b.addOptions();
+	wasm_opts.addOption(bool, "enable_uchardet", false);
+	const wasm_mod = b.createModule(.{
+		.root_source_file = b.path("src/wasm_main.zig"),
+		.target = wasm_target,
+		.optimize = .ReleaseSmall,
+	});
+	wasm_mod.addOptions("build_options", wasm_opts);
+	const wasm_exe = b.addExecutable(.{
+		.name = "docscan",
+		.root_module = wasm_mod,
+	});
+	wasm_exe.entry = .disabled;
+	wasm_exe.rdynamic = true;
+	const wasm_install = b.addInstallArtifact(wasm_exe, .{});
+	const wasm_step = b.step("wasm", "Build the wasm32-freestanding parse-to-text slice");
+	wasm_step.dependOn(&wasm_install.step);
 }

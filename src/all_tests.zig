@@ -9,6 +9,7 @@
 
 test {
 	_ = @import("core/document.zig");
+	_ = @import("core/extract_text.zig");
 	_ = @import("core/parser_md.zig");
 	_ = @import("core/xml.zig");
 	_ = @import("core/zip.zig");

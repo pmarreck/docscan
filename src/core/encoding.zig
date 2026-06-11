@@ -7,6 +7,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// Charset *detection* (uchardet, C++ via the uchardetz package) is the only C
+// dependency on the parse path. It is gated behind build_options.enable_uchardet so
+// the wasm32-freestanding parse-to-text slice (enable_uchardet=false) has ZERO C deps
+// and ZERO imports; when disabled, detectEncoding returns null and callers assume
+// UTF-8. The pure-Zig getEncodingTable() below is always available.
+const enable_uchardet = @import("build_options").enable_uchardet;
+
 // ── uchardet C FFI (manual declarations to avoid header include path issues) ──
 
 const uchardet_t = *anyopaque;
@@ -22,17 +29,21 @@ extern "C" fn uchardet_get_charset(ud: uchardet_t) [*:0]const u8;
 /// The returned slice points into uchardet's internal buffer and is only valid
 /// until the next call to uchardet functions — copy it if you need to keep it.
 pub fn detectEncoding(data: []const u8) ?[]const u8 {
-    if (data.len == 0) return null;
-    const ud = uchardet_new() orelse return null;
-    defer uchardet_delete(ud);
+    if (enable_uchardet) {
+        if (data.len == 0) return null;
+        const ud = uchardet_new() orelse return null;
+        defer uchardet_delete(ud);
 
-    if (uchardet_handle_data(ud, data.ptr, data.len) != 0) return null;
-    uchardet_data_end(ud);
+        if (uchardet_handle_data(ud, data.ptr, data.len) != 0) return null;
+        uchardet_data_end(ud);
 
-    const charset: [*:0]const u8 = uchardet_get_charset(ud);
-    const result = std.mem.span(charset);
-    if (result.len == 0) return null;
-    return result;
+        const charset: [*:0]const u8 = uchardet_get_charset(ud);
+        const result = std.mem.span(charset);
+        if (result.len == 0) return null;
+        return result;
+    } else {
+        return null;
+    }
 }
 
 /// Convert bytes from a detected encoding to UTF-8.

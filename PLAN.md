@@ -35,7 +35,8 @@ See `docs/superpowers/plans/2026-04-08-docscan-implementation.md` for full task 
 - [ ] Task 16: Benchmark Suite — `./bm` stub exists
 - [ ] Wire ignore patterns into CLI directory walker
 - [ ] `docscan_list_documents` FFI function
-- [ ] DIFAT chain support in OLE2 (>7MB .doc files)
+- [x] DIFAT chain support in OLE2 (>7MB .doc files) (2026-06-03 EST)
+- [ ] **incitez citation-extraction integration** (GATED - awaiting Peter's prioritization; inbox brief 2026-06-12 from Einstein). Add incitez as a Zig package dependency (`build.zig.zon`) and call its Zig API directly -- allowed per Peter's 2026-06-12 FFI refinement: incitez's own CLI already dogfoods its C FFI (`include/incitez.h`), so the FFI is proven exercised and re-vendoring through it is unnecessary (C FFI stays the boundary only for any non-Zig consumer). chunker enrichment pass -> per-chunk `citations[]` (incitez byte-offset spans translated to chunk-relative, UTF-8-multibyte-safe; type, reporter, courts-db id, resolution cluster id); store in SQLite (FTS5 col or sidecar table keyed by chunk id); citation-aware search (`docscan search --citing "531 U.S. 98"`) + MCP exposure. TDD + byte-offset round-trip proof; bench under existing bm gates. Plan of record: `docs/citation_extraction.md`. Unlocks legal_ai stage-1 extraction.
 
 ## Known Limitations
 
@@ -154,3 +155,39 @@ DB: add indexes on `page_physical` and `(page_logical, page_section)` in chunks 
 - If `--physical` is defaulted to, stderr hint: "Using physical page numbers. Use --logical if document metadata supports it."
 - `--logical` flag switches to logical page matching
 - Cross-section ambiguity (same logical page in multiple sections): not handled for v1 — use physical pages. Document this limitation.
+
+## Ops: fileserver index recovery (Textfiles & PDF & eBook corpus) — TABLED 2026-06-13 (Peter: WASM slice is higher priority)
+
+Index run died ~Jun 5 09:57 when /Volumes/Fileserver went unresponsive (external
+mount failure, NOT a docscan bug — process wedged in uninterruptible "U" state).
+DB left ~70% done: 834/1200 docs, ~143k embeddings, hot journal present (unclean
+shutdown). Clean 732MB `index.db.killed-20260603-212303` backup beside it.
+
+DECISION (Peter, 2026-06-12): the index DB is a *derived* artifact → it belongs on
+LOCAL disk; the corpus is read remotely. NO copy-back. Only one-time copy is a 932MB
+pull-DOWN of the existing partial to recover the 70% GPU work (optional vs fresh-local).
+- [ ] Confirm local DB home + resume-from-pull vs fresh-local, then execute
+- [ ] Proposed improvement: docscan auto-defaults DB to a local app-data dir when the
+      corpus is detected on a network mount (one-line stderr note) — kills the footgun
+      by construction instead of by remembering `--db`.
+
+## In Progress: docscan-WASM parse-to-text slice (for incitez_web private demo)
+
+Work order: Einstein 2026-06-12 (Peter opted in; approach delegated to docscan agent).
+LLMsend Einstein at each milestone boundary; coordinate output contract with the
+incitez_web session. STOP at each milestone boundary — do NOT roll PDF build in on momentum.
+
+- [ ] **Milestone 1 — `packages.wasm` parse-to-text slice (BUILD NOW)**: export
+      `docscan_extract_text(ptr,len,fmt)->resPtr` returning `[u32 LE len][UTF-8 text]` +
+      `alloc`/`free`/`selftest`/`version`. `fmt`: docx|md|txt (pdf reserved). wasm32-
+      freestanding, ZERO imports; comptime-EXCLUDE search/sqlite-vec/FTS5/embedding/Ollama
+      (parse-to-text ONLY, mirror how incitez comptime-excluded PCRE2). Reuse incitez's
+      exact memory ABI — read `~/Documents-CloudManaged/incitez/docs/wasm_abi.md`, mirror
+      it (len-prefixed UTF-8, who-frees-what, grow-detaches-ArrayBuffer gotcha), write
+      `docscan/docs/wasm_abi.md`. selftest() embeds tiny .docx + .md → assert expected text.
+      CI `checks.wasm` node-smoke instantiation; report artifact SIZE (incitez ~536KB; aim small).
+      Purity gate: docx/md/txt paths do NO I/O at the parse boundary.
+- [ ] **Milestone 2 — PDF feasibility READ (BEFORE any PDF build)**: report to Einstein —
+      docscan PDF parse pure-Zig or C-dep? rough wasm size delta? extraction quality (simple
+      Tj/TJ content-stream only, or subset/CID font handling)? Decides PDF-via-WASM vs
+      self-hosted pdf.js (incitez_web CSP `default-src 'none'; connect-src 'self'` → no CDN).
