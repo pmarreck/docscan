@@ -41,50 +41,32 @@ fn parseHeadingLine(line: []const u8) ?struct { level: u8, text: []const u8 } {
 	return .{ .level = level, .text = text };
 }
 
-/// Join content lines into a single trimmed string, allocated via allocator.
-/// Leading/trailing blank lines are stripped; inner lines joined with newline.
+/// Join content lines into structure-aware plain text (citation pipeline contract):
+/// consecutive non-blank lines (a paragraph) are reflowed with single spaces so soft
+/// line-wraps don't split tokens like citations; a blank line becomes exactly one '\n'
+/// marking a structural boundary (consumers treat a lone '\n' as a hard stop). Leading/
+/// trailing blank lines are stripped; never a run of '\n' or a trailing '\n'.
 fn joinContentLines(gpa: Allocator, lines: []const []const u8) ![]const u8 {
-	// Find first and last non-empty lines
-	var first: usize = 0;
-	var last: usize = 0;
-	var found_any = false;
+	var buf: std.ArrayList(u8) = .empty;
+	errdefer buf.deinit(gpa);
 
-	for (lines, 0..) |line, i| {
-		const trimmed = std.mem.trim(u8, line, " \t");
-		if (trimmed.len > 0) {
-			if (!found_any) {
-				first = i;
-				found_any = true;
-			}
-			last = i;
+	var started = false;
+	var pending_boundary = false;
+	for (lines) |line| {
+		const trimmed = std.mem.trim(u8, line, " \t\r");
+		if (trimmed.len == 0) {
+			if (started) pending_boundary = true;
+			continue;
 		}
-	}
-
-	if (!found_any) {
-		return try gpa.dupe(u8, "");
-	}
-
-	const relevant = lines[first .. last + 1];
-
-	// Calculate total length
-	var total_len: usize = 0;
-	for (relevant, 0..) |line, i| {
-		total_len += line.len;
-		if (i < relevant.len - 1) total_len += 1; // newline
-	}
-
-	const buf = try gpa.alloc(u8, total_len);
-	var offset: usize = 0;
-	for (relevant, 0..) |line, i| {
-		@memcpy(buf[offset .. offset + line.len], line);
-		offset += line.len;
-		if (i < relevant.len - 1) {
-			buf[offset] = '\n';
-			offset += 1;
+		if (started) {
+			try buf.append(gpa, if (pending_boundary) '\n' else ' ');
+			pending_boundary = false;
 		}
+		try buf.appendSlice(gpa, trimmed);
+		started = true;
 	}
 
-	return buf;
+	return try buf.toOwnedSlice(gpa);
 }
 
 /// Recursively build nested Section tree from a slice of flat sections.
@@ -439,4 +421,31 @@ test "legal reporter abbreviation — intra-token spaces preserved (no 'U. S.' -
 		if (std.mem.indexOf(u8, s.content, "530 U. S. 238") != null) found = true;
 	}
 	try testing.expect(found);
+}
+
+test "md structure-aware: soft line-wraps join to spaces, blank line = lone boundary newline" {
+	// Phase 1 (citation pipeline, 2026-06-14): intra-paragraph soft wraps must NOT
+	// split citation tokens; a blank line is a structural boundary (incitez treats a
+	// lone \n as a hard case-name stop). No runs of \n, no trailing \n.
+	const input =
+		\\# Memo
+		\\
+		\\See Brown v.
+		\\Board of Education, 347 U. S. 483.
+		\\
+		\\Next paragraph here.
+	;
+	const doc = try parse(testing.allocator, input, "/test/wrap.md");
+	defer freeDocument(testing.allocator, doc);
+
+	const c = doc.sections[0].content;
+	// soft wrap joined to a single space — citation token intact across the wrap
+	try testing.expect(std.mem.indexOf(u8, c, "Brown v. Board of Education, 347 U. S. 483.") != null);
+	// the soft-wrap newline is gone
+	try testing.expect(std.mem.indexOf(u8, c, "v.\nBoard") == null);
+	// the paragraph boundary survives as exactly one newline
+	try testing.expect(std.mem.indexOf(u8, c, "483.\nNext paragraph here.") != null);
+	// no run of newlines, no trailing newline
+	try testing.expect(std.mem.indexOf(u8, c, "\n\n") == null);
+	try testing.expect(c.len == 0 or c[c.len - 1] != '\n');
 }
