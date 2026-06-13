@@ -108,6 +108,42 @@
 			in {
 				packages.default = buildDocscan {};
 
+				# wasm32-freestanding parse-to-text slice for incitez_web. `zig build
+				# wasm` runs the full build() so the zig deps must be present, but the
+				# slice links none of them (sqlite/uchardet excluded). Single output
+				# file, mirroring incitez: $out/docscan.wasm.
+				packages.wasm = pkgs.stdenv.mkDerivation {
+					pname = "docscan-wasm";
+					version = "0.1.0";
+					src = ./.;
+
+					nativeBuildInputs = [ pkgs.zig_0_16 ];
+
+					dontConfigure = true;
+					dontFixup = true;
+
+					buildPhase = ''
+						export HOME=$TMPDIR
+						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
+						export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+						export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+						mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+						cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+						chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
+						zig build wasm --color off
+					'';
+
+					installPhase = ''
+						mkdir -p $out
+						cp zig-out/bin/docscan.wasm $out/
+					'';
+
+					meta = with pkgs.lib; {
+						description = "docscan parse-to-text WASM slice (wasm32-freestanding, zero imports)";
+						license = licenses.mit;
+					};
+				};
+
 				checks = {
 					build = self.packages.${system}.default;
 
@@ -138,6 +174,39 @@
 						installPhase = ''
 							mkdir -p $out
 							echo "tests passed" > $out/result
+						'';
+					};
+
+					# Non-Zig consumer refuting the wasm artifact at its boundary: build
+					# the slice, then instantiate + exercise it from Node with an EMPTY
+					# import object (proving the zero-imports contract) and run the
+					# embedded selftest + real extraction. The MFIC gate Garnix runs on push.
+					wasm = pkgs.stdenv.mkDerivation {
+						pname = "docscan-wasm-smoke";
+						version = "0.1.0";
+						src = ./.;
+
+						nativeBuildInputs = [ pkgs.zig_0_16 pkgs.nodejs ];
+
+						dontConfigure = true;
+						dontFixup = true;
+
+						buildPhase = ''
+							export HOME=$TMPDIR
+							export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
+							export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+							export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+							mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+							cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+							chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
+
+							zig build wasm --color off
+							node tests/wasm/smoke.mjs zig-out/bin/docscan.wasm
+						'';
+
+						installPhase = ''
+							mkdir -p $out
+							echo "wasm smoke passed" > $out/result
 						'';
 					};
 				};

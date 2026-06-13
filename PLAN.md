@@ -177,7 +177,7 @@ Work order: Einstein 2026-06-12 (Peter opted in; approach delegated to docscan a
 LLMsend Einstein at each milestone boundary; coordinate output contract with the
 incitez_web session. STOP at each milestone boundary — do NOT roll PDF build in on momentum.
 
-- [ ] **Milestone 1 — `packages.wasm` parse-to-text slice (BUILD NOW)**: export
+- [x] **Milestone 1 (done 2026-06-13: 964KB artifact, checks.wasm green) — `packages.wasm` parse-to-text slice (BUILD NOW)**: export
       `docscan_extract_text(ptr,len,fmt)->resPtr` returning `[u32 LE len][UTF-8 text]` +
       `alloc`/`free`/`selftest`/`version`. `fmt`: docx|md|txt (pdf reserved). wasm32-
       freestanding, ZERO imports; comptime-EXCLUDE search/sqlite-vec/FTS5/embedding/Ollama
@@ -187,7 +187,7 @@ incitez_web session. STOP at each milestone boundary — do NOT roll PDF build i
       `docscan/docs/wasm_abi.md`. selftest() embeds tiny .docx + .md → assert expected text.
       CI `checks.wasm` node-smoke instantiation; report artifact SIZE (incitez ~536KB; aim small).
       Purity gate: docx/md/txt paths do NO I/O at the parse boundary.
-- [ ] **Milestone 2 — PDF feasibility READ (BEFORE any PDF build)**: report to Einstein —
+- [x] **Milestone 2 (resolved 2026-06-13: PDF pure-Zig w/ToUnicode CMaps, BUILT into the slice) — PDF feasibility READ (BEFORE any PDF build)**: report to Einstein —
       docscan PDF parse pure-Zig or C-dep? rough wasm size delta? extraction quality (simple
       Tj/TJ content-stream only, or subset/CID font handling)? Decides PDF-via-WASM vs
       self-hosted pdf.js (incitez_web CSP `default-src 'none'; connect-src 'self'` → no CDN).
