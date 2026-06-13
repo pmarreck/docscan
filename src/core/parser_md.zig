@@ -422,3 +422,21 @@ test "ATX heading edge cases — #NoSpace is NOT a heading, ###### Level 6 works
 	try testing.expectEqualStrings("Level 6", doc.sections[1].heading.?);
 	try testing.expectEqual(@as(u8, 6), doc.sections[1].level);
 }
+
+test "legal reporter abbreviation — intra-token spaces preserved (no 'U. S.' -> 'US.')" {
+	// Regression (incitez_web 2026-06-13): the md path collapsed the space inside
+	// "U. S." reporter abbreviations -> "US.", breaking incitez citation recall.
+	const input =
+		\\# Memo
+		\\
+		\\Compare 530 U. S. 238, 241-242 (2000).
+	;
+	const doc = try parse(testing.allocator, input, "/test/reporter.md");
+	defer freeDocument(testing.allocator, doc);
+
+	var found = false;
+	for (doc.sections) |s| {
+		if (std.mem.indexOf(u8, s.content, "530 U. S. 238") != null) found = true;
+	}
+	try testing.expect(found);
+}

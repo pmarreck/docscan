@@ -67,6 +67,13 @@ check("txt extract identity", txt === "plain text body");
 // version string
 check(`version "${version()}"`, version().length > 0);
 
+// reporter-spacing regression (incitez_web 2026-06-13): intra-token spaces in
+// legal reporters (U. S., F. 3d, ...) must survive extraction, else citations vanish.
+const rep = extract("Compare 530 U. S. 238, 241-242 (2000).", FMT.md);
+check(`md preserves "530 U. S. 238" (got ${JSON.stringify(rep)})`, rep.includes("530 U. S. 238"));
+const repTxt = extract("530 U. S. 238", FMT.txt);
+check("txt preserves reporter spacing", repTxt === "530 U. S. 238");
+
 console.log(`\n  wasm size: ${bytes.length} bytes`);
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log("\nall smoke checks passed");

@@ -2603,3 +2603,23 @@ test "parse decodes MacRomanEncoding byte 0xDE as fi ligature" {
 	// After CMap decode + normalizeText ligature expansion
 	try testing.expect(std.mem.indexOf(u8, content, "finally") != null);
 }
+test "pdf extraction preserves legal reporter intra-token spaces (no collapse)" {
+	// Regression (incitez_web / Einstein 2026-06-13): pdf routes through the same
+	// wordfix rejoin pass that collapsed "U. S." -> "US."; verify a born-digital
+	// text-layer PDF keeps the reporter spacing intact.
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "Compare 530 U. S. 238 and 5 F. 3d 1000.", .font_size = 12, .y_pos = 700 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/reporter.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+
+	try testing.expect(std.mem.indexOf(u8, all.items, "530 U. S. 238") != null);
+}

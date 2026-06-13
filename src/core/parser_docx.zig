@@ -739,3 +739,25 @@ test "page tracking with multiple page breaks" {
 	try testing.expectEqualStrings("Page 3", doc.sections[1].heading.?);
 	try testing.expectEqual(@as(?u32, 3), doc.sections[1].page_physical);
 }
+
+test "docx extraction preserves legal reporter intra-token spaces (no collapse)" {
+	// Regression (incitez_web / Einstein 2026-06-13): docx routes through the same
+	// wordfix rejoin pass that collapsed "U. S." -> "US."; verify the reporter class
+	// survives docx extraction (U. S., F. 3d, S. Ct.).
+	const body =
+		\\<w:p><w:r><w:t>Compare 530 U. S. 238, see 5 F. 3d 1000 and 123 S. Ct. 456.</w:t></w:r></w:p>
+	;
+	const docx = try buildTestDocx(testing.allocator, body, null);
+	defer testing.allocator.free(docx);
+
+	const doc = try parse(testing.allocator, docx, "/test/reporter.docx");
+	defer freeDocument(testing.allocator, doc);
+
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+
+	try testing.expect(std.mem.indexOf(u8, all.items, "530 U. S. 238") != null);
+	try testing.expect(std.mem.indexOf(u8, all.items, "5 F. 3d 1000") != null);
+	try testing.expect(std.mem.indexOf(u8, all.items, "123 S. Ct. 456") != null);
+}

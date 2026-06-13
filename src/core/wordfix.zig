@@ -293,6 +293,12 @@ fn rejoinLine(allocator: Allocator, line: []const u8) ![]const u8 {
 					const combined = buf[0..core_combined_len];
 						if (isWord(combined)) {
 							const should_join = blk: {
+								// Never merge across an abbreviation / sentence boundary: a trailing
+								// period on the left fragment ("U.", "S.", "F.", "Cal.") marks a
+								// complete token, not an OCR/PDF word-split. Legal reporters carry
+								// such intra-token spaces (U. S., F. 3d, S. Ct., Cal. App.) and must
+								// survive extraction byte-for-byte for citation recall.
+								if (std.mem.indexOfScalar(u8, left_stripped.suffix, '.') != null) break :blk false;
 								// Join when at least one fragment is NOT a real standalone word.
 								// "Real" = in dictionary AND (>= 3 chars OR common function word).
 								// This treats rare 2-char abbreviations ("kn") as fragments
@@ -1215,4 +1221,25 @@ test "textQuality: OCR near-miss text with letter swaps" {
 	try testing.expect(quality < 70);
 	// But above 30 (not totally garbled — most chars are correct)
 	try testing.expect(quality > 30);
+}
+
+test "rejoinWords preserves legal reporter intra-token spaces (no 'U. S.' -> 'US.')" {
+	// Regression (incitez_web / Einstein 2026-06-13): the word-rejoin pass merged
+	// abbreviation initials ("U." + "S." -> "US."), collapsing the significant
+	// internal spacing of legal reporters and breaking citation recall. This is a
+	// CLASS: U. S., F. 3d, S. Ct., Cal. App. all carry intra-token spaces. None of
+	// these inputs contains a real OCR word-split, so rejoinWords must pass them
+	// through byte-for-byte.
+	const a = std.testing.allocator;
+	const cases = [_][]const u8{
+		"Compare 530 U. S. 238, 241-242 (2000).",
+		"See 5 F. 3d 1000.",
+		"Citing 123 S. Ct. 456.",
+		"Per Cal. App. 4th 1.",
+	};
+	for (cases) |c| {
+		const out = try rejoinWords(a, c);
+		defer a.free(out);
+		try std.testing.expectEqualStrings(c, out);
+	}
 }
