@@ -208,3 +208,35 @@ agreed with incitez (2026-06-14): wraps→space, lone \n = boundary, no \n runs/
       new export returns `[u32 text_len][text][u32 n][n×{emitted,original}]` in one buffer.
       md/txt exact byte-to-byte first; pdf/docx pending an incitez_web highlight-needs convo
       ("original bytes" into a binary PDF isn't directly a highlight position).
+
+## ⏸ Paused 2026-06-14 (Peter guiding chardetz) — resumption notes
+
+**Pushed & deployed (yolo @ c83fe7c8):** WASM parse-to-text slice; reporter-spacing
+fix; citation Phase 1 (md/docx/pdf structure-aware); Tm/groff wrap-join fix. The
+citation "surpass" is live across formats; incitez_web consumes it.
+
+**Local-only (NOT pushed):**
+- `zonxmnro` adaptive modal line-gap (robustness; did NOT crack the Brann brief).
+- `tmtxprto` ligature normalization (wanted — keep) + WinAnsi-default CP1252 stopgap
+  (Peter objected to blanket "assume Windows"; INTERIM only, to be superseded by
+  chardetz detection — do NOT push the assumption as-is; consider splitting the commit
+  to push ligatures alone, or narrow encoding to C1-range-only as the defensible interim).
+
+**Open threads:**
+- [ ] **Encoding (strategic):** chardetz = pure-Zig uchardet (M1 done: tables+oracle+corpus;
+      M2–M6 = probers/FFI/WASM pending). **Peter is driving chardetz in its own session.**
+      When chardetz FFI/WASM lands, replace docscan's WinAnsi-default stopgap with chardetz
+      detection (works in the wasm slice; handles ALL odd encodings, not just CP1252).
+- [ ] **Brann real-brief pdf split** (~19 chars/line, citations split mid-token): adaptive-gap
+      did NOT fix it. Its content stream is pathological (cumulative TD, spurious `5.00 Tf`
+      between body spans, erratic positioning). Needs instrumented diagnosis of the actual
+      split path. Fixture: `tests/corpus/legal-brann-appellate-brief.pdf` (3.5MB > jj 1MB
+      snapshot limit → NOT committed; decide gitignore vs `snapshot.max-new-file-size`).
+      incitez_web holds pdf on `incitez_clean` (recall-safe) until fixed.
+- [x] **POS/grammar research** (2026-06-14): docs/research/2026-06-14-pos-tagging-for-zig-wasm.md — RECOMMENDATION: averaged-perceptron tagger (pure-Zig, wasm-able via @embedFile+flate like wordfix dicts); PROPN tag = party-attribution signal for the heading-bleed problem. Implementation deferred.
+      party-name signal (helps the heading-bleed problem). Synthesis still owed.
+- [ ] **Ligature normalization for doc/rtf/epub** — currently only via wordfix (md/docx/pdf);
+      extend to the other parsers if they don't route through wordfix.
+- [ ] **Citation pipeline Phase 2** — offset map + `docscan_extract_structured` (deferred;
+      md/txt exact first, pdf/docx pending incitez_web highlight-needs convo).
+- [ ] Stray uncommitted `docs/superpowers/plans/2026-04-15-libvips-ocr-preprocessing.md`.

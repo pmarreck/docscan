@@ -13,3 +13,6 @@ ZIG_RECENT_API_CHANGES.md
 zig-pkg/
 inbox/
 ZIG_0.15_TO_0.16_MIGRATION.md
+
+# Large local-only PDF diagnosis fixture (exceeds jj 1MB snapshot limit)
+tests/corpus/legal-brann-appellate-brief.pdf

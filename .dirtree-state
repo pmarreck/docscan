@@ -1,6 +1,7 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
+	docs/research/2026-06-14-pos-tagging-for-zig-wasm.md = Research: POS/grammar tagging embeddable in Zig + WASM (recommends averaged-perceptron; PROPN=party-attribution signal)
 	docs/wasm_abi.md = Consumer contract for the docscan WASM parse-to-text slice (exports, fmt enum, memory protocol, mirrors incitez ABI)
 	src/core/extract_text.zig = Pure-Zig Document->plaintext flattener (depth-first section walk); used by the WASM slice
 	src/wasm_main.zig = WASM parse-to-text slice entry: wasm32-freestanding reactor exporting docscan_extract_text/alloc/free/selftest/version_ptr (mirrors incitez ABI)
