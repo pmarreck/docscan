@@ -755,7 +755,9 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 /// font_maps provides ToUnicode CMap lookups for hex-encoded glyph IDs.
 fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.ArrayList(TextSpan), page_num: u32, font_maps: ?*const FontMap) PdfError!void {
 	var pos: usize = 0;
-	var current_font_size: f32 = 12.0; // default
+	var current_font_size: f32 = 12.0; // default; effective = tf_size * tm_scale
+	var tf_size: f32 = 12.0; // last Tf point size
+	var tm_scale: f32 = 1.0; // Tm d-component (text-matrix vertical scale)
 	var current_font_name: ?[]const u8 = null; // e.g., "F1" — points into stream data
 	var last_name: ?[]const u8 = null; // last /Name token seen (for Tf matching)
 	var y_pos: f32 = 0;
@@ -924,7 +926,8 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 			// Full pattern: /FontName fontSize Tf
 			if (ws_pos < stream.len and stream[ws_pos] == 'T' and ws_pos + 1 < stream.len and stream[ws_pos + 1] == 'f') {
 				if (ws_pos + 2 >= stream.len or isDelimiter(stream[ws_pos + 2])) {
-					current_font_size = num;
+					tf_size = num;
+					current_font_size = tf_size * tm_scale;
 					current_font_name = last_name;
 					pos = ws_pos + 2;
 					continue;
@@ -964,7 +967,11 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							const d_val = tm_nums[1]; // [a,b,c,d,e,f] = [num, num2, tm[0], tm[1], tm[2], tm[3]]
 							const e_val = tm_nums[2];
 							const f_val = tm_nums[3];
-							if (@abs(d_val) > 0.1) current_font_size = @abs(d_val);
+							// The Tm d-component is the vertical SCALE, not the font size; the
+							// rendered size is Tf_size * d. groff positions via Tm [1 0 0 1 x y]
+							// (d=1) and sizes via Tf, so do NOT overwrite the Tf size with d.
+							tm_scale = if (@abs(d_val) > 0.01) @abs(d_val) else 1.0;
+							current_font_size = tf_size * tm_scale;
 							x_pos = e_val;
 							y_pos = f_val;
 							pos = ws3 + 2;
@@ -2664,4 +2671,27 @@ test "pdf structure-aware: citation split across a line wrap joins (recall); par
 	try testing.expect(std.mem.indexOf(u8, c, "Brown v. Board, 347 U. S. 483.") != null);
 	// paragraph boundary preserved as a lone newline
 	try testing.expect(std.mem.indexOf(u8, c, "483.\nNext paragraph.") != null);
+}
+
+test "Tm positioning with identity scale keeps the Tf font size (not the Tm d-component)" {
+	// Regression (incitez_web 2026-06-14): groff-style PDFs position text via
+	// Tm [1 0 0 1 x y] (d = 1, an identity vertical SCALE) and set the point size via
+	// Tf. Conflating the Tm d-component with the font size clobbered font_size to ~1,
+	// which collapsed the wrap-vs-paragraph threshold so every line break became a
+	// boundary and split citations. Effective size = Tf_size * Tm_d_scale.
+	const stream =
+		"BT\n/F1 10 Tf\n1 0 0 1 72 700 Tm\n(Roe v. Wade, 410) Tj\nET\n" ++
+		"BT\n/F1 10 Tf\n1 0 0 1 72 688 Tm\n(U.S. 113) Tj\nET\n";
+	var spans = std.ArrayList(TextSpan).empty;
+	defer {
+		for (spans.items) |s| testing.allocator.free(s.text);
+		spans.deinit(testing.allocator);
+	}
+
+	try parseContentStream(testing.allocator, stream, &spans, 0, null);
+
+	try testing.expect(spans.items.len >= 2);
+	for (spans.items) |s| {
+		try testing.expectApproxEqAbs(@as(f32, 10.0), s.font_size, 0.5);
+	}
 }
