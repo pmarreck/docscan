@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const pdf_decryptor = @import("pdf_decryptor.zig");
 
 // ── Public Types ────────────────────────────────────────────────────
 
@@ -50,12 +51,24 @@ pub const PdfError = error{
 
 /// Top-level context for accessing objects within a PDF file held in memory.
 /// Parses the xref table on init and provides object/stream lookup.
+/// Standard-security-handler state for a blank-password-encrypted document.
+/// Derived once in PdfContext.init; used to decrypt per-object stream bytes.
+pub const CryptState = struct {
+	file_key: [32]u8,
+	key_len: u8, // bytes of file_key in use (<=16 for R<5, 32 for V5)
+	version: u8,
+	use_aes: bool,
+};
+
+const DecryptedStream = struct { data: []const u8, owned: bool };
+
 pub const PdfContext = struct {
 	data: []const u8,
 	xref: std.AutoHashMap(u64, XrefEntry),
 	trailer_dict: ?[]const DictEntry,
 	allocator: Allocator,
 	stream_cache: std.AutoHashMap(u64, []const u8), // obj_num -> decompressed stream data
+	crypt: ?CryptState = null,
 
 	/// Parse a PDF byte buffer: locate startxref, parse xref table, store trailer.
 	pub fn init(allocator: Allocator, data: []const u8) PdfError!PdfContext {
@@ -70,6 +83,28 @@ pub const PdfContext = struct {
 
 		const xref_offset = findStartxref(data) orelse return PdfError.InvalidPdf;
 		try parseXrefSection(&ctx, xref_offset);
+
+		// Detect Standard Security Handler encryption and derive the file key for a
+		// BLANK user password (the common encrypted-but-openable case). Decryption
+		// logic vendored from validate (see pdf_decryptor.zig).
+		if (pdf_decryptor.parseEncryptionParams(data)) |params| {
+			if (params.isSupported()) {
+				if (params.version >= 5) {
+					if (pdf_decryptor.tryEmptyPasswordV5(allocator, params)) |fk| {
+						ctx.crypt = .{ .file_key = fk, .key_len = 32, .version = params.version, .use_aes = true };
+					}
+				} else {
+					const res = pdf_decryptor.tryEmptyPassword(params);
+					if (res.success) {
+						if (res.encryption_key) |ek| {
+							var fk = [_]u8{0} ** 32;
+							@memcpy(fk[0..res.key_length], ek[0..res.key_length]);
+							ctx.crypt = .{ .file_key = fk, .key_len = res.key_length, .version = params.version, .use_aes = res.use_aes };
+						}
+					}
+				}
+			}
+		}
 		return ctx;
 	}
 
@@ -193,6 +228,17 @@ pub const PdfContext = struct {
 		return cloned;
 	}
 
+	/// Decrypt a raw stream when the document is encrypted (blank password); else
+	/// return the raw slice unchanged. obj_num/gen drive the per-object key.
+	fn decryptRawStream(self: *PdfContext, obj_num: u64, gen: u64, raw: []const u8) PdfError!DecryptedStream {
+		const c = self.crypt orelse return .{ .data = raw, .owned = false };
+		const dec = if (c.version >= 5)
+			pdf_decryptor.decryptStreamV5(self.allocator, raw, c.file_key) catch return PdfError.DecompressionFailed
+		else
+			pdf_decryptor.decryptStream(self.allocator, raw, c.file_key[0..c.key_len], @intCast(obj_num), @intCast(gen), c.use_aes) catch return PdfError.DecompressionFailed;
+		return .{ .data = dec, .owned = true };
+	}
+
 	/// Get decompressed stream data for an object (must be a stream object).
 	/// Caller owns the returned slice. Decompressed data is cached internally
 	/// so repeated calls for the same object avoid redundant decompression.
@@ -228,7 +274,9 @@ pub const PdfContext = struct {
 			// Try to find endstream
 			const end_pos = std.mem.indexOf(u8, self.data[stream_start..], "endstream") orelse
 				return PdfError.MalformedObject;
-			const decompressed = try decompressStream(self.allocator, self.data[stream_start .. stream_start + end_pos], dict_val.dict);
+			const dr1 = try self.decryptRawStream(obj_num, entry.gen, self.data[stream_start .. stream_start + end_pos]);
+			defer if (dr1.owned) self.allocator.free(@constCast(dr1.data));
+			const decompressed = try decompressStream(self.allocator, dr1.data, dict_val.dict);
 			// Cache the decompressed data, return a dupe to the caller
 			self.stream_cache.put(obj_num, decompressed) catch {
 				// Cache insertion failed — caller still gets the data, just uncached
@@ -241,7 +289,9 @@ pub const PdfContext = struct {
 		if (stream_start + len > self.data.len) return PdfError.InvalidPdf;
 		const stream_data = self.data[stream_start .. stream_start + len];
 
-		const decompressed = try decompressStream(self.allocator, stream_data, dict_val.dict);
+		const dr2 = try self.decryptRawStream(obj_num, entry.gen, stream_data);
+		defer if (dr2.owned) self.allocator.free(@constCast(dr2.data));
+		const decompressed = try decompressStream(self.allocator, dr2.data, dict_val.dict);
 		// Cache the decompressed data, return a dupe to the caller
 		self.stream_cache.put(obj_num, decompressed) catch {
 			return decompressed;

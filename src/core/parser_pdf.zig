@@ -2796,3 +2796,23 @@ test "pdf: undeclared simple-font high bytes map via WinAnsi (CP1252) to UTF-8, 
 	try testing.expect(std.mem.indexOf(u8, c, "\u{2014}") != null);
 	try testing.expect(std.mem.indexOfScalar(u8, c, 0x93) == null);
 }
+
+test "decrypt blank-password PDFs (RC4-128, AES-128, AES-256/R6) and extract text" {
+	// Standard Security Handler, empty USER password. Decryption logic vendored from
+	// validate (pdf_decryptor.zig); fixtures are qpdf-encrypted copies of
+	// legal-rfc2119-keywords.pdf, so correct decryption => the plaintext is recovered.
+	const fixtures = [_][]const u8{
+		@embedFile("fixtures/encrypted_rc4_128.pdf"),
+		@embedFile("fixtures/encrypted_aes_128.pdf"),
+		@embedFile("fixtures/encrypted_v5r6_aes256.pdf"),
+	};
+	for (fixtures) |pdf| {
+		const doc = try parse(testing.allocator, pdf, "/test/enc.pdf");
+		defer freeDocument(testing.allocator, doc);
+		var all = std.ArrayList(u8).empty;
+		defer all.deinit(testing.allocator);
+		for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+		try testing.expect(std.mem.indexOf(u8, all.items, "Internet") != null);
+		try testing.expect(std.mem.indexOf(u8, all.items, "Requirement") != null);
+	}
+}
