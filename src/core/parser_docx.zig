@@ -120,6 +120,11 @@ fn extractParagraphText(gpa: Allocator, p_node: xml.XmlNode) ![]const u8 {
 					if (run_child.text) |text| {
 						try buf.appendSlice(gpa, text);
 					}
+				} else if (std.mem.eql(u8, run_child.tag, "w:br")) {
+					// Intra-paragraph line break -> space (a wrap), so a citation
+					// token split across <w:br/> isn't welded. Page breaks are
+					// handled structurally via countPageBreaks.
+					try buf.append(gpa, ' ');
 				}
 			}
 		}
@@ -333,10 +338,10 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 				current = flat_sections.items.len - 1;
 			} else {
 				defer gpa.free(text);
-				// Body text — append to current section
-				if (text.len == 0 and current == null and flat_sections.items.len == 0) {
-					continue; // skip leading empty paragraphs
-				}
+				// Body text. Skip empty/blank paragraphs entirely so an empty <w:p>
+				// never produces a run of '\n' — one structural boundary = one '\n'.
+				const trimmed = std.mem.trim(u8, text, " \t\r\n");
+				if (trimmed.len == 0) continue;
 				if (current == null) {
 					try flat_sections.append(gpa, FlatSection{
 						.heading = null,
@@ -350,7 +355,7 @@ pub fn parse(gpa: Allocator, content: []const u8, path: []const u8) !Document {
 				if (fs.content_buf.items.len > 0) {
 					try fs.content_buf.append(gpa, '\n');
 				}
-				try fs.content_buf.appendSlice(gpa, text);
+				try fs.content_buf.appendSlice(gpa, trimmed);
 			}
 		}
 	}
@@ -760,4 +765,32 @@ test "docx extraction preserves legal reporter intra-token spaces (no collapse)"
 	try testing.expect(std.mem.indexOf(u8, all.items, "530 U. S. 238") != null);
 	try testing.expect(std.mem.indexOf(u8, all.items, "5 F. 3d 1000") != null);
 	try testing.expect(std.mem.indexOf(u8, all.items, "123 S. Ct. 456") != null);
+}
+
+test "docx structure-aware: <w:p>=lone-\\n boundary, no \\n runs, intra-paragraph <w:br/>=space" {
+	// Phase 1 (citation pipeline 2026-06-14): each <w:p> is a structural boundary
+	// (one \n); empty paragraphs must NOT produce runs of \n; a manual line break
+	// <w:br/> within a paragraph is an intra-paragraph wrap -> space, so a citation
+	// token split across it isn't welded ("347 U." <w:br/> "S. 483" -> "347 U. S. 483").
+	const body =
+		\\<w:p><w:r><w:t>First para.</w:t></w:r></w:p>
+		\\<w:p></w:p>
+		\\<w:p><w:r><w:t>Second para with 347 U.</w:t><w:br/><w:t>S. 483 cite.</w:t></w:r></w:p>
+	;
+	const docx = try buildTestDocx(testing.allocator, body, null);
+	defer testing.allocator.free(docx);
+
+	const doc = try parse(testing.allocator, docx, "/test/struct.docx");
+	defer freeDocument(testing.allocator, doc);
+
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+
+	// paragraph boundary present as exactly one \n (empty <w:p> must not add a run)
+	try testing.expect(std.mem.indexOf(u8, c, "First para.\nSecond para") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "\n\n") == null);
+	// intra-paragraph <w:br/> -> space; reporter token intact across it
+	try testing.expect(std.mem.indexOf(u8, c, "347 U. S. 483") != null);
 }
