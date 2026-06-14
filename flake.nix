@@ -43,10 +43,10 @@
 				};
 
 				# Fixed-output derivation that pre-fetches all Zig deps declared in
-				# build.zig.zon (URL deps for sqlite_vec, uchardetz). This is the
+				# build.zig.zon (URL deps for sqlite_vec, chardetz). This is the
 				# only step with network access; the consumer builds offline.
 				# To recompute: set zigDepsHash = ""; nix build; copy printed hash.
-				zigDepsHash = "sha256-6RDUzlXOKUNx302PH2PiYdgId1lMY2CxMctiXwYjVhw=";
+				zigDepsHash = "sha256-rpVo7KSy7JDIhpgL+30U3e5lyYx5o5Uc1bKeviGPoBw=";
 
 				zigDeps = pkgs.stdenv.mkDerivation {
 					pname = "docscan-zig-deps";
@@ -110,7 +110,7 @@
 
 				# wasm32-freestanding parse-to-text slice for incitez_web. `zig build
 				# wasm` runs the full build() so the zig deps must be present, but the
-				# slice links none of them (sqlite/uchardet excluded). Single output
+				# slice links none of the C deps (sqlite excluded; chardetz is pure-Zig). Single output
 				# file, mirroring incitez: $out/docscan.wasm.
 				packages.wasm = pkgs.stdenv.mkDerivation {
 					pname = "docscan-wasm";

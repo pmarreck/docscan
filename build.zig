@@ -8,10 +8,6 @@ pub fn build(b: *std.Build) void {
 		"Optimization mode (default: ReleaseFast)",
 	) orelse .ReleaseFast;
 
-	const enable_uchardet = b.option(bool, "enable_uchardet", "Link uchardet (C++ via uchardetz) for charset detection; disabled for the wasm slice (default true)") orelse true;
-	const native_opts = b.addOptions();
-	native_opts.addOption(bool, "enable_uchardet", enable_uchardet);
-
 	// SQLite + sqlite-vec from dependency
 	const sqlite_vec_dep = b.dependency("sqlite_vec", .{
 		.target = target,
@@ -20,19 +16,10 @@ pub fn build(b: *std.Build) void {
 	const sqlite3_lib = sqlite_vec_dep.artifact("sqlite3");
 	const vec_static_lib = sqlite_vec_dep.artifact("sqlite_vec0");
 
-	// uchardet encoding detection (C++ with C API)
-	// The uchardetz package exposes both static and shared "uchardet" artifacts,
-	// so we can't use artifact() which panics on ambiguity. Find the static one.
-	const uchardetz_dep = b.dependency("uchardetz", .{
-		.target = target,
-		.optimize = optimize,
-	});
-	// uchardetz exposes the static library as "uchardet-static" (the shared
-	// library uses the bare name "uchardet"), so artifact() resolves
-	// unambiguously to the static one. Earlier code walked install_tls deps
-	// to disambiguate, but Zig 0.16's linkLibrary asserts .kind == .lib which
-	// the loop-fallback path didn't always satisfy.
-	const uchardet_lib = uchardetz_dep.artifact("uchardet-static");
+	// chardetz: pure-Zig charset DETECTOR (universalchardet/uchardet reimplementation).
+	// Replaces the old C++ uchardet entirely — no C dependency, compiles to
+	// wasm32-freestanding. Target-agnostic module, recompiled per consumer target.
+	const chardetz_mod = b.dependency("chardetz", .{}).module("chardetz");
 
 	// Core module — root.zig re-exports all sub-modules
 	const core_mod = b.createModule(.{
@@ -44,9 +31,7 @@ pub fn build(b: *std.Build) void {
 	core_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 	core_mod.linkLibrary(sqlite3_lib);
 	core_mod.linkLibrary(vec_static_lib);
-	// encoding.zig uses uchardet for heuristic encoding detection
-	core_mod.linkLibrary(uchardet_lib);
-	core_mod.addOptions("build_options", native_opts);
+	core_mod.addImport("chardetz", chardetz_mod);
 
 	// Static library for C FFI
 	const ffi_mod = b.createModule(.{
@@ -63,7 +48,6 @@ pub fn build(b: *std.Build) void {
 	});
 	ffi_mod.linkLibrary(sqlite3_lib);
 	ffi_mod.linkLibrary(vec_static_lib);
-	ffi_mod.linkLibrary(uchardet_lib);
 	ffi_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 	lib.installHeader(b.path("ffi/docscan_core.h"), "docscan_core.h");
 	b.installArtifact(lib);
@@ -86,7 +70,6 @@ pub fn build(b: *std.Build) void {
 	exe_mod.linkLibrary(lib);
 	exe_mod.linkLibrary(sqlite3_lib);
 	exe_mod.linkLibrary(vec_static_lib);
-	exe_mod.linkLibrary(uchardet_lib);
 	exe_mod.link_libc = true;
 	// Link Windows socket library for networking code
 	if (target.result.os.tag == .windows) {
@@ -106,9 +89,8 @@ pub fn build(b: *std.Build) void {
 	});
 	test_mod.linkLibrary(sqlite3_lib);
 	test_mod.linkLibrary(vec_static_lib);
-	test_mod.linkLibrary(uchardet_lib);
 	test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
-	test_mod.addOptions("build_options", native_opts);
+	test_mod.addImport("chardetz", chardetz_mod);
 
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -125,7 +107,6 @@ pub fn build(b: *std.Build) void {
 	});
 	ffi_test_mod.linkLibrary(sqlite3_lib);
 	ffi_test_mod.linkLibrary(vec_static_lib);
-	ffi_test_mod.linkLibrary(uchardet_lib);
 	ffi_test_mod.addCMacro("SQLITE_VEC_STATIC", "1");
 
 	const run_ffi_tests = b.addRunArtifact(ffi_tests);
@@ -137,16 +118,15 @@ pub fn build(b: *std.Build) void {
 
 	// ── WASM parse-to-text slice (browser / incitez_web) ──
 	// wasm32-freestanding, reactor module, ZERO imports. Comptime-excludes the
-	// sqlite/search/embedding machinery and uchardet (C++); parses docx/pdf/md/txt.
+	// sqlite/search/embedding machinery; parses docx/pdf/md/txt and transcodes
+	// charsets via pure-Zig chardetz + codepages (no C deps at all).
 	const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-	const wasm_opts = b.addOptions();
-	wasm_opts.addOption(bool, "enable_uchardet", false);
 	const wasm_mod = b.createModule(.{
 		.root_source_file = b.path("src/wasm_main.zig"),
 		.target = wasm_target,
 		.optimize = .ReleaseSmall,
 	});
-	wasm_mod.addOptions("build_options", wasm_opts);
+	wasm_mod.addImport("chardetz", chardetz_mod);
 	const wasm_exe = b.addExecutable(.{
 		.name = "docscan",
 		.root_module = wasm_mod,

@@ -28,4 +28,5 @@ test {
 	_ = @import("core/encoding.zig");
 	_ = @import("core/wordfix.zig");
 	_ = @import("core/preprocess.zig");
+	_ = @import("core/codepages_test.zig");
 }

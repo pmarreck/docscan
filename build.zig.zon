@@ -1,25 +1,24 @@
 .{
-	.name = .docscan,
-	.version = "0.1.0",
-	.minimum_zig_version = "0.16.0",
-	.paths = .{
-		"build.zig",
-		"build.zig.zon",
-		"src",
-		"ffi",
-		"cli",
-	},
-	.dependencies = .{
-		// sqlite-vec provides both sqlite3 and vec extension
-		.sqlite_vec = .{
-			.url = "git+https://github.com/pmarreck/sqlite-vec.git#c9d3630f56637276829d9ab0c54b1116c6d3e2ef",
-			.hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0CTyBADFzDhhNOTSAUplRsfH1qs-DqwP6FwrZ641",
-		},
-		// uchardet encoding detection (C++ library with C API)
-		.uchardetz = .{
-			.url = "git+https://github.com/pmarreck/uchardetz.git#9737134e4b6a92ec2223f9c81c1e1648e1f9c994",
-			.hash = "uchardetz-0.0.6-koAyw7pFCwAzXYaKhsirPcnwf7wfPYm8B8UCRkNc2WbD",
-		},
-	},
-	.fingerprint = 0x20526b286e1fcb24,
+    .name = .docscan,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "ffi",
+        "cli",
+    },
+    .dependencies = .{
+        // sqlite-vec provides both sqlite3 and vec extension
+        .sqlite_vec = .{
+            .url = "git+https://github.com/pmarreck/sqlite-vec.git#c9d3630f56637276829d9ab0c54b1116c6d3e2ef",
+            .hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0CTyBADFzDhhNOTSAUplRsfH1qs-DqwP6FwrZ641",
+        },
+        .chardetz = .{
+            .url = "git+https://github.com/pmarreck/chardetz#e2f6e62fdbd29f9d41eda87ee731c3fbb5d6e167",
+            .hash = "chardetz-0.1.0-I0bi5_TFCQDDHlTmn5ausJ8WqDYd9sH1fsAfLLNhCK0d",
+        },
+    },
+    .fingerprint = 0x20526b286e1fcb24,
 }

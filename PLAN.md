@@ -223,10 +223,25 @@ citation "surpass" is live across formats; incitez_web consumes it.
   to push ligatures alone, or narrow encoding to C1-range-only as the defensible interim).
 
 **Open threads:**
-- [ ] **Encoding (strategic):** chardetz = pure-Zig uchardet (M1 done: tables+oracle+corpus;
-      M2–M6 = probers/FFI/WASM pending). **Peter is driving chardetz in its own session.**
-      When chardetz FFI/WASM lands, replace docscan's WinAnsi-default stopgap with chardetz
-      detection (works in the wasm slice; handles ALL odd encodings, not just CP1252).
+- [x] **Encoding (chardetz integration, 2026-06-14 EST):** chardetz (pure-Zig uchardet,
+      published & green) now drives `encoding.detectEncoding` — C++ uchardet fully retired
+      (uchardetz zon dep + all build.zig links + the `enable_uchardet` option removed; flake
+      zigDepsHash recomputed). Detection works in the wasm slice now too. `encoding.toUtf8`
+      transcodes EVERY single-byte charset chardetz can detect (Cyrillic/Greek/Hebrew/Arabic/
+      Thai/Turkish/Vietnamese/Central-European: 19 generated `codepages.zig` tables + the
+      existing WINDOWS-1252/ISO-8859-1/MAC-ROMAN) plus UTF-16/UTF-32 (BOM- and name-directed,
+      surrogate pairs). CJK multibyte is detected but NOT yet transcoded (deferred per Peter).
+      MFIC: tables written mechanically from Unicode MAPPINGS (VISCII via perl Encode),
+      differential-tested vs `iconv` over all 256 bytes × 22 charsets (5632 cells; hermetic
+      `@embedFile` oracle in codepages_test.zig). At generation iconv and MAPPINGS agreed on
+      all cells (0 divergences). Regenerate via `tools/gen_codepages.sh`.
+- [ ] **Encoding HEURISTIC (NEXT — Peter 2026-06-14): do NOT trust the chunk's CLAIMED
+      /Encoding NOR chardetz detection alone.** Per non-ASCII text run, decode it BOTH ways
+      (declared vs chardetz-detected), score each with `wordfix.textQuality`, keep the higher.
+      MFIC-style: the dictionary is the independent judge — neither the PDF's claim nor the
+      detector's claim is trusted alone. (Agreement => same result; pure-ASCII => no-op;
+      wrong-claim => garbled decode scores low and loses.) Wire into the PDF text path;
+      this RETIRES the WinAnsi-default stopgap in parser_pdf.zig (~line 739).
 - [ ] **Brann real-brief pdf split** (~19 chars/line, citations split mid-token): adaptive-gap
       did NOT fix it. Its content stream is pathological (cumulative TD, spurious `5.00 Tf`
       between body spans, erratic positioning). Needs instrumented diagnosis of the actual

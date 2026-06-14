@@ -1,59 +1,48 @@
 //! Character encoding detection and conversion for docscan.
 //! Provides three layers of encoding support:
 //! 1. Pre-computed CMap tables for known PDF font encodings (WinAnsi, MacRoman, etc.)
-//! 2. Heuristic encoding detection via uchardet (C++ FFI) as a last resort.
-//! 3. Conversion routines from detected encodings to UTF-8.
+//! 2. Heuristic charset detection via chardetz (pure-Zig uchardet reimplementation).
+//! 3. Conversion routines from detected encodings to UTF-8 (single-byte codepages
+//!    via codepages.zig + UTF-16/UTF-32; CJK multibyte is detected but not yet
+//!    transcoded).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+// chardetz: pure-Zig charset detector (universalchardet/uchardet reimplementation).
+// No C dependency, compiles to wasm32-freestanding — so detection now works in the
+// browser slice too, unlike the old C++ uchardet it replaces.
+const chardetz = @import("chardetz");
+// codepages: generated single-byte codepage→Unicode tables (iconv-verified).
+const codepages = @import("codepages.zig");
 
-// Charset *detection* (uchardet, C++ via the uchardetz package) is the only C
-// dependency on the parse path. It is gated behind build_options.enable_uchardet so
-// the wasm32-freestanding parse-to-text slice (enable_uchardet=false) has ZERO C deps
-// and ZERO imports; when disabled, detectEncoding returns null and callers assume
-// UTF-8. The pure-Zig getEncodingTable() below is always available.
-const enable_uchardet = @import("build_options").enable_uchardet;
-
-// ── uchardet C FFI (manual declarations to avoid header include path issues) ──
-
-const uchardet_t = *anyopaque;
-extern "C" fn uchardet_new() ?uchardet_t;
-extern "C" fn uchardet_delete(ud: uchardet_t) void;
-extern "C" fn uchardet_handle_data(ud: uchardet_t, data: [*]const u8, len_: usize) c_int;
-extern "C" fn uchardet_data_end(ud: uchardet_t) void;
-extern "C" fn uchardet_get_charset(ud: uchardet_t) [*:0]const u8;
-
-/// Detect the character encoding of a byte buffer using uchardet.
-/// Returns the encoding name (e.g., "WINDOWS-1252", "UTF-8", "ISO-8859-1")
-/// or null if detection fails or the library returns an empty string.
-/// The returned slice points into uchardet's internal buffer and is only valid
-/// until the next call to uchardet functions — copy it if you need to keep it.
-pub fn detectEncoding(data: []const u8) ?[]const u8 {
-    if (enable_uchardet) {
-        if (data.len == 0) return null;
-        const ud = uchardet_new() orelse return null;
-        defer uchardet_delete(ud);
-
-        if (uchardet_handle_data(ud, data.ptr, data.len) != 0) return null;
-        uchardet_data_end(ud);
-
-        const charset: [*:0]const u8 = uchardet_get_charset(ud);
-        const result = std.mem.span(charset);
-        if (result.len == 0) return null;
-        return result;
-    } else {
-        return null;
-    }
+/// Detect the character encoding of a byte buffer using chardetz.
+/// Returns the charset name (e.g. "WINDOWS-1252", "KOI8-R", "UTF-8") or null if
+/// detection is inconclusive (empty input or no confident match). The name is a
+/// static string owned by chardetz; the allocator is taken for API parity with
+/// chardetz.detect (the current detection path is allocation-free).
+pub fn detectEncoding(allocator: Allocator, data: []const u8) ?[]const u8 {
+    if (data.len == 0) return null;
+    const name = chardetz.detect(allocator, data);
+    if (name.len == 0) return null;
+    return name;
 }
 
-/// Convert bytes from a detected encoding to UTF-8.
-/// Supports: WINDOWS-1252, ISO-8859-1, MAC-ROMAN, ASCII, UTF-8.
-/// Falls back to Latin-1 (ISO-8859-1) for unrecognised encodings.
+/// Convert bytes from a named encoding to UTF-8.
+/// Handles: UTF-8/ASCII (passthrough), UTF-16/UTF-32 (BOM- and name-directed),
+/// WINDOWS-1252, ISO-8859-1, MAC-ROMAN, and every single-byte codepage in
+/// codepages.zig (Cyrillic/Greek/Hebrew/Arabic/Thai/Turkish/Vietnamese/…).
+/// Falls back to Latin-1 for unrecognised single-byte names. Bytes undefined in
+/// the source charset are dropped (matching iconv //IGNORE).
 pub fn toUtf8(allocator: Allocator, data: []const u8, encoding: []const u8) ![]const u8 {
     if (asciiEqlIgnoreCase(encoding, "UTF-8") or
-        asciiEqlIgnoreCase(encoding, "ASCII"))
+        asciiEqlIgnoreCase(encoding, "ASCII") or
+        asciiEqlIgnoreCase(encoding, "US-ASCII"))
     {
         return allocator.dupe(u8, data);
+    }
+    // UTF-16 / UTF-32 (name- or BOM-directed; handles surrogate pairs).
+    if (utf16or32(encoding)) |variant| {
+        return convertUtf16or32(allocator, data, variant);
     }
     if (asciiEqlIgnoreCase(encoding, "WINDOWS-1252")) {
         return convertWithTable(allocator, data, &win1252_to_unicode);
@@ -72,8 +61,101 @@ pub fn toUtf8(allocator: Allocator, data: []const u8, encoding: []const u8) ![]c
         // ISO-8859-1 is identity mapping to Unicode codepoints 0x00-0xFF
         return convertLatin1ToUtf8(allocator, data);
     }
+    // Single-byte legacy codepages (generated tables, iconv-verified).
+    if (codepages.tableFor(encoding)) |table| {
+        return convertWithTable(allocator, data, table);
+    }
     // Fallback: treat as Latin-1
     return convertLatin1ToUtf8(allocator, data);
+}
+
+/// The four concrete UTF-16/UTF-32 byte orders we decode.
+const WideEnc = enum { utf16le, utf16be, utf32le, utf32be };
+
+/// Classify a UTF-16/UTF-32 charset name (case-insensitive). The bare "UTF-16"/
+/// "UTF-32" forms default to little-endian but are overridden by a BOM in
+/// convertUtf16or32. Returns null for any non-UTF-16/32 name.
+fn utf16or32(name: []const u8) ?WideEnc {
+    if (asciiEqlIgnoreCase(name, "UTF-16LE") or asciiEqlIgnoreCase(name, "UTF16LE")) return .utf16le;
+    if (asciiEqlIgnoreCase(name, "UTF-16BE") or asciiEqlIgnoreCase(name, "UTF16BE")) return .utf16be;
+    if (asciiEqlIgnoreCase(name, "UTF-16") or asciiEqlIgnoreCase(name, "UTF16")) return .utf16le;
+    if (asciiEqlIgnoreCase(name, "UTF-32LE") or asciiEqlIgnoreCase(name, "UTF32LE")) return .utf32le;
+    if (asciiEqlIgnoreCase(name, "UTF-32BE") or asciiEqlIgnoreCase(name, "UTF32BE")) return .utf32be;
+    if (asciiEqlIgnoreCase(name, "UTF-32") or asciiEqlIgnoreCase(name, "UTF32")) return .utf32le;
+    return null;
+}
+
+/// Decode UTF-16 or UTF-32 to UTF-8. A leading BOM overrides the name's
+/// endianness and is stripped. UTF-16 surrogate pairs are combined; lone
+/// surrogates and out-of-range scalars are skipped.
+fn convertUtf16or32(allocator: Allocator, data: []const u8, enc: WideEnc) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    const is32 = (enc == .utf32le or enc == .utf32be);
+    var little = (enc == .utf16le or enc == .utf32le);
+    var off: usize = 0;
+    if (is32) {
+        if (data.len >= 4 and data[0] == 0xFF and data[1] == 0xFE and data[2] == 0x00 and data[3] == 0x00) {
+            little = true;
+            off = 4;
+        } else if (data.len >= 4 and data[0] == 0x00 and data[1] == 0x00 and data[2] == 0xFE and data[3] == 0xFF) {
+            little = false;
+            off = 4;
+        }
+        var i = off;
+        while (i + 4 <= data.len) : (i += 4) {
+            const cp: u32 = if (little)
+                @as(u32, data[i]) | (@as(u32, data[i + 1]) << 8) | (@as(u32, data[i + 2]) << 16) | (@as(u32, data[i + 3]) << 24)
+            else
+                @as(u32, data[i + 3]) | (@as(u32, data[i + 2]) << 8) | (@as(u32, data[i + 1]) << 16) | (@as(u32, data[i]) << 24);
+            try appendScalar(allocator, &buf, cp);
+        }
+    } else {
+        if (data.len >= 2 and data[0] == 0xFF and data[1] == 0xFE) {
+            little = true;
+            off = 2;
+        } else if (data.len >= 2 and data[0] == 0xFE and data[1] == 0xFF) {
+            little = false;
+            off = 2;
+        }
+        var i = off;
+        while (i + 2 <= data.len) {
+            const w0: u16 = if (little)
+                @as(u16, data[i]) | (@as(u16, data[i + 1]) << 8)
+            else
+                @as(u16, data[i + 1]) | (@as(u16, data[i]) << 8);
+            i += 2;
+            var cp: u32 = w0;
+            if (w0 >= 0xD800 and w0 <= 0xDBFF) {
+                // High surrogate: needs a following low surrogate.
+                if (i + 2 > data.len) break;
+                const w1: u16 = if (little)
+                    @as(u16, data[i]) | (@as(u16, data[i + 1]) << 8)
+                else
+                    @as(u16, data[i + 1]) | (@as(u16, data[i]) << 8);
+                if (w1 >= 0xDC00 and w1 <= 0xDFFF) {
+                    cp = 0x10000 + ((@as(u32, w0 - 0xD800) << 10) | (w1 - 0xDC00));
+                    i += 2;
+                } else {
+                    continue; // lone high surrogate — skip
+                }
+            } else if (w0 >= 0xDC00 and w0 <= 0xDFFF) {
+                continue; // lone low surrogate — skip
+            }
+            try appendScalar(allocator, &buf, cp);
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Append a Unicode scalar to `buf` as UTF-8; skip invalid scalars (surrogates
+/// or > U+10FFFF) rather than failing the whole conversion.
+fn appendScalar(allocator: Allocator, buf: *std.ArrayList(u8), cp: u32) !void {
+    if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return;
+    var tmp: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch return;
+    try buf.appendSlice(allocator, tmp[0..n]);
 }
 
 // ── Encoding Tables ─────────────────────────────────────────────────
@@ -395,17 +477,77 @@ test "encoding: PDFDocEncoding smart quotes" {
     try testing.expectEqualStrings("\xe2\x80\x9c\xe2\x80\x9d", result);
 }
 
-test "encoding: uchardet basic functionality" {
-    // uchardet should be callable without crashing.
-    // With pure ASCII, detection may return null or a valid encoding name.
+test "encoding: detectEncoding is callable and stable on ASCII" {
+    // chardetz should classify plain ASCII without crashing; result may be
+    // "ASCII"/"UTF-8" or null — we only assert it does not crash.
     const ascii_text = "Hello, world! This is plain text.";
-    _ = detectEncoding(ascii_text);
-    // No assertion on result — uchardet's behavior on pure ASCII is
-    // implementation-dependent (may return empty/null or "ASCII"/"UTF-8").
+    _ = detectEncoding(testing.allocator, ascii_text);
 }
 
-test "encoding: uchardet returns null for empty input" {
-    try testing.expectEqual(@as(?[]const u8, null), detectEncoding(""));
+test "encoding: detectEncoding returns null for empty input" {
+    try testing.expectEqual(@as(?[]const u8, null), detectEncoding(testing.allocator, ""));
+}
+
+test "encoding: toUtf8 transcodes KOI8-R Cyrillic" {
+    // "Привет" in KOI8-R.
+    const koi8 = &[_]u8{ 0xF0, 0xD2, 0xC9, 0xD7, 0xC5, 0xD4 };
+    const out = try toUtf8(testing.allocator, koi8, "KOI8-R");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("Привет", out);
+}
+
+test "encoding: toUtf8 transcodes WINDOWS-1251 Cyrillic" {
+    const cp1251 = &[_]u8{ 0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2 };
+    const out = try toUtf8(testing.allocator, cp1251, "WINDOWS-1251");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("Привет", out);
+}
+
+test "encoding: toUtf8 transcodes ISO-8859-7 Greek" {
+    const grk = &[_]u8{ 0xE1, 0xE2, 0xE3 };
+    const out = try toUtf8(testing.allocator, grk, "ISO-8859-7");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("αβγ", out);
+}
+
+test "encoding: toUtf8 TIS-620 aliases ISO-8859-11 (Thai)" {
+    // 0xA1 = THAI CHARACTER KO KAI (U+0E01) in both.
+    const thai = &[_]u8{0xA1};
+    const a = try toUtf8(testing.allocator, thai, "TIS-620");
+    defer testing.allocator.free(a);
+    const b = try toUtf8(testing.allocator, thai, "ISO-8859-11");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
+    try testing.expectEqualStrings("\xe0\xb8\x81", a); // U+0E01
+}
+
+test "encoding: toUtf8 UTF-16LE with BOM" {
+    const u16le = &[_]u8{ 0xFF, 0xFE, 0x48, 0x00, 0x69, 0x00 }; // BOM + "Hi"
+    const out = try toUtf8(testing.allocator, u16le, "UTF-16");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("Hi", out);
+}
+
+test "encoding: toUtf8 UTF-16BE with BOM" {
+    const u16be = &[_]u8{ 0xFE, 0xFF, 0x00, 0x48, 0x00, 0x69 }; // BOM + "Hi"
+    const out = try toUtf8(testing.allocator, u16be, "UTF-16");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("Hi", out);
+}
+
+test "encoding: toUtf8 UTF-16LE surrogate pair (emoji)" {
+    // U+1F600 = surrogate pair D83D DE00 → LE bytes 3D D8 00 DE.
+    const pair = &[_]u8{ 0x3D, 0xD8, 0x00, 0xDE };
+    const out = try toUtf8(testing.allocator, pair, "UTF-16LE");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("\xf0\x9f\x98\x80", out); // 😀
+}
+
+test "encoding: toUtf8 UTF-32LE with BOM" {
+    const u32le = &[_]u8{ 0xFF, 0xFE, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x69, 0x00, 0x00, 0x00 };
+    const out = try toUtf8(testing.allocator, u32le, "UTF-32");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("Hi", out);
 }
 
 test "encoding: Windows-1252 undefined bytes (0x81) are skipped" {
