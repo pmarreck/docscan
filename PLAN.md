@@ -191,3 +191,20 @@ incitez_web session. STOP at each milestone boundary — do NOT roll PDF build i
       docscan PDF parse pure-Zig or C-dep? rough wasm size delta? extraction quality (simple
       Tj/TJ content-stream only, or subset/CID font handling)? Decides PDF-via-WASM vs
       self-hosted pdf.js (incitez_web CSP `default-src 'none'; connect-src 'self'` → no CDN).
+
+## Citation pipeline (docscan slice) — per CITATION_PIPELINE_RESPONSIBILITIES.md
+
+docscan owns STRUCTURE-AWARE extraction + the offset map; incitez consumes the lone-\n
+hard-stop signal; incitez_web composes the map for source-highlighting. Marker contract
+agreed with incitez (2026-06-14): wraps→space, lone \n = boundary, no \n runs/trailing.
+
+- [x] **Phase 1 — structure-aware extraction (md/docx/pdf)** (2026-06-14): intra-paragraph
+      wraps → space (the ~47% recall fix), lone `\n` ONLY at structural boundaries. md =
+      paragraph reflow; docx = `<w:p>` boundary + `<w:br/>`→space + no `\n` runs; pdf = y-gap
+      threshold (font×2.2) wrap-vs-paragraph (headings already split by font-size sections).
+      Reporter-spacing class still byte-for-byte. TDD red→green per format. Pushed @ fdd78334.
+- [ ] **Phase 2 — offset map + `docscan_extract_structured`** (emitted↔original): sorted
+      `{emitted_off, original_off}` breakpoint array (piecewise-1:1, binary-search to map back);
+      new export returns `[u32 text_len][text][u32 n][n×{emitted,original}]` in one buffer.
+      md/txt exact byte-to-byte first; pdf/docx pending an incitez_web highlight-needs convo
+      ("original bytes" into a binary PDF isn't directly a highlight position).
