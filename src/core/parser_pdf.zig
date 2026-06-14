@@ -1478,8 +1478,19 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 							}
 						}
 					} else {
-						// Different line — use newline
-						try fs.content_buf.append(allocator, '\n');
+						// Different line. A normal single-line advance is an intra-paragraph
+						// WRAP -> join with a space (so citation tokens aren't split — the
+						// ~47% recall fix); only a larger vertical gap is a paragraph /
+						// structural boundary -> a lone '\n' (incitez's hard case-name stop).
+						// Headings are already separated upstream by font-size section detection.
+						const paragraph_threshold = prev_font_size * 2.2;
+						if (y_diff < paragraph_threshold) {
+							const blen = fs.content_buf.items.len;
+							const last_ws = blen > 0 and (fs.content_buf.items[blen - 1] == ' ' or fs.content_buf.items[blen - 1] == '\n');
+							if (!last_ws) try fs.content_buf.append(allocator, ' ');
+						} else {
+							try fs.content_buf.append(allocator, '\n');
+						}
 					}
 				} else {
 					try fs.content_buf.append(allocator, '\n');
@@ -1902,13 +1913,15 @@ test "same-line spans with word gaps get space separator" {
 	// Must contain "The dominant sequence" with spaces
 	try testing.expect(std.mem.indexOf(u8, content, "The dominant sequence") != null);
 }
-test "different-line spans get newline separator" {
-	// When spans have different Y positions (different lines), they should be
-	// joined with a newline.
+test "line wraps join with a space; a large vertical gap is a paragraph boundary" {
+	// Structure-aware (citation pipeline 2026-06-14): a normal single-line advance is
+	// an intra-paragraph wrap -> space (so citation tokens aren't split); only a large
+	// vertical gap is a paragraph boundary -> a lone '\n'.
 	const pdf = try buildTestPdf(testing.allocator, &.{
 		.{ .text_items = &.{
-			.{ .text = "Line one", .font_size = 12, .y_pos = 700 },
+			.{ .text = "Line one", .font_size = 12, .y_pos = 700 }, // wrap: 20pt gap (1.67x font)
 			.{ .text = "Line two", .font_size = 12, .y_pos = 680 },
+			.{ .text = "New paragraph", .font_size = 12, .y_pos = 620 }, // boundary: 60pt gap (5x font)
 		} },
 	});
 	defer testing.allocator.free(pdf);
@@ -1918,8 +1931,10 @@ test "different-line spans get newline separator" {
 
 	try testing.expect(doc.sections.len > 0);
 	const content = doc.sections[0].content;
-	// Should contain a newline between lines, not a space
-	try testing.expect(std.mem.indexOf(u8, content, "Line one\nLine two") != null);
+	// wrap -> space (joined), not a newline
+	try testing.expect(std.mem.indexOf(u8, content, "Line one Line two") != null);
+	// large gap -> paragraph boundary as a lone newline
+	try testing.expect(std.mem.indexOf(u8, content, "two\nNew paragraph") != null);
 }
 
 test "CMap parsing — bfchar and bfrange sections" {
@@ -2622,4 +2637,31 @@ test "pdf extraction preserves legal reporter intra-token spaces (no collapse)" 
 	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
 
 	try testing.expect(std.mem.indexOf(u8, all.items, "530 U. S. 238") != null);
+}
+
+test "pdf structure-aware: citation split across a line wrap joins (recall); paragraph gap = boundary" {
+	// Phase 1 (citation pipeline 2026-06-14): a citation token split by a layout
+	// line-wrap must rejoin (the ~47% recall fix); a real paragraph gap stays a lone
+	// '\n' boundary (incitez's hard case-name stop).
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "see Brown v.", .font_size = 12, .y_pos = 700 }, // wrap: 18pt gap
+			.{ .text = "Board, 347 U. S. 483.", .font_size = 12, .y_pos = 682 },
+			.{ .text = "Next paragraph.", .font_size = 12, .y_pos = 620 }, // boundary: 62pt gap
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/wrap.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+
+	// wrap joined -> citation token intact across the line break
+	try testing.expect(std.mem.indexOf(u8, c, "Brown v. Board, 347 U. S. 483.") != null);
+	// paragraph boundary preserved as a lone newline
+	try testing.expect(std.mem.indexOf(u8, c, "483.\nNext paragraph.") != null);
 }
