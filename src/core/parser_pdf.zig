@@ -1380,6 +1380,43 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 		flat_sections.deinit(allocator);
 	}
 
+	// Adaptive line-gap: real PDFs set per-span font sizes erratically (e.g. a spurious
+	// 5pt Tf between body spans), so a font-relative paragraph threshold is fragile. The
+	// document's OWN modal vertical line advance is the reliable wrap-vs-paragraph signal.
+	// Bucket consecutive same-page vertical advances (to the nearest point) over a sane
+	// line-height range; if a clear, well-sampled mode emerges, a gap >= modal*1.5 is a
+	// paragraph break. Otherwise (too few samples — synthetic/short docs) fall back to the
+	// per-span font heuristic below.
+	var modal_gap: f32 = 0;
+	{
+		var gap_counts = std.AutoHashMap(u32, usize).init(allocator);
+		defer gap_counts.deinit();
+		var have_prev_gap = false;
+		var gap_prev_y: f32 = 0;
+		var gap_prev_page: u32 = 0;
+		for (spans) |span| {
+			if (have_prev_gap and span.page == gap_prev_page) {
+				const g = @abs(span.y_position - gap_prev_y);
+				if (g >= 4.0 and g <= 72.0) {
+					const bucket: u32 = @intFromFloat(@round(g));
+					const e = try gap_counts.getOrPut(bucket);
+					if (e.found_existing) e.value_ptr.* += 1 else e.value_ptr.* = 1;
+				}
+			}
+			gap_prev_y = span.y_position;
+			gap_prev_page = span.page;
+			have_prev_gap = true;
+		}
+		var best: usize = 0;
+		var git = gap_counts.iterator();
+		while (git.next()) |e| {
+			if (e.value_ptr.* > best) {
+				best = e.value_ptr.*;
+				modal_gap = @floatFromInt(e.key_ptr.*);
+			}
+		}
+		if (best < 4) modal_gap = 0; // need a clear, well-sampled mode to trust it
+	}
 	var current: ?usize = null;
 	var prev_y: f32 = 0;
 	var prev_x: f32 = 0;
@@ -1490,7 +1527,9 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 						// ~47% recall fix); only a larger vertical gap is a paragraph /
 						// structural boundary -> a lone '\n' (incitez's hard case-name stop).
 						// Headings are already separated upstream by font-size section detection.
-						const paragraph_threshold = prev_font_size * 2.2;
+						// Adaptive when the document has a clear modal line height; else
+						// fall back to the per-span font heuristic (short/synthetic docs).
+						const paragraph_threshold = if (modal_gap > 0) modal_gap * 1.5 else prev_font_size * 2.2;
 						if (y_diff < paragraph_threshold) {
 							const blen = fs.content_buf.items.len;
 							const last_ws = blen > 0 and (fs.content_buf.items[blen - 1] == ' ' or fs.content_buf.items[blen - 1] == '\n');
@@ -2694,4 +2733,36 @@ test "Tm positioning with identity scale keeps the Tf font size (not the Tm d-co
 	for (spans.items) |s| {
 		try testing.expectApproxEqAbs(@as(f32, 10.0), s.font_size, 0.5);
 	}
+}
+
+test "pdf adaptive wrap-join: a spurious small per-span font doesn't split lines (modal line-gap)" {
+	// Real-brief pattern (Brann, incitez_web 2026-06-14): the generator emits a spurious
+	// '5 Tf' before a body span. A font-relative paragraph threshold (prev_font*2.2 = 11pt)
+	// then treats the normal single-line advance (16pt) as a boundary and splits the line
+	// ("Albritton v.\nGandy..."), dropping the citation. The document's OWN modal line
+	// advance (16pt here, x4) is the reliable signal: 16 = wrap (join), 32 = paragraph.
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "First body line here", .font_size = 14, .y_pos = 700 },
+			.{ .text = "second line of text", .font_size = 14, .y_pos = 684 }, // 16 gap (modal)
+			.{ .text = "Albritton v.", .font_size = 5, .y_pos = 668 }, // spurious 5pt Tf, 16 gap
+			.{ .text = "Gandy 531 So 2d 381", .font_size = 14, .y_pos = 652 }, // 16 gap AFTER the 5pt span
+			.{ .text = "more body content here", .font_size = 14, .y_pos = 636 }, // 16 gap
+			.{ .text = "New paragraph begins", .font_size = 14, .y_pos = 604 }, // 32 gap -> boundary
+		} },
+	});
+	defer testing.allocator.free(pdf);
+
+	const doc = try parse(testing.allocator, pdf, "/test/brann.pdf");
+	defer freeDocument(testing.allocator, doc);
+
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+
+	// the line after the spurious 5pt span joins instead of splitting
+	try testing.expect(std.mem.indexOf(u8, c, "Albritton v. Gandy 531 So 2d 381") != null);
+	// the 32pt gap is preserved as a paragraph boundary (lone newline)
+	try testing.expect(std.mem.indexOf(u8, c, "more body content here\nNew paragraph begins") != null);
 }
