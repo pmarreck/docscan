@@ -731,21 +731,30 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 			}
 		}
 
-		// Fallback: check /Encoding name for a known encoding table
+		// Map via the font's /Encoding table, DEFAULTING to WinAnsi (CP1252) for simple
+		// fonts that declare no (or an unrecognized) encoding. This turns raw high bytes
+		// (curly quotes 0x93/0x94, em dash 0x97, etc.) into proper UTF-8 instead of invalid
+		// raw bytes. WinAnsi is the de-facto default for non-symbolic PDF text fonts;
+		// deterministic (no charset guessing) and pure-Zig (works in the wasm slice, where
+		// the uchardet charset detector is comptime-excluded).
 		const enc_name = pdf_objects.getDictName(font_obj_dict, "Encoding");
-		if (enc_name) |ename| {
-			if (encoding.getEncodingTable(ename)) |table| {
-				var cmap = buildCMapFromEncodingTable(allocator, table);
-				const owned_name = allocator.dupe(u8, font_name) catch {
-					cmap.deinit();
-					continue;
-				};
-				font_maps.put(owned_name, cmap) catch {
-					allocator.free(owned_name);
-					cmap.deinit();
-					continue;
-				};
+		const enc_table: ?*const [256]u21 = blk: {
+			if (enc_name) |ename| {
+				if (encoding.getEncodingTable(ename)) |t| break :blk t;
 			}
+			break :blk encoding.getEncodingTable("WinAnsiEncoding");
+		};
+		if (enc_table) |table| {
+			var cmap = buildCMapFromEncodingTable(allocator, table);
+			const owned_name = allocator.dupe(u8, font_name) catch {
+				cmap.deinit();
+				continue;
+			};
+			font_maps.put(owned_name, cmap) catch {
+				allocator.free(owned_name);
+				cmap.deinit();
+				continue;
+			};
 		}
 	}
 }
@@ -2765,4 +2774,25 @@ test "pdf adaptive wrap-join: a spurious small per-span font doesn't split lines
 	try testing.expect(std.mem.indexOf(u8, c, "Albritton v. Gandy 531 So 2d 381") != null);
 	// the 32pt gap is preserved as a paragraph boundary (lone newline)
 	try testing.expect(std.mem.indexOf(u8, c, "more body content here\nNew paragraph begins") != null);
+}
+
+test "pdf: undeclared simple-font high bytes map via WinAnsi (CP1252) to UTF-8, not raw" {
+	// Peter/incitez_web 2026-06-14: PDF simple fonts declaring no /Encoding and no
+	// ToUnicode emitted raw CP1252 bytes (0x93/0x94 curly quotes, 0x97 em dash) =>
+	// invalid UTF-8. Default such fonts to WinAnsi so bytes become proper UTF-8.
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = "\x93Hello\x94 \x97 there", .font_size = 12, .y_pos = 700 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/cp1252.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "\u{201C}Hello\u{201D}") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "\u{2014}") != null);
+	try testing.expect(std.mem.indexOfScalar(u8, c, 0x93) == null);
 }

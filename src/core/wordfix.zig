@@ -796,11 +796,43 @@ pub fn rejoinWords(allocator: Allocator, text: []const u8) ![]const u8 {
 
 const document = @import("document.zig");
 
+/// Normalize Latin presentation-form ligatures (U+FB00..U+FB06) to their ASCII
+/// component letters. Ligatures are a typographic/view concern; decomposing them
+/// keeps extracted text matchable downstream (search, citation reporters/parties).
+pub fn normalizeLigatures(allocator: Allocator, text: []const u8) ![]u8 {
+	var buf: std.ArrayList(u8) = .empty;
+	errdefer buf.deinit(allocator);
+	var i: usize = 0;
+	while (i < text.len) {
+		// U+FB00..U+FB06 encode as EF AC 80..86 in UTF-8.
+		if (i + 3 <= text.len and text[i] == 0xEF and text[i + 1] == 0xAC and text[i + 2] >= 0x80 and text[i + 2] <= 0x86) {
+			try buf.appendSlice(allocator, switch (text[i + 2]) {
+				0x80 => "ff",
+				0x81 => "fi",
+				0x82 => "fl",
+				0x83 => "ffi",
+				0x84 => "ffl",
+				0x85, 0x86 => "st",
+				else => unreachable,
+			});
+			i += 3;
+		} else {
+			try buf.append(allocator, text[i]);
+			i += 1;
+		}
+	}
+	return try buf.toOwnedSlice(allocator);
+}
 /// Walk all sections recursively and apply text normalization.
 pub fn applySections(allocator: Allocator, sections: []const document.Section) void {
 	const mutable: []document.Section = @constCast(sections);
 	for (mutable) |*section| {
 		if (section.content.len > 0) {
+			// Normalize ligatures first (view concern -> downstream-matchable text),
+			// then rejoin OCR/PDF word-splits.
+			const deligatured = normalizeLigatures(allocator, section.content) catch continue;
+			allocator.free(@constCast(section.content));
+			section.content = deligatured;
 			const fixed = rejoinWords(allocator, section.content) catch continue;
 			allocator.free(@constCast(section.content));
 			section.content = fixed;
@@ -1241,5 +1273,22 @@ test "rejoinWords preserves legal reporter intra-token spaces (no 'U. S.' -> 'US
 		const out = try rejoinWords(a, c);
 		defer a.free(out);
 		try std.testing.expectEqualStrings(c, out);
+	}
+}
+
+test "normalizeLigatures decomposes Latin presentation-form ligatures to ASCII" {
+	const a = std.testing.allocator;
+	const Case = struct { in: []const u8, out: []const u8 };
+	const cases = [_]Case{
+		.{ .in = "o\u{FB03}ce", .out = "office" }, // ffi
+		.{ .in = "\u{FB01}le", .out = "file" }, // fi
+		.{ .in = "\u{FB02}ow", .out = "flow" }, // fl
+		.{ .in = "sta\u{FB00}", .out = "staff" }, // ff
+		.{ .in = "no ligatures here", .out = "no ligatures here" },
+	};
+	for (cases) |tc| {
+		const got = try normalizeLigatures(a, tc.in);
+		defer a.free(got);
+		try std.testing.expectEqualStrings(tc.out, got);
 	}
 }
