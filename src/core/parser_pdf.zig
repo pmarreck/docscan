@@ -4151,3 +4151,56 @@ test "dotLeaderToNewline replaces 5+ dot leaders, preserves ellipses and reporte
 		try testing.expectEqualStrings(tc.want, got);
 	}
 }
+
+/// Two abutting runs "Gas" + "Co." at a camelCase boundary (the dropped-space site)
+/// on one line, plus a single-token "BethEnergy" run. The run-joiner must insert a
+/// space where the concatenation is a non-word ("GasCo") but leave a genuine
+/// single-token camelCase name ("BethEnergy") alone.
+fn buildPdfCamelRunBoundary(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	// "Gas" then "Co." as separate runs butting together (14pt advance ≈ width of "Gas"),
+	// then a single-run "BethEnergy" on the next line.
+	const stream =
+		"BT\n/F1 12 Tf\n100 700 Td\n(Natural Carbonic Gas) Tj\n14 0 Td\n(Co., 220 U. S. 61) Tj\n" ++
+		"0 -15 Td\n(Pauley v. BethEnergy Mines) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: dropped space at a camelCase run boundary is restored, single-token name kept" {
+	// incitez_web 2026-06-15: "GasCo."→"Gas Co." (a dropped run-boundary space) is fixed
+	// because isWord("GasCo") is now false → the run-joiner inserts a space. A genuine
+	// single-token camelCase name ("BethEnergy") has no run boundary and must NOT split.
+	const pdf = try buildPdfCamelRunBoundary(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/camel.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "Gas Co.") != null); // dropped space restored
+	try testing.expect(std.mem.indexOf(u8, c, "GasCo") == null);
+	try testing.expect(std.mem.indexOf(u8, c, "BethEnergy") != null); // single token kept
+	try testing.expect(std.mem.indexOf(u8, c, "Beth Energy") == null);
+}
