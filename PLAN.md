@@ -344,6 +344,20 @@ citation "surpass" is live across formats; incitez_web consumes it.
             while a genuine single-token name ("BethEnergy", no run boundary) is left intact
             (so "PepsiCo" won't wrongly split). Regression test locks both. ALL 4 of
             incitez_web's residual artifacts resolved.
+      - [x] **(5d) ToA section headers on their own line** (2026-06-15 EST): incitez verified the
+            dot-leader→\n fix on Brann (welding gone, 348 cites, attribution recovered) and asked
+            for one high-value structural fix: a Table-of-Authorities section header ("Cases",
+            "Statutes", "Other Authorities", …) is its own visual line but was merged onto entry 1
+            ("Cases Albritton v. Gandy"), bleeding into the party name (BOTH docscan and eyecite
+            mis-attribute "Cases Albritton" — parity). `splitToAHeaders` inserts a lone \n after a
+            known header (longest-match, case-insensitive) when followed by space + capital/digit
+            (the first entry); capital/digit guard avoids splitting body prose ("Cases involving…").
+            Verified on Brann (Cases/Statutes/Other Authorities now on own lines), 0 spurious splits
+            in non-legal corpus docs, 27/27 held. Lets incitez's \n-hard-stop strip the header →
+            "Albritton" → incitez SURPASSES eyecite. Classifier-over-set + synthetic-PDF tests.
+            incitez's cosmetic ask (B — page-refs stranded at line starts by the mid-entry leader→\n)
+            is explicitly DEFERRED (incitez's walk-back already ignores leading digits; lowercase-v
+            entries parse correctly). The all-caps "V." OCR line is incitez's own antecedent fix, not docscan's.
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
             fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
             Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
