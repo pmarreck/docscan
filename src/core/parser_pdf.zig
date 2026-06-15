@@ -1861,6 +1861,38 @@ fn isAlphaByte(c: u8) bool {
 	return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
 }
 
+/// How to treat a line-break hyphen at a soft wrap: the previous line ended with
+/// "<left>-" and the next line starts with "<right>". `.drop` = soft hyphenation,
+/// remove the hyphen (the joined form is a dictionary word, OR the left fragment is
+/// not a word — a proper-noun split like "Ada-rand"→"Adarand"); `.keep` = a real
+/// compound (left IS a word but the join is not, e.g. "well-known"); `.not_applicable`
+/// = not a clean alpha word-continuation (fall back to normal spacing). Only consulted
+/// at an actual line wrap, so mid-line compounds ("e-mail", "x-ray") are untouched.
+const WrapHyphen = enum { drop, keep, not_applicable };
+fn wrapHyphenDecision(buf: []const u8, next: []const u8) WrapHyphen {
+	if (buf.len == 0 or buf[buf.len - 1] != '-') return .not_applicable;
+	var lstart = buf.len - 1; // index of the trailing hyphen
+	while (lstart > 0 and isAlphaByte(buf[lstart - 1])) lstart -= 1;
+	const left = buf[lstart .. buf.len - 1];
+	var re: usize = 0;
+	while (re < next.len and isAlphaByte(next[re])) re += 1;
+	const right = next[0..re];
+	if (left.len == 0 or right.len == 0) return .not_applicable;
+	var cbuf: [128]u8 = undefined;
+	if (left.len + right.len <= cbuf.len) {
+		@memcpy(cbuf[0..left.len], left);
+		@memcpy(cbuf[left.len .. left.len + right.len], right);
+		if (wordfix.isWord(cbuf[0 .. left.len + right.len])) return .drop;
+	}
+	// Capitalization disambiguates the remaining cases (the dictionary can't: "Ada"/"rand"
+	// are both words yet "Adarand" is a proper-noun split, while "well"/"known" are a real
+	// compound). A hyphenated proper compound is Cap+Cap ("Smith-Jones") → keep the hyphen.
+	if (std.ascii.isUpper(left[0]) and std.ascii.isUpper(right[0])) return .keep;
+	if (!wordfix.isWord(left)) return .drop; // non-word left fragment (Bos-, BethEn-, e-) → soft split
+	if (std.ascii.isUpper(left[0])) return .drop; // Capitalized word + lowercase tail = proper-noun split (Ada-rand)
+	return .keep; // lowercase word, join is not a word → real compound (well-known, self-evident)
+}
+
 /// Detokenizer-aware separator between two runs. pdfminer decides spacing purely
 /// by x-gap, which yields "word , comma"; we add punctuation attachment so closing
 /// punctuation hugs the previous token and openers hug the next. Punctuation rules
@@ -1903,6 +1935,40 @@ fn joinLineRuns(allocator: Allocator, line: PdfLine) ![]u8 {
 	}
 	return buf.toOwnedSlice(allocator);
 }
+
+/// Replace Table-of-Authorities dot-leader runs with a lone newline (incitez 2026-06-15:
+/// a structural separator so a citation walk-back stops there instead of welding entry
+/// N's page refs onto entry N+1's name). Lexical equivalent of /(?:\.[ \t]*){5,}/ → "\n":
+/// 5+ dots, each optionally followed by spaces/tabs. The 5+ threshold preserves 3-dot
+/// "..." ellipses, Bluebook 4-dot "....", and reporter spacing ("U. S." never reaches a
+/// run of 5). Preceding spaces are dropped so the boundary is a lone newline.
+fn dotLeaderToNewline(allocator: Allocator, text: []const u8) ![]u8 {
+	var out = std.ArrayList(u8).empty;
+	errdefer out.deinit(allocator);
+	var i: usize = 0;
+	while (i < text.len) {
+		if (text[i] == '.') {
+			var j = i;
+			var dots: usize = 0;
+			while (j < text.len and (text[j] == '.' or text[j] == ' ' or text[j] == '\t')) {
+				if (text[j] == '.') dots += 1;
+				j += 1;
+			}
+			if (dots >= 5) {
+				while (out.items.len > 0 and (out.items[out.items.len - 1] == ' ' or out.items[out.items.len - 1] == '\t')) _ = out.pop();
+				try out.append(allocator, '\n');
+				i = j;
+				continue;
+			}
+			try out.appendSlice(allocator, text[i..j]);
+			i = j;
+			continue;
+		}
+		try out.append(allocator, text[i]);
+		i += 1;
+	}
+	return out.toOwnedSlice(allocator);
+}
 /// Infer document structure from text spans using font size heuristics.
 /// Larger text = headings, dominant (most common) size = body text.
 fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Section {
@@ -1929,7 +1995,9 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 		line_spans.deinit(allocator);
 	}
 	for (cl.lines) |line| {
-		const text = try joinLineRuns(allocator, line);
+		const joined = try joinLineRuns(allocator, line);
+		defer allocator.free(joined);
+		const text = try dotLeaderToNewline(allocator, joined); // ToA leaders → newline boundary
 		try line_spans.append(allocator, .{
 			.text = text,
 			.font_size = line.size,
@@ -2158,8 +2226,17 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 						const paragraph_threshold = if (modal_gap > 0) modal_gap * 1.5 else prev_font_size * 2.2;
 						if (y_diff < paragraph_threshold) {
 							const blen = fs.content_buf.items.len;
-							const last_ws = blen > 0 and (fs.content_buf.items[blen - 1] == ' ' or fs.content_buf.items[blen - 1] == '\n');
-							if (!last_ws) try fs.content_buf.append(allocator, ' ');
+							// A line-break hyphen joins a word across the wrap (incitez_web
+							// 2026-06-15: case names like "Ada-\nrand"→"Adarand"). Drop a soft
+							// hyphen, keep a real compound ("well-known"), no space either way.
+							switch (wrapHyphenDecision(fs.content_buf.items, span.text)) {
+								.drop => _ = fs.content_buf.pop(),
+								.keep => {},
+								.not_applicable => {
+									const last_ws = blen > 0 and (fs.content_buf.items[blen - 1] == ' ' or fs.content_buf.items[blen - 1] == '\n');
+									if (!last_ws) try fs.content_buf.append(allocator, ' ');
+								},
+							}
 						} else {
 							try fs.content_buf.append(allocator, '\n');
 						}
@@ -3930,4 +4007,147 @@ test "reorderRunsByReading: full-width header above a two-column band stays in p
 	// next 6 are all left, then 6 right
 	for (out[1..7]) |s| try testing.expectEqualStrings("Lx", s.text);
 	for (out[7..13]) |s| try testing.expectEqualStrings("Rx", s.text);
+}
+
+/// Build a 1-page PDF with two wrapped body lines: line 1 ends "...scrutiny, Ada-"
+/// and line 2 starts "rand Constructors…" — a proper-noun case name hyphenated across
+/// a line break. de-hyphenation must yield "Adarand", and the real compound "well-known"
+/// (also wrapped) must KEEP its hyphen.
+fn buildPdfWrapHyphen(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	// Four wrapped lines (each advance -15, within the wrap threshold): a proper-noun
+	// split (Ada-/rand), a real compound (well-/known), and a dictionary split (over-/come).
+	const stream =
+		"BT\n/F1 12 Tf\n100 700 Td\n(known as strict scrutiny, Ada-) Tj\n" ++
+		"0 -15 Td\n(rand Constructors, Inc. is a well-) Tj\n" ++
+		"0 -15 Td\n(known firm that will over-) Tj\n" ++
+		"0 -15 Td\n(come all challenges here.) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: line-break hyphen rejoined for proper nouns, kept for real compounds" {
+	// incitez_web 2026-06-15: case names hyphenated across a line break ("Ada-\nrand")
+	// were left as "Ada-rand" because dictionary de-hyphenation only fires when the
+	// joined form is a dict word. At a wrap boundary we KNOW it's a line-break hyphen:
+	// drop it for soft splits (joined is a word, or the left fragment is not a word →
+	// proper noun), keep it for real compounds (left is a word, join is not).
+	const pdf = try buildPdfWrapHyphen(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/wraphyphen.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "Adarand") != null); // proper-noun split rejoined
+	try testing.expect(std.mem.indexOf(u8, c, "Ada-rand") == null);
+	try testing.expect(std.mem.indexOf(u8, c, "overcome") != null); // dict split rejoined
+	try testing.expect(std.mem.indexOf(u8, c, "well-known") != null); // real compound kept
+	try testing.expect(std.mem.indexOf(u8, c, "wellknown") == null);
+}
+
+test "wrapHyphenDecision classifies line-break hyphens over a set" {
+	const Case = struct { buf: []const u8, next: []const u8, want: WrapHyphen };
+	const cases = [_]Case{
+		// DROP — soft splits
+		.{ .buf = "scrutiny, Ada-", .next = "rand Constructors", .want = .drop }, // proper noun, Cap+lower
+		.{ .buf = "Group of Bos-", .next = "ton, Inc.", .want = .drop }, // non-word left
+		.{ .buf = "v. BethEn-", .next = "ergy Mines", .want = .drop }, // non-word left
+		.{ .buf = "will over-", .next = "come all", .want = .drop }, // joined IS a dict word
+		.{ .buf = "send an e-", .next = "mail today", .want = .drop }, // single-letter left, not a word
+		// KEEP — real compounds
+		.{ .buf = "a well-", .next = "known firm", .want = .keep }, // lowercase compound
+		.{ .buf = "is self-", .next = "evident now", .want = .keep }, // lowercase compound
+		.{ .buf = "filed by Vornak-", .next = "Tessik LLP today", .want = .keep }, // Cap+Cap distinct names → keep hyphen
+		// NOT_APPLICABLE — fall back to normal spacing
+		.{ .buf = "no hyphen here", .next = "next word", .want = .not_applicable }, // no trailing hyphen
+		.{ .buf = "page 5-", .next = "9 of brief", .want = .not_applicable }, // right not alphabetic
+	};
+	for (cases) |tc| try testing.expectEqual(tc.want, wrapHyphenDecision(tc.buf, tc.next));
+}
+
+/// Build a 1-page PDF with two Table-of-Authorities lines whose dot leaders connect
+/// each case name to its page number. The leaders must become lone newlines so a
+/// citation walk-back stops there (incitez 2026-06-15), not weld entry N's pages onto
+/// entry N+1's name.
+fn buildPdfDotLeaderToA(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	const stream =
+		"BT\n/F1 12 Tf\n100 700 Td\n(Winn Lovett Grocery Co. v. Archer .......... 32) Tj\n" ++
+		"0 -15 Td\n(Pierce v. Society of Sisters ............ 47) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: ToA dot-leaders become newline boundaries, not welds" {
+	const pdf = try buildPdfDotLeaderToA(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/toa.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "Archer\n32") != null); // leader → newline boundary
+	try testing.expect(std.mem.indexOf(u8, c, "Sisters\n47") != null);
+	try testing.expect(std.mem.indexOf(u8, c, ".....") == null); // no 5+ dot leader survives
+}
+
+test "dotLeaderToNewline replaces 5+ dot leaders, preserves ellipses and reporter spacing" {
+	const Case = struct { in: []const u8, want: []const u8 };
+	const cases = [_]Case{
+		.{ .in = "Warley .......... 19", .want = "Warley\n19" }, // leader → newline, no trailing space
+		.{ .in = "Sisters . . . . . 47", .want = "Sisters\n47" }, // spaced dots, 5 → leader
+		.{ .in = "see id. . . . here", .want = "see id. . . . here" }, // 4 dots (incl id.) — under 5, kept
+		.{ .in = "ellipsis.... done", .want = "ellipsis.... done" }, // Bluebook 4-dot kept
+		.{ .in = "trailing off...", .want = "trailing off..." }, // 3-dot ellipsis kept
+		.{ .in = "530 U. S. 238 (2000)", .want = "530 U. S. 238 (2000)" }, // reporter spacing untouched
+		.{ .in = "no dots here", .want = "no dots here" },
+	};
+	for (cases) |tc| {
+		const got = try dotLeaderToNewline(testing.allocator, tc.in);
+		defer testing.allocator.free(got);
+		try testing.expectEqualStrings(tc.want, got);
+	}
 }
