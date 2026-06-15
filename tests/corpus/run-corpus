@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# run-corpus — dev-time differential gate for PDF extraction over a stratified,
+# PUBLIC corpus (tests/corpus/fetched/, built by tools/fetch-corpus.sh).
+#
+# WHY: the line-aware heuristics (dominant font size, line/paragraph grouping) are
+# statistically dependent on document COMPOSITION. A fix validated on ONE document
+# (e.g. the Brann brief) is overfitting. This validates them as classifiers over a
+# SIZE/COMPOSITION-STRATIFIED SET, against an INDEPENDENT oracle (pdftotext/poppler).
+#
+# Per-document metrics (must hold for ALL):
+#   - word recall: share of pdftotext's >=3-char alnum words present in ours.
+#       Catches dropped/garbled/mis-encoded text + gross structure loss.
+#   - heading fraction: share of extracted chars in heading lines (markdown '#').
+#       Catches the dominant-size failure (~everything flagged a heading).
+#
+# Requires: a built docscan (./build → zig-out/bin/docscan) + pdftotext on PATH.
+# NOT in the hermetic CI test (needs corpus + poppler); run it locally during
+# heuristic work. set -u only (never -e: we assert exit codes ourselves).
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DOCSCAN="${DOCSCAN:-$ROOT/zig-out/bin/docscan}"
+CORPUS="$ROOT/tests/corpus/fetched"
+MIN_RECALL="${MIN_RECALL:-0.80}"
+MAX_HEADING_FRAC="${MAX_HEADING_FRAC:-0.45}"
+
+command -v pdftotext >/dev/null 2>&1 || { echo "SKIP: pdftotext not on PATH (the oracle)"; exit 0; }
+[ -x "$DOCSCAN" ] || { echo "SKIP: no docscan binary at $DOCSCAN (run ./build)"; exit 0; }
+[ -d "$CORPUS" ] && ls "$CORPUS"/*.pdf >/dev/null 2>&1 || { echo "SKIP: no corpus at $CORPUS (run tools/fetch-corpus.sh)"; exit 0; }
+
+tok() { tr -cs 'A-Za-z0-9' '\n' | tr 'A-Z' 'a-z' | awk 'length($0)>=3' | sort -u; }
+
+printf '%-34s %8s %8s %8s  %s\n' "document" "recall" "head_fr" "chars" "result"
+fail=0
+total=0
+for pdf in "$CORPUS"/*.pdf; do
+	total=$((total + 1))
+	name="$(basename "$pdf")"
+	our="$("$DOCSCAN" extract --markdown --simple "$pdf" 2>/dev/null)"
+	ref="$(pdftotext "$pdf" - 2>/dev/null)"
+
+	refw="$(printf '%s' "$ref" | tok)"
+	ourw="$(printf '%s' "$our" | tok)"
+	refn="$(printf '%s\n' "$refw" | grep -c . || true)"
+	common="$(comm -12 <(printf '%s\n' "$refw") <(printf '%s\n' "$ourw") | grep -c . || true)"
+	recall="$(awk -v c="$common" -v r="$refn" 'BEGIN{ printf (r>0)? c/r : 1 }')"
+
+	# heading fraction from markdown: chars in lines starting with '#'.
+	read -r hchars tchars < <(printf '%s\n' "$our" | awk '
+		{ t += length($0) + 1 }
+		/^#+([ \t]|$)/ { h += length($0) + 1 }
+		END { printf "%d %d", h+0, t+0 }')
+	hfrac="$(awk -v h="$hchars" -v t="$tchars" 'BEGIN{ printf (t>0)? h/t : 0 }')"
+
+	ok="$(awk -v rc="$recall" -v hf="$hfrac" -v mr="$MIN_RECALL" -v mh="$MAX_HEADING_FRAC" 'BEGIN{ print (rc>=mr && hf<=mh) ? "ok" : "FAIL" }')"
+	[ "$ok" = "FAIL" ] && fail=$((fail + 1))
+	printf '%-34s %8.2f %8.2f %8d  %s\n' "$name" "$recall" "$hfrac" "$tchars" "$ok"
+done
+
+echo "------------------------------------------------------------------"
+echo "$((total - fail))/$total passed (recall>=$MIN_RECALL, heading_frac<=$MAX_HEADING_FRAC)"
+[ "$fail" -eq 0 ]

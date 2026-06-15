@@ -1516,6 +1516,29 @@ fn firstNonSpace(s: []const u8) ?u8 {
 	return null;
 }
 
+/// True when the boundary letters of two runs would merge into a NON-dictionary
+/// word ("for"+"an" → "foran"). Used to keep a narrow real space when the x-gap
+/// alone is ambiguous. Returns false if either side's boundary fragment is <2
+/// letters or non-alphabetic (i.e. there's already a separator/punctuation).
+fn joinedFragmentIsNonWord(prev_text: []const u8, next_text: []const u8) bool {
+	var ps = prev_text.len;
+	while (ps > 0 and isAlphaByte(prev_text[ps - 1])) ps -= 1;
+	const pf = prev_text[ps..];
+	var ne: usize = 0;
+	while (ne < next_text.len and isAlphaByte(next_text[ne])) ne += 1;
+	const nf = next_text[0..ne];
+	if (pf.len < 2 or nf.len < 2) return false;
+	if (pf.len + nf.len > 128) return false;
+	var buf: [128]u8 = undefined;
+	@memcpy(buf[0..pf.len], pf);
+	@memcpy(buf[pf.len .. pf.len + nf.len], nf);
+	return !wordfix.isWord(buf[0 .. pf.len + nf.len]);
+}
+
+fn isAlphaByte(c: u8) bool {
+	return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+}
+
 /// Detokenizer-aware separator between two runs. pdfminer decides spacing purely
 /// by x-gap, which yields "word , comma"; we add punctuation attachment so closing
 /// punctuation hugs the previous token and openers hug the next. Punctuation rules
@@ -1535,7 +1558,14 @@ fn runSeparator(prev: TextSpan, next: TextSpan) RunSep {
 	}
 	// x-gap: if next starts at/inside prev's estimated extent, they butt together.
 	const prev_right = prev.x_position + @as(f32, @floatFromInt(prev.text.len)) * prev.font_size * 0.4;
-	if (next.x_position - prev_right < next.font_size * 0.15) return .none;
+	if (next.x_position - prev_right < next.font_size * 0.15) {
+		// Tight gap usually means a mid-word split (no space). But if joining the
+		// adjacent letter-fragments yields a NON-word ("for"+"an" = "foran"), it was
+		// a real narrow space — keep it (dictionary heuristic from the pre-line-aware
+		// path; the rejoin pass can't re-split a wrongly-merged word).
+		if (joinedFragmentIsNonWord(prev.text, next.text)) return .space;
+		return .none;
+	}
 	return .space;
 }
 
@@ -1553,14 +1583,45 @@ fn joinLineRuns(allocator: Allocator, line: PdfLine) ![]u8 {
 }
 /// Infer document structure from text spans using font size heuristics.
 /// Larger text = headings, dominant (most common) size = body text.
-fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Section {
-	if (spans.len == 0) return try allocator.alloc(Section, 0);
+fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Section {
+	if (run_spans.len == 0) return try allocator.alloc(Section, 0);
 
-	// Find dominant font size (most common, by total character count)
+	// Line-aware re-section: collapse the raw runs into one synthetic span PER
+	// VISUAL LINE (median font size, detokenizer-joined text) before any structure
+	// inference. Real PDFs (e.g. the Brann brief) set per-run font sizes erratically
+	// (9.2–16.2 within a sentence), which made the per-span heading detector below
+	// misclassify mid-sentence runs as headings and shred the document into bogus
+	// one-run sections. Keying off the per-LINE median fixes that; intra-line spacing
+	// is already resolved by joinLineRuns. All logic below operates on these line
+	// spans (the `spans` shadow), so it needs no further change.
+	const cl = try clusterRunsIntoLines(allocator, run_spans);
+	defer freeLines(allocator, cl);
+	var line_spans = std.ArrayList(TextSpan).empty;
+	defer {
+		for (line_spans.items) |ls| allocator.free(ls.text);
+		line_spans.deinit(allocator);
+	}
+	for (cl.lines) |line| {
+		const text = try joinLineRuns(allocator, line);
+		try line_spans.append(allocator, .{
+			.text = text,
+			.font_size = line.size,
+			.page = line.page,
+			.y_position = line.y,
+			.x_position = if (line.runs.len > 0) line.runs[0].x_position else 0,
+		});
+	}
+	const spans = line_spans.items;
+	// Dominant font size (most common by char count). Computed over the RAW runs,
+	// not the collapsed line medians: a line whose runs are mostly spurious 5pt
+	// glyphs has median 5, and there are enough such lines in real briefs (dot
+	// leaders, footnotes) to drag a line-median mode down to 5 — which would make
+	// the body-size threshold tiny and flag everything as a heading. The raw-run
+	// mode is the true body size (14pt body text dominates by total characters).
 	var size_counts = std.AutoHashMap(u32, usize).init(allocator);
 	defer size_counts.deinit();
 
-	for (spans) |span| {
+	for (run_spans) |span| {
 		const key = @as(u32, @bitCast(span.font_size));
 		const entry = try size_counts.getOrPut(key);
 		if (entry.found_existing) {
@@ -1570,6 +1631,13 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 		}
 	}
 
+	// Dominant = mode (most common size by char count). NOTE: this is fooled by a
+	// heavy tail of tiny text on the Brann outlier (its Table of Authorities is
+	// mostly 5pt dot-leaders → mode 5 → threshold ~5.75 → every line flagged a
+	// heading). Median-by-char fixes Brann but regresses short heading-heavy docs
+	// (the median char lands in a heading size → no headings). A robust heuristic
+	// validated across BOTH the unit tests AND tools/fetch-corpus.sh is still owed
+	// (see PLAN.md). Keeping mode for now: 8/9 corpus + all unit tests pass.
 	var dominant_size: f32 = 12.0;
 	var max_count: usize = 0;
 	var iter = size_counts.iterator();
@@ -3299,4 +3367,33 @@ test "joinLineRuns: distinct words with an x-gap get a single space" {
 	const out = try joinLineRuns(testing.allocator, line);
 	defer testing.allocator.free(out);
 	try testing.expectEqualStrings("Rawlings Sporting Goods Company, Inc.", out);
+}
+
+test "pdf: erratic per-run font sizes on one line stay one body section (line-aware)" {
+	// The Brann root cause in miniature: a single visual line (same y) whose runs
+	// carry erratic per-run font sizes — one spikes above the heading threshold
+	// mid-sentence. Pre-line-aware, that run was misclassified as a heading and
+	// split the line into bogus sections; now the per-LINE median keeps it body.
+	const pdf = try buildTestPdf(testing.allocator, &.{.{ .text_items = &.{
+		.{ .text = "The plaintiff", .font_size = 12, .y_pos = 700, .x_pos = 0 },
+		.{ .text = "obtained a", .font_size = 17, .y_pos = 700, .x_pos = 120 }, // spike > threshold
+		.{ .text = "verdict against", .font_size = 12, .y_pos = 700, .x_pos = 220 },
+		.{ .text = "the defendant.", .font_size = 12, .y_pos = 700, .x_pos = 360 },
+		.{ .text = "Second line of body text here.", .font_size = 12, .y_pos = 680, .x_pos = 0 },
+		.{ .text = "Third line of body text here.", .font_size = 12, .y_pos = 660, .x_pos = 0 },
+	} }});
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/erratic.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	// The whole first line is preserved as continuous body text, not split at the
+	// size-17 "obtained a" run.
+	try testing.expect(std.mem.indexOf(u8, c, "The plaintiff obtained a verdict against the defendant.") != null);
+	// And "obtained a" did NOT become a heading.
+	for (doc.sections) |s| {
+		if (s.heading) |h| try testing.expect(std.mem.indexOf(u8, h, "obtained") == null);
+	}
 }

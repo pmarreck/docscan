@@ -275,13 +275,26 @@ citation "surpass" is live across formats; incitez_web consumes it.
             unicode61 tokenizer does punctuation-stripping/case-folding at INDEX time; the index
             path adds no extra normalization. The space-BEFORE-comma is a run-join artifact (not
             an index concern). Ruling (Peter): keep punctuation-spacing restoration as faithful.
-      - [ ] **(3) Line-aware re-section** (root cause, chosen by Peter 2026-06-15): erratic
-            PER-RUN font sizes (9.2–16.2 mid-sentence) fool the per-SPAN heading detector →
-            body runs misclassified as headings → hundreds of bogus 1-run sections. docscan's y
-            is reliable, so: cluster runs into LINES by y; per-line representative size = MEDIAN
-            (not per-run); detect headings per LINE; join runs within a line with detokenizer
-            spacing (no space before `,.;:)`); lines → paragraphs. Detokenizer spacing (your
-            original concern) becomes polish once bogus splits stop.
+      - [~] **(3) Line-aware re-section** (IN PROGRESS, local WIP — NOT on yolo). Done: pure
+            helpers clusterRunsIntoLines + joinLineRuns (committed 64743c91, unpushed) and the
+            inferStructure rewire (collapse runs→per-line synthetic spans; dominant from RAW
+            runs; heading detection per line median). All unit tests + the erratic-per-run-size
+            regression pass. BUT validating revealed a deeper, COMPOSITION-DEPENDENT fragility:
+            on long docs whose front-matter is mostly tiny text (Brann's 90pg Table of
+            Authorities = 5pt dot-leaders; the 144pg arXiv survey's refs), the global font mode
+            collapses to 5 → threshold ~5.75 → ~every line flagged a heading. A 5-page version
+            would "work" — classic OVERFITTING risk if tuned to one doc (Peter 2026-06-15: test
+            as classifiers over a SET, vary doc SIZE to float statistical-dependency bugs; do
+            NOT hard-code a font floor to make Brann pass).
+            NEXT: make dominant-size detection robust across the corpus (candidates: median-by-
+            char / trimmed mode / bimodal-aware), validated by tools/fetch-corpus.sh +
+            tests/corpus/run-corpus (the differential gate: word-recall vs pdftotext + heading-
+            fraction over a stratified PUBLIC set incl. encrypted + local Brann). Accept a fix
+            ONLY if the whole corpus passes — never because Brann does. Detokenizer spacing
+            (the original space-before-comma concern) is already handled by joinLineRuns.
+      - [x] **Corpus harness** (2026-06-15): tools/fetch-corpus.sh (pinned public arXiv 12–144pg
+            + qpdf blank-pw encrypted variants + local Brann, gitignored) + tests/corpus/run-corpus
+            (dev-time differential vs pdftotext; word-recall + heading-fraction; skips w/o corpus).
       - [ ] **(4) Grammar/POS** for the residual ambiguous joins (the deferred tagger).
       Fixture: `tests/corpus/legal-brann-appellate-brief.pdf` (3.5MB, gitignored).
       incitez_web holds pdf on `incitez_clean` (recall-safe) until fixed.

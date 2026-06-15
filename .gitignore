@@ -16,3 +16,6 @@ ZIG_0.15_TO_0.16_MIGRATION.md
 
 # Large local-only PDF diagnosis fixture (exceeds jj 1MB snapshot limit)
 tests/corpus/legal-brann-appellate-brief.pdf
+
+# Reproducible dev corpus (rebuild via tools/fetch-corpus.sh)
+tests/corpus/fetched/
