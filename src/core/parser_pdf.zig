@@ -927,6 +927,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 	var current_font_size: f32 = 12.0; // default; effective = tf_size * tm_scale
 	var tf_size: f32 = 12.0; // last Tf point size
 	var tm_scale: f32 = 1.0; // Tm d-component (text-matrix vertical scale)
+	var tm_scale_x: f32 = 1.0; // Tm a-component (text-matrix horizontal scale)
 	var current_font_name: ?[]const u8 = null; // e.g., "F1" — points into stream data
 	var last_name: ?[]const u8 = null; // last /Name token seen (for Tf matching)
 	var y_pos: f32 = 0;
@@ -1123,8 +1124,12 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 				const ws2 = skipStreamWhitespace(stream, peek_pos);
 				if (ws2 < stream.len and stream[ws2] == 'T' and ws2 + 1 < stream.len and (stream[ws2 + 1] == 'd' or stream[ws2 + 1] == 'D')) {
 					if (ws2 + 2 >= stream.len or isDelimiter(stream[ws2 + 2])) {
-						x_pos += num; // num is tx (first operand)
-						y_pos += num2;
+						// Td offsets are in TEXT space; map to user space via the text-matrix
+						// scale. PDFs that bake the font size into Tm (e.g. `1 Tf` + `9 0 0 9 … Tm`,
+						// like SCOTUS slip opinions) otherwise record line advances ~1/scale too
+						// small, collapsing every line into one cluster (the reading-order scramble).
+						x_pos += num * tm_scale_x; // num is tx (first operand)
+						y_pos += num2 * tm_scale;
 						pos = ws2 + 2;						continue;
 					}
 				}
@@ -1153,6 +1158,9 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							// rendered size is Tf_size * d. groff positions via Tm [1 0 0 1 x y]
 							// (d=1) and sizes via Tf, so do NOT overwrite the Tf size with d.
 							tm_scale = if (@abs(d_val) > 0.01) @abs(d_val) else 1.0;
+							// The Tm a-component is the horizontal scale; track it so Td x-offsets
+							// (in text space) map to user-space movement, like tm_scale does for y.
+							tm_scale_x = if (@abs(num) > 0.01) @abs(num) else 1.0;
 							current_font_size = tf_size * tm_scale;
 							x_pos = e_val;
 							y_pos = f_val;
@@ -1543,14 +1551,243 @@ fn medianRunSize(runs: []const TextSpan) f32 {
 	return (buf[n / 2 - 1] + buf[n / 2]) / 2.0;
 }
 
-/// Group spans into visual lines, PRESERVING content-stream order. The stream
-/// already emits text in reading order — including column-major multi-column
-/// layouts — so we must NOT globally re-sort by y: doing so interleaves columns
-/// that share a y-band (the f4c2eb0a multi-column regression that scrambled SCOTUS
-/// citations). Instead we cluster CONSECUTIVE runs whose baselines are within
-/// ~half the larger run's height; a new line starts on any larger y jump (the next
-/// line, or the top of the next column). Each line's runs are then x-sorted. Pure;
-/// caller frees with `freeLines`.
+// ── Geometric reading-order reconstruction (Peter's 2-column gutter heuristic, 2026-06-15) ──
+// Content-stream order is NOT reading order in real legal PDFs: SCOTUS slip opinions
+// and OSG briefs emit positioned runs out of visual order, so reading them in stream
+// order scrambles multi-column text and Tables of Authorities (incitez_web's ~82%
+// citation-loss regression). This pass reconstructs reading order per page from glyph
+// geometry, constrained to ≤2 columns (legal works are never 3-col):
+//   1. Detect a central column GUTTER via an x-coverage histogram (a low-density
+//      vertical channel in the middle third, with content on both sides).
+//   2. Classify each visual line: one that CROSSES the gutter is full-width (a
+//      single-column body line, a heading, or a ToA "name ……… page" dot-leader line
+//      → read left→right). One that leaves a clean wide gap at the gutter is a
+//      2-column line.
+//   3. A 2-column REGION is a multi-line BAND of consecutive non-crossing lines with
+//      content on both sides ("no single 2-column line" — Peter): read the whole left
+//      column top→bottom, then the right. Isolated split lines are read as full-width.
+// Falls back to pure y/x order when no gutter is found, so it is never worse than the
+// prior content-stream behaviour on genuinely single-column pages.
+const ReadOrder = struct {
+	const bins: usize = 64;
+	const valley_frac: f32 = 0.15; // gutter channel density < 15% of the busiest column bin
+	const gap_frac: f32 = 0.04; // a real inter-column gap exceeds 4% of page width
+	const margin: f32 = 1.0; // x slack (pt) around the gutter
+	const min_lines_2col: usize = 2; // a 2-column band must span at least two lines
+};
+
+const Side = enum { all, left, right };
+
+/// Estimated right edge of a run (no per-glyph widths are tracked, so reuse the
+/// 0.4·font_size·len width heuristic that runSeparator uses).
+fn estRunRight(s: TextSpan) f32 {
+	return s.x_position + @as(f32, @floatFromInt(s.text.len)) * s.font_size * 0.4;
+}
+
+fn pageXBounds(page: []const TextSpan) struct { min: f32, max: f32 } {
+	var mn: f32 = std.math.floatMax(f32);
+	var mx: f32 = -std.math.floatMax(f32);
+	for (page) |s| {
+		if (s.x_position < mn) mn = s.x_position;
+		const r = estRunRight(s);
+		if (r > mx) mx = r;
+	}
+	return .{ .min = mn, .max = mx };
+}
+
+/// Detect a central column gutter: the lowest-density bin in the middle third of an
+/// x-coverage histogram, accepted only if it is a clear whitespace channel (< a
+/// fraction of the busiest bin) with content on both sides. Returns the gutter x or null.
+fn detectGutter(allocator: Allocator, page: []const TextSpan) !?f32 {
+	const b = pageXBounds(page);
+	const w = b.max - b.min;
+	if (w <= 0) return null;
+	const nb = ReadOrder.bins;
+	const cov = try allocator.alloc(f32, nb);
+	defer allocator.free(cov);
+	@memset(cov, 0);
+	const binw = w / @as(f32, @floatFromInt(nb));
+	if (binw <= 0) return null;
+	for (page) |s| {
+		const r = estRunRight(s);
+		if (r <= s.x_position) continue;
+		var bi: usize = @intFromFloat(@max(0.0, (s.x_position - b.min) / binw));
+		const be: usize = @min(nb - 1, @as(usize, @intFromFloat(@max(0.0, (r - b.min) / binw))));
+		if (bi > nb - 1) bi = nb - 1;
+		while (bi <= be) : (bi += 1) cov[bi] += 1;
+	}
+	var peak: f32 = 0;
+	for (cov) |c| {
+		if (c > peak) peak = c;
+	}
+	if (peak <= 0) return null;
+	const lo = nb / 3;
+	const hi = (nb * 2) / 3;
+	var valley_bin: usize = lo;
+	var valley: f32 = std.math.floatMax(f32);
+	var k: usize = lo;
+	while (k <= hi and k < nb) : (k += 1) {
+		if (cov[k] < valley) {
+			valley = cov[k];
+			valley_bin = k;
+		}
+	}
+	if (valley > ReadOrder.valley_frac * peak) return null; // no clean channel → single column
+	const gutter = b.min + (@as(f32, @floatFromInt(valley_bin)) + 0.5) * binw;
+	var leftc: f32 = 0;
+	var rightc: f32 = 0;
+	for (page) |s| {
+		if (estRunRight(s) <= gutter) {
+			leftc += 1;
+		} else if (s.x_position >= gutter) {
+			rightc += 1;
+		}
+	}
+	if (leftc < 1 or rightc < 1) return null;
+	return gutter;
+}
+
+/// A line is "split" (a true 2-column line) when no run spans the gutter AND there
+/// is a clean gap wider than gap_frac·page_w straddling it. A run that crosses the
+/// gutter (full-width text, a dot-leader bridging name→page) makes the line full-width.
+fn lineIsSplitIdx(page: []const TextSpan, ln: []const usize, gutter: f32, page_w: f32) bool {
+	var left_max_right: f32 = -std.math.floatMax(f32);
+	var right_min_left: f32 = std.math.floatMax(f32);
+	var has_cross = false;
+	for (ln) |k| {
+		const s = page[k];
+		const l = s.x_position;
+		const r = estRunRight(s);
+		if (l < gutter - ReadOrder.margin and r > gutter + ReadOrder.margin) has_cross = true;
+		if (r <= gutter + ReadOrder.margin and r > left_max_right) left_max_right = r;
+		if (l >= gutter - ReadOrder.margin and l < right_min_left) right_min_left = l;
+	}
+	if (has_cross) return false;
+	if (left_max_right == -std.math.floatMax(f32) or right_min_left == std.math.floatMax(f32)) return false;
+	return (right_min_left - left_max_right) > ReadOrder.gap_frac * page_w;
+}
+
+/// Append a line's runs (for the requested side, partitioned by run CENTER vs gutter)
+/// to `out`, x-sorted. The center test guarantees a clean partition (no run dropped
+/// or double-counted) for split lines.
+fn emitLineIdx(allocator: Allocator, page: []const TextSpan, ln: []const usize, out: *std.ArrayList(TextSpan), side: Side, gutter: f32) !void {
+	const buf = try allocator.alloc(usize, ln.len);
+	defer allocator.free(buf);
+	var n: usize = 0;
+	for (ln) |k| {
+		const s = page[k];
+		const center = (s.x_position + estRunRight(s)) * 0.5;
+		const keep = switch (side) {
+			.all => true,
+			.left => center < gutter,
+			.right => center >= gutter,
+		};
+		if (keep) {
+			buf[n] = k;
+			n += 1;
+		}
+	}
+	std.mem.sort(usize, buf[0..n], page, struct {
+		fn lt(p: []const TextSpan, a: usize, b: usize) bool {
+			return p[a].x_position < p[b].x_position;
+		}
+	}.lt);
+	for (buf[0..n]) |k| try out.append(allocator, page[k]);
+}
+
+/// Reorder one page's runs into reading order (see ReadOrder above). Appends to `out`.
+fn orderPage(allocator: Allocator, page: []const TextSpan, out: *std.ArrayList(TextSpan)) !void {
+	if (page.len == 0) return;
+	const ord = try allocator.alloc(usize, page.len);
+	defer allocator.free(ord);
+	for (ord, 0..) |*p, k| p.* = k;
+	std.mem.sort(usize, ord, page, struct {
+		fn lt(p: []const TextSpan, a: usize, b: usize) bool {
+			if (p[a].y_position != p[b].y_position) return p[a].y_position > p[b].y_position; // top→bottom
+			return p[a].x_position < p[b].x_position;
+		}
+	}.lt);
+
+	const gutter_opt = try detectGutter(allocator, page);
+	if (gutter_opt == null) {
+		for (ord) |k| try out.append(allocator, page[k]);
+		return;
+	}
+	const gutter = gutter_opt.?;
+	const bounds = pageXBounds(page);
+	const page_w = bounds.max - bounds.min;
+
+	// Group the y-sorted indices into visual lines (same tolerance as clusterRunsIntoLines).
+	var line_starts = std.ArrayList(usize).empty;
+	defer line_starts.deinit(allocator);
+	var line_ends = std.ArrayList(usize).empty;
+	defer line_ends.deinit(allocator);
+	var li: usize = 0;
+	while (li < ord.len) {
+		const start = li;
+		const base_y = page[ord[li]].y_position;
+		const base_f = page[ord[li]].font_size;
+		li += 1;
+		while (li < ord.len) {
+			const tol = @max(page[ord[li]].font_size, base_f) * 0.5;
+			if (@abs(page[ord[li]].y_position - base_y) > tol) break;
+			li += 1;
+		}
+		try line_starts.append(allocator, start);
+		try line_ends.append(allocator, li);
+	}
+	const nlines = line_starts.items.len;
+	const is_split = try allocator.alloc(bool, nlines);
+	defer allocator.free(is_split);
+	for (0..nlines) |t| {
+		is_split[t] = lineIsSplitIdx(page, ord[line_starts.items[t]..line_ends.items[t]], gutter, page_w);
+	}
+
+	var t: usize = 0;
+	while (t < nlines) {
+		if (!is_split[t]) {
+			try emitLineIdx(allocator, page, ord[line_starts.items[t]..line_ends.items[t]], out, .all, gutter);
+			t += 1;
+			continue;
+		}
+		var u = t;
+		while (u < nlines and is_split[u]) u += 1;
+		if (u - t >= ReadOrder.min_lines_2col) {
+			var s = t;
+			while (s < u) : (s += 1) try emitLineIdx(allocator, page, ord[line_starts.items[s]..line_ends.items[s]], out, .left, gutter);
+			s = t;
+			while (s < u) : (s += 1) try emitLineIdx(allocator, page, ord[line_starts.items[s]..line_ends.items[s]], out, .right, gutter);
+		} else {
+			var s = t;
+			while (s < u) : (s += 1) try emitLineIdx(allocator, page, ord[line_starts.items[s]..line_ends.items[s]], out, .all, gutter);
+		}
+		t = u;
+	}
+}
+
+/// Reconstruct reading order across all pages. Returns a NEW owned array of shallow
+/// TextSpan copies (text slices are shared, not duplicated — the caller frees only
+/// the array). Pages are contiguous in the input and kept in page order.
+fn reorderRunsByReading(allocator: Allocator, spans: []const TextSpan) ![]TextSpan {
+	var out = try std.ArrayList(TextSpan).initCapacity(allocator, spans.len);
+	errdefer out.deinit(allocator);
+	var i: usize = 0;
+	while (i < spans.len) {
+		const page = spans[i].page;
+		var j = i;
+		while (j < spans.len and spans[j].page == page) j += 1;
+		try orderPage(allocator, spans[i..j], &out);
+		i = j;
+	}
+	return out.toOwnedSlice(allocator);
+}
+
+/// Group spans into visual lines from runs ALREADY in reading order (inferStructure
+/// runs reorderRunsByReading first, which reconstructs geometric reading order incl.
+/// ≤2-column layouts). Clusters CONSECUTIVE runs whose baselines are within ~half the
+/// larger run's height; a new line starts on any larger y jump (next line, or the top
+/// of the next column in the reordered stream). Each line's runs are then x-sorted.
+/// Pure; caller frees with `freeLines`.
 fn clusterRunsIntoLines(allocator: Allocator, spans: []const TextSpan) !ClusteredLines {
 	const backing = try allocator.dupe(TextSpan, spans);
 	errdefer allocator.free(backing);
@@ -1679,7 +1916,12 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 	// one-run sections. Keying off the per-LINE median fixes that; intra-line spacing
 	// is already resolved by joinLineRuns. All logic below operates on these line
 	// spans (the `spans` shadow), so it needs no further change.
-	const cl = try clusterRunsIntoLines(allocator, run_spans);
+	// Reconstruct geometric reading order (≤2-column gutter detection) before
+	// clustering — the content stream is not reliably in reading order on real
+	// multi-column legal PDFs (incitez_web 2026-06-15). See reorderRunsByReading.
+	const ordered = try reorderRunsByReading(allocator, run_spans);
+	defer allocator.free(ordered);
+	const cl = try clusterRunsIntoLines(allocator, ordered);
 	defer freeLines(allocator, cl);
 	var line_spans = std.ArrayList(TextSpan).empty;
 	defer {
@@ -3633,4 +3875,59 @@ test "pdf: ligature glyphs recovered from StandardEncoding positions (Builtin fo
 	try testing.expect(std.mem.indexOf(u8, c, "defines") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "flag") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "defnes") == null);
+}
+
+test "reorderRunsByReading: single-column runs sort top-to-bottom by y" {
+	// Content stream emits these out of vertical order; reading order is by y desc.
+	const spans = [_]TextSpan{
+		.{ .text = "third", .font_size = 12, .page = 1, .y_position = 600, .x_position = 100 },
+		.{ .text = "first", .font_size = 12, .page = 1, .y_position = 700, .x_position = 100 },
+		.{ .text = "second", .font_size = 12, .page = 1, .y_position = 650, .x_position = 100 },
+	};
+	const out = try reorderRunsByReading(testing.allocator, &spans);
+	defer testing.allocator.free(out);
+	try testing.expectEqualStrings("first", out[0].text);
+	try testing.expectEqualStrings("second", out[1].text);
+	try testing.expectEqualStrings("third", out[2].text);
+}
+
+test "reorderRunsByReading: two-column page reads whole left column then right" {
+	// 3 lines × 2 columns, content order row-major (the scramble). Left x=50 (clean
+	// gap to right x=300). Reading order must be L1 L2 L3 then R1 R2 R3.
+	const spans = [_]TextSpan{
+		.{ .text = "L1", .font_size = 12, .page = 1, .y_position = 700, .x_position = 50 },
+		.{ .text = "R1", .font_size = 12, .page = 1, .y_position = 700, .x_position = 300 },
+		.{ .text = "L2", .font_size = 12, .page = 1, .y_position = 680, .x_position = 50 },
+		.{ .text = "R2", .font_size = 12, .page = 1, .y_position = 680, .x_position = 300 },
+		.{ .text = "L3", .font_size = 12, .page = 1, .y_position = 660, .x_position = 50 },
+		.{ .text = "R3", .font_size = 12, .page = 1, .y_position = 660, .x_position = 300 },
+	};
+	const out = try reorderRunsByReading(testing.allocator, &spans);
+	defer testing.allocator.free(out);
+	const got = [_][]const u8{ out[0].text, out[1].text, out[2].text, out[3].text, out[4].text, out[5].text };
+	const want = [_][]const u8{ "L1", "L2", "L3", "R1", "R2", "R3" };
+	for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "reorderRunsByReading: full-width header above a two-column band stays in place" {
+	// A full-width header line (crosses the gutter) atop a 2-column body band.
+	// Reading order: header, then all left, then all right.
+	var spans = std.ArrayList(TextSpan).empty;
+	defer spans.deinit(testing.allocator);
+	// header spans full width (x 50 → ~310 via long text), crosses the gutter
+	try spans.append(testing.allocator, .{ .text = "HEADER SPANNING THE FULL PAGE WIDTH", .font_size = 12, .page = 1, .y_position = 720, .x_position = 50 });
+	// 6 body lines per column so the gutter survives the header's coverage
+	var i: usize = 0;
+	while (i < 6) : (i += 1) {
+		const y: f32 = 700 - @as(f32, @floatFromInt(i)) * 20;
+		// row-major (scrambled) emission
+		try spans.append(testing.allocator, .{ .text = "Lx", .font_size = 12, .page = 1, .y_position = y, .x_position = 50 });
+		try spans.append(testing.allocator, .{ .text = "Rx", .font_size = 12, .page = 1, .y_position = y, .x_position = 300 });
+	}
+	const out = try reorderRunsByReading(testing.allocator, spans.items);
+	defer testing.allocator.free(out);
+	try testing.expect(std.mem.startsWith(u8, out[0].text, "HEADER"));
+	// next 6 are all left, then 6 right
+	for (out[1..7]) |s| try testing.expectEqualStrings("Lx", s.text);
+	for (out[7..13]) |s| try testing.expectEqualStrings("Rx", s.text);
 }
