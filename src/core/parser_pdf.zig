@@ -1415,6 +1415,142 @@ fn isDelimiter(c: u8) bool {
 
 // ── Structure Inference ────────────────────────────────────────────
 
+/// A visual line: runs (TextSpans) sharing a text baseline, in reading order
+/// (left→right). `size` is the MEDIAN run font size — robust to erratic per-run
+/// sizing (the Brann failure: 9.2–16.2 within one sentence), so heading detection
+/// keys off the line, not any single outlier run.
+const PdfLine = struct {
+	runs: []TextSpan, // borrows from the sorted-spans backing array
+	page: u32,
+	y: f32, // representative baseline (runs share it within tolerance)
+	size: f32, // median run font size
+};
+
+/// Result of clusterRunsIntoLines: the lines plus the owned backing array they
+/// borrow from. Caller frees both with `freeLines`.
+const ClusteredLines = struct {
+	lines: []PdfLine,
+	backing: []TextSpan,
+};
+
+fn freeLines(allocator: Allocator, cl: ClusteredLines) void {
+	allocator.free(cl.lines);
+	allocator.free(cl.backing);
+}
+
+fn lineReadingOrderLessThan(_: void, a: TextSpan, b: TextSpan) bool {
+	if (a.page != b.page) return a.page < b.page;
+	return a.y_position > b.y_position; // PDF y grows upward → top-to-bottom is y desc
+}
+
+fn lineXLessThan(_: void, a: TextSpan, b: TextSpan) bool {
+	return a.x_position < b.x_position;
+}
+
+/// Median font size of a line's runs (even count → average of the two middles).
+/// A bounded stack buffer keeps it pure; pathologically long lines (>256 runs)
+/// median over the first 256, which is plenty representative.
+fn medianRunSize(runs: []const TextSpan) f32 {
+	if (runs.len == 0) return 12.0;
+	var buf: [256]f32 = undefined;
+	const n = @min(runs.len, buf.len);
+	for (runs[0..n], 0..) |r, k| buf[k] = r.font_size;
+	std.mem.sort(f32, buf[0..n], {}, comptime std.sort.asc(f32));
+	if (n % 2 == 1) return buf[n / 2];
+	return (buf[n / 2 - 1] + buf[n / 2]) / 2.0;
+}
+
+/// Group spans into visual lines by baseline-y proximity (pdfminer's line-overlap
+/// idea: same line when baselines are within ~half the larger run's height — well
+/// below normal line spacing). Spans are sorted into reading order first (page
+/// asc, y desc), grouped, then each line's runs are x-sorted. Pure; the document
+/// is untouched. Caller frees the result with `freeLines`.
+fn clusterRunsIntoLines(allocator: Allocator, spans: []const TextSpan) !ClusteredLines {
+	const backing = try allocator.dupe(TextSpan, spans);
+	errdefer allocator.free(backing);
+	std.mem.sort(TextSpan, backing, {}, lineReadingOrderLessThan);
+
+	var lines = std.ArrayList(PdfLine).empty;
+	errdefer lines.deinit(allocator);
+
+	var i: usize = 0;
+	while (i < backing.len) {
+		const start = i;
+		const page = backing[i].page;
+		const base_y = backing[i].y_position;
+		i += 1;
+		while (i < backing.len and backing[i].page == page) {
+			const tol = @max(backing[i].font_size, backing[start].font_size) * 0.5;
+			if (@abs(backing[i].y_position - base_y) > tol) break;
+			i += 1;
+		}
+		const run_slice = backing[start..i];
+		std.mem.sort(TextSpan, run_slice, {}, lineXLessThan);
+		try lines.append(allocator, .{
+			.runs = run_slice,
+			.page = page,
+			.y = base_y,
+			.size = medianRunSize(run_slice),
+		});
+	}
+	return .{ .lines = try lines.toOwnedSlice(allocator), .backing = backing };
+}
+
+
+/// Separator between two adjacent runs when joining a visual line.
+const RunSep = enum { none, space };
+
+fn lastNonSpace(s: []const u8) ?u8 {
+	var i = s.len;
+	while (i > 0) {
+		i -= 1;
+		if (s[i] != ' ' and s[i] != '\t') return s[i];
+	}
+	return null;
+}
+
+fn firstNonSpace(s: []const u8) ?u8 {
+	for (s) |c| {
+		if (c != ' ' and c != '\t') return c;
+	}
+	return null;
+}
+
+/// Detokenizer-aware separator between two runs. pdfminer decides spacing purely
+/// by x-gap, which yields "word , comma"; we add punctuation attachment so closing
+/// punctuation hugs the previous token and openers hug the next. Punctuation rules
+/// win; otherwise a default space (runs are distinct fragments) unless their x
+/// extents butt together (a mid-word split → no space; the dictionary rejoin pass
+/// is the safety net). Runs keep their own leading/trailing spaces regardless.
+fn runSeparator(prev: TextSpan, next: TextSpan) RunSep {
+	const nf = firstNonSpace(next.text) orelse return .space;
+	switch (nf) {
+		',', '.', ';', ':', '!', '?', ')', ']', '}', '%', '\'' => return .none,
+		else => {},
+	}
+	const pl = lastNonSpace(prev.text) orelse return .space;
+	switch (pl) {
+		'(', '[', '{', '-' => return .none,
+		else => {},
+	}
+	// x-gap: if next starts at/inside prev's estimated extent, they butt together.
+	const prev_right = prev.x_position + @as(f32, @floatFromInt(prev.text.len)) * prev.font_size * 0.4;
+	if (next.x_position - prev_right < next.font_size * 0.15) return .none;
+	return .space;
+}
+
+/// Join a clustered line's runs into one string with detokenizer-aware spacing.
+fn joinLineRuns(allocator: Allocator, line: PdfLine) ![]u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	for (line.runs, 0..) |run, idx| {
+		if (idx > 0 and runSeparator(line.runs[idx - 1], run) == .space) {
+			try buf.append(allocator, ' ');
+		}
+		try buf.appendSlice(allocator, run.text);
+	}
+	return buf.toOwnedSlice(allocator);
+}
 /// Infer document structure from text spans using font size heuristics.
 /// Larger text = headings, dominant (most common) size = body text.
 fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Section {
@@ -3095,4 +3231,72 @@ test "pdf: parse() leak sweep over allocation-heavy document shapes" {
 		const doc = try parse(a, pdf, "/t/tj.pdf");
 		freeDocument(a, doc);
 	}
+}
+
+test "clusterRunsIntoLines groups by baseline and median ignores per-run size outliers" {
+	// Real Brann coordinates: two visual lines (~656, ~624), each split into runs
+	// with wildly varying per-run font sizes (the failure that fooled per-span
+	// heading detection). The clusterer must yield 2 lines, x-ordered runs, and a
+	// MEDIAN size near the body (~14), not the 16.2 outlier.
+	const spans = [_]TextSpan{
+		.{ .text = "Following", .font_size = 14.0, .page = 1, .y_position = 656.40, .x_position = 117.84 },
+		.{ .text = ", the plaintiff-", .font_size = 14.9, .page = 1, .y_position = 655.92, .x_position = 295.92 },
+		.{ .text = ", Matrix Group", .font_size = 14.4, .page = 1, .y_position = 656.64, .x_position = 425.28 },
+		// Second line, deliberately out of x order + with 9.2 and 16.2 outliers.
+		.{ .text = "), obtained a", .font_size = 16.2, .page = 1, .y_position = 623.52, .x_position = 221.04 },
+		.{ .text = "Limited", .font_size = 13.9, .page = 1, .y_position = 624.24, .x_position = 82.08 },
+		.{ .text = ", Inc.", .font_size = 9.2, .page = 1, .y_position = 624.00, .x_position = 126.72 },
+		.{ .text = "verdict", .font_size = 10.0, .page = 1, .y_position = 623.52, .x_position = 305.52 },
+	};
+	const cl = try clusterRunsIntoLines(testing.allocator, &spans);
+	defer freeLines(testing.allocator, cl);
+
+	try testing.expectEqual(@as(usize, 2), cl.lines.len);
+	// Line 0 (~656): runs x-ordered.
+	try testing.expectEqualStrings("Following", cl.lines[0].runs[0].text);
+	try testing.expectEqualStrings(", the plaintiff-", cl.lines[0].runs[1].text);
+	try testing.expectEqualStrings(", Matrix Group", cl.lines[0].runs[2].text);
+	// Line 1 (~624): x-ordered → Limited(82), Inc(126), obtained(221), verdict(305).
+	try testing.expectEqual(@as(usize, 4), cl.lines[1].runs.len);
+	try testing.expectEqualStrings("Limited", cl.lines[1].runs[0].text);
+	try testing.expectEqualStrings("verdict", cl.lines[1].runs[3].text);
+	// Median of {9.2,10.0,13.9,16.2} = (10.0+13.9)/2 = 11.95 — NOT the 16.2 outlier.
+	try testing.expect(cl.lines[1].size < 14.0);
+	try testing.expect(cl.lines[1].size > 10.0);
+}
+
+test "joinLineRuns: closing punctuation and hyphen attach left (no spurious space)" {
+	var runs = [_]TextSpan{
+		.{ .text = "trial", .font_size = 14, .page = 1, .y_position = 656, .x_position = 117 },
+		.{ .text = ", the plaintiff-", .font_size = 14, .page = 1, .y_position = 656, .x_position = 295 },
+		.{ .text = "appellee", .font_size = 14, .page = 1, .y_position = 656, .x_position = 378 },
+	};
+	const line = PdfLine{ .runs = &runs, .page = 1, .y = 656, .size = 14 };
+	const out = try joinLineRuns(testing.allocator, line);
+	defer testing.allocator.free(out);
+	// ", " hugs "trial"; "-" hugs "appellee" — no "trial , the plaintiff- appellee".
+	try testing.expectEqualStrings("trial, the plaintiff-appellee", out);
+}
+
+test "joinLineRuns: opening bracket hugs next, closing punctuation hugs prev" {
+	var runs = [_]TextSpan{
+		.{ .text = "Inc. (", .font_size = 14, .page = 1, .y_position = 624, .x_position = 82 },
+		.{ .text = "Matrix", .font_size = 14, .page = 1, .y_position = 624, .x_position = 126 },
+		.{ .text = "), obtained", .font_size = 14, .page = 1, .y_position = 624, .x_position = 176 },
+	};
+	const line = PdfLine{ .runs = &runs, .page = 1, .y = 624, .size = 14 };
+	const out = try joinLineRuns(testing.allocator, line);
+	defer testing.allocator.free(out);
+	try testing.expectEqualStrings("Inc. (Matrix), obtained", out);
+}
+
+test "joinLineRuns: distinct words with an x-gap get a single space" {
+	var runs = [_]TextSpan{
+		.{ .text = "Rawlings Sporting Goods", .font_size = 14.9, .page = 1, .y_position = 591, .x_position = 82.08 },
+		.{ .text = "Company, Inc.", .font_size = 14.8, .page = 1, .y_position = 591, .x_position = 239.76 },
+	};
+	const line = PdfLine{ .runs = &runs, .page = 1, .y = 591, .size = 14.9 };
+	const out = try joinLineRuns(testing.allocator, line);
+	defer testing.allocator.free(out);
+	try testing.expectEqualStrings("Rawlings Sporting Goods Company, Inc.", out);
 }
