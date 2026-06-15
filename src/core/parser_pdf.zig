@@ -1974,6 +1974,62 @@ fn dotLeaderToNewline(allocator: Allocator, text: []const u8) ![]u8 {
 	}
 	return out.toOwnedSlice(allocator);
 }
+
+/// Known Table-of-Authorities section headers, LONGEST-first so multi-word headers match
+/// before their single-word prefixes ("Other Authorities" before "Authorities").
+const toa_headers = [_][]const u8{
+	"Constitutional Provisions", "Statutory Provisions", "Legislative Materials",
+	"Legislative History", "Table of Authorities", "Other Authorities",
+	"Federal Cases", "State Cases", "Authorities", "Regulations", "Treatises",
+	"Miscellaneous", "Statutes", "Cases", "Rules",
+};
+
+/// Longest known ToA header that prefixes `s` at a word boundary (case-insensitive), or null.
+fn matchToAHeader(s: []const u8) ?usize {
+	for (toa_headers) |h| {
+		if (s.len < h.len) continue;
+		if (std.ascii.eqlIgnoreCase(s[0..h.len], h)) {
+			const after: u8 = if (s.len > h.len) s[h.len] else ' ';
+			if (after == ' ' or after == '\t' or after == ':' or after == '\n') return h.len;
+		}
+	}
+	return null;
+}
+
+/// Put a ToA section header on its own line: at a line start, if the text begins with a
+/// known header followed by (optional ':') a space and then a capital/digit (the first
+/// entry), insert a newline after the header — a structural boundary a citation walk-back
+/// can strip (incitez 2026-06-15). The capital/digit guard avoids splitting body prose
+/// that merely starts with "Cases ...".
+fn splitToAHeaders(allocator: Allocator, text: []const u8) ![]u8 {
+	var out = std.ArrayList(u8).empty;
+	errdefer out.deinit(allocator);
+	var i: usize = 0;
+	var at_line_start = true;
+	while (i < text.len) {
+		if (at_line_start) {
+			if (matchToAHeader(text[i..])) |hlen| {
+				var k = i + hlen;
+				if (k < text.len and text[k] == ':') k += 1;
+				if (k < text.len and (text[k] == ' ' or text[k] == '\t')) {
+					var r = k;
+					while (r < text.len and (text[r] == ' ' or text[r] == '\t')) r += 1;
+					if (r < text.len and (std.ascii.isUpper(text[r]) or std.ascii.isDigit(text[r]))) {
+						try out.appendSlice(allocator, text[i..k]);
+						try out.append(allocator, '\n');
+						i = r;
+						continue; // at_line_start stays true: the entry begins a new line
+					}
+				}
+			}
+		}
+		const c = text[i];
+		try out.append(allocator, c);
+		at_line_start = (c == '\n');
+		i += 1;
+	}
+	return out.toOwnedSlice(allocator);
+}
 /// Infer document structure from text spans using font size heuristics.
 /// Larger text = headings, dominant (most common) size = body text.
 fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Section {
@@ -2260,6 +2316,17 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 		}
 	}
 	// Build hierarchical section tree
+	// Put ToA section headers ("Cases", "Statutes", "Other Authorities", …) on their own
+	// line: in a Table of Authorities the header is its own visual line but gets merged
+	// onto entry 1 ("Cases Albritton v. Gandy"), bleeding into the party name. A lone \n
+	// after the header is the same structural-boundary role as the dot-leader fix — it
+	// lets a citation walk-back strip the header (incitez 2026-06-15).
+	for (flat_sections.items) |*fs| {
+		const split = try splitToAHeaders(allocator, fs.content_buf.items);
+		defer allocator.free(split);
+		fs.content_buf.clearRetainingCapacity();
+		try fs.content_buf.appendSlice(allocator, split);
+	}
 	if (flat_sections.items.len == 0) return try allocator.alloc(Section, 0);
 	return try buildTree(allocator, flat_sections.items, 0, flat_sections.items.len);
 }
@@ -4222,4 +4289,66 @@ test "pdf: dropped space at a camelCase run boundary is restored, single-token n
 	try testing.expect(std.mem.indexOf(u8, c, "GasCo") == null);
 	try testing.expect(std.mem.indexOf(u8, c, "BethEnergy") != null); // single token kept
 	try testing.expect(std.mem.indexOf(u8, c, "Beth Energy") == null);
+}
+
+test "splitToAHeaders puts ToA section headers on their own line" {
+	const Case = struct { in: []const u8, want: []const u8 };
+	const cases = [_]Case{
+		.{ .in = "Cases Albritton v. Gandy, 531", .want = "Cases\nAlbritton v. Gandy, 531" },
+		.{ .in = "Statutes 10 U. C. 9 1059", .want = "Statutes\n10 U. C. 9 1059" }, // entry starts with a digit
+		.{ .in = "Other Authorities Restatement (Second)", .want = "Other Authorities\nRestatement (Second)" }, // multi-word header
+		.{ .in = "Cases: Brown v. Board", .want = "Cases:\nBrown v. Board" }, // header with colon
+		.{ .in = "Cases involving negligence here", .want = "Cases involving negligence here" }, // lowercase rest → body prose, not split
+		.{ .in = "These cases show", .want = "These cases show" }, // not at a header at line start
+		.{ .in = "line one\nCases Smith v. Jones", .want = "line one\nCases\nSmith v. Jones" }, // header after a newline
+	};
+	for (cases) |tc| {
+		const got = try splitToAHeaders(testing.allocator, tc.in);
+		defer testing.allocator.free(got);
+		try testing.expectEqualStrings(tc.want, got);
+	}
+}
+
+/// Build a 1-page PDF whose Table of Authorities has the section header "Cases" on its own
+/// visual line, then the first entry below it. The header must end up on its own line.
+fn buildPdfToAHeader(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	const stream =
+		"BT\n/F1 12 Tf\n100 700 Td\n(Cases) Tj\n" ++
+		"0 -15 Td\n(Albritton v. Gandy, 531 So. 2d 381) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: ToA section header is not welded onto the first entry" {
+	const pdf = try buildPdfToAHeader(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/toahdr.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "Cases\nAlbritton") != null); // header on its own line
+	try testing.expect(std.mem.indexOf(u8, c, "Cases Albritton") == null); // not welded
 }
