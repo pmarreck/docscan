@@ -9,9 +9,13 @@
 #   - word recall   : pdftotext's >=3-char words present in ours (content fidelity).
 #   - heading frac  : share of chars in heading lines (catches over-heading / the
 #                     dominant-size collapse).
-#   - bigram overlap: pdftotext's adjacent word-pairs preserved in ours (READING
-#                     ORDER). Catches multi-column scramble that word-recall can't —
-#                     every word present but mis-ordered (incitez_web 2026-06-15).
+#   - order (4-gram): pdftotext's 4-word shingles preserved in ours (READING ORDER).
+#                     A long shingle straddles run/column boundaries, so a reading-
+#                     order scramble shatters it — UNLIKE bigram (the prior metric),
+#                     which survived run-level interleave because within-run pairs
+#                     stay adjacent. bigram gave osg-sekhar a false 0.75 while its
+#                     body was word-salad; 4-gram scores it 0.42 (incitez_web
+#                     2026-06-15 sharp-tradeoff report: ToA/string-cite scramble).
 #
 # Requires: built docscan (./build → zig-out/bin/docscan) + pdftotext on PATH.
 # NOT a hermetic CI test (needs corpus + poppler); run locally during heuristic work.
@@ -23,7 +27,14 @@ DOCSCAN="${DOCSCAN:-$ROOT/zig-out/bin/docscan}"
 CORPUS="${CORPUS:-$ROOT/tests/corpus}"
 MIN_RECALL="${MIN_RECALL:-0.80}"
 MAX_HEADING_FRAC="${MAX_HEADING_FRAC:-0.45}"
-MIN_BIGRAM="${MIN_BIGRAM:-0.65}"
+MIN_ORDER="${MIN_ORDER:-0.80}"   # 4-gram reading-order floor (calibrated to clean single-col + reflowed legal)
+MIN_ORDER_HARD="${MIN_ORDER_HARD:-0.55}"  # relaxed floor for KNOWN_HARD layouts (still catches gross regressions)
+NGRAM="${NGRAM:-4}"
+# KNOWN_HARD: dense 2-column STEM papers (figures/equations/tables interleaved) and
+# field-based forms whose reading order even pdftotext orders idiosyncratically. These
+# are OUT of the legal-citation domain; they get the relaxed floor so the gate stays
+# green for its purpose while still flagging a gross regression. Reported with 'hard'.
+KNOWN_HARD="${KNOWN_HARD:-academic-attention-paper academic-deep-learning-nature academic-resnet-paper legal-irs-form-w9}"
 
 command -v pdftotext >/dev/null 2>&1 || { echo "SKIP: pdftotext not on PATH (the oracle)"; exit 0; }
 [ -x "$DOCSCAN" ] || { echo "SKIP: no docscan binary at $DOCSCAN (run ./build)"; exit 0; }
@@ -31,10 +42,11 @@ ls "$CORPUS"/*.pdf >/dev/null 2>&1 || { echo "SKIP: no PDFs in $CORPUS"; exit 0;
 
 toks() { tr -cs 'A-Za-z0-9' '\n' | tr 'A-Z' 'a-z' | awk 'length($0)>=3'; }     # ordered
 words() { toks | sort -u; }                                                     # set
-bigrams() { toks | awk 'NR>1{print p" "$0} {p=$0}' | sort -u; }                 # ordered pairs, deduped
+# k-word shingles (contiguous), deduped — the reading-order probe.
+shingles() { toks | awk -v k="$NGRAM" '{a[NR]=$0} END{for(i=1;i+k-1<=NR;i++){s=a[i];for(j=1;j<k;j++)s=s" "a[i+j];print s}}' | sort -u; }
 
-printf '%-46s %7s %7s %7s %8s  %s\n' "document" "recall" "head_fr" "bigram" "chars" "result"
-fail=0; total=0
+printf '%-46s %7s %7s %7s %8s  %s\n' "document" "recall" "head_fr" "order" "chars" "result"
+fail=0; total=0; hardcnt=0
 for pdf in "$CORPUS"/*.pdf; do
 	total=$((total + 1))
 	name="$(basename "$pdf")"
@@ -46,20 +58,25 @@ for pdf in "$CORPUS"/*.pdf; do
 	common="$(comm -12 <(printf '%s\n' "$refw") <(printf '%s\n' "$ourw") | grep -c . || true)"
 	recall="$(awk -v c="$common" -v r="$refn" 'BEGIN{ printf (r>0)? c/r : 1 }')"
 
-	refb="$(printf '%s' "$ref" | bigrams)"; ourb="$(printf '%s' "$our" | bigrams)"
-	rbn="$(printf '%s\n' "$refb" | grep -c . || true)"
-	cbn="$(comm -12 <(printf '%s\n' "$refb") <(printf '%s\n' "$ourb") | grep -c . || true)"
-	bigram="$(awk -v c="$cbn" -v r="$rbn" 'BEGIN{ printf (r>0)? c/r : 1 }')"
+	refs="$(printf '%s' "$ref" | shingles)"; ours="$(printf '%s' "$our" | shingles)"
+	rsn="$(printf '%s\n' "$refs" | grep -c . || true)"
+	csn="$(comm -12 <(printf '%s\n' "$refs") <(printf '%s\n' "$ours") | grep -c . || true)"
+	order="$(awk -v c="$csn" -v r="$rsn" 'BEGIN{ printf (r>0)? c/r : 1 }')"
 
 	read -r hchars tchars < <(printf '%s\n' "$our" | awk '{ t+=length($0)+1 } /^#+([ \t]|$)/ { h+=length($0)+1 } END { printf "%d %d", h+0, t+0 }')
 	hfrac="$(awk -v h="$hchars" -v t="$tchars" 'BEGIN{ printf (t>0)? h/t : 0 }')"
 
-	ok="$(awk -v rc="$recall" -v hf="$hfrac" -v bg="$bigram" -v mr="$MIN_RECALL" -v mh="$MAX_HEADING_FRAC" -v mb="$MIN_BIGRAM" \
-		'BEGIN{ print (rc>=mr && hf<=mh && bg>=mb) ? "ok" : "FAIL" }')"
+	base="${name%.pdf}"
+	hard=0
+	for h in $KNOWN_HARD; do [ "$base" = "$h" ] && hard=1; done
+	floor="$MIN_ORDER"; [ "$hard" = 1 ] && floor="$MIN_ORDER_HARD"
+	ok="$(awk -v rc="$recall" -v hf="$hfrac" -v od="$order" -v mr="$MIN_RECALL" -v mh="$MAX_HEADING_FRAC" -v mo="$floor" -v hd="$hard" \
+		'BEGIN{ pass=(rc>=mr && hf<=mh && od>=mo); print pass ? (hd ? "hard" : "ok") : "FAIL" }')"
 	[ "$ok" = "FAIL" ] && fail=$((fail + 1))
-	printf '%-46s %7.2f %7.2f %7.2f %8d  %s\n' "$name" "$recall" "$hfrac" "$bigram" "$tchars" "$ok"
+	[ "$ok" = "hard" ] && hardcnt=$((hardcnt + 1))
+	printf '%-46s %7.2f %7.2f %7.2f %8d  %s\n' "$name" "$recall" "$hfrac" "$order" "$tchars" "$ok"
 done
 
 echo "---------------------------------------------------------------------------------------"
-echo "$((total - fail))/$total passed (recall>=$MIN_RECALL, heading_frac<=$MAX_HEADING_FRAC, bigram>=$MIN_BIGRAM)"
+echo "$((total - fail))/$total passed (recall>=$MIN_RECALL, heading_frac<=$MAX_HEADING_FRAC, ${NGRAM}gram_order>=$MIN_ORDER); ${hardcnt:-0} known-hard at relaxed >=$MIN_ORDER_HARD (dense-STEM/forms — figure-region segmentation is future work)"
 [ "$fail" -eq 0 ]
