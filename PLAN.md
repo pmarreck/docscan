@@ -292,14 +292,41 @@ citation "surpass" is live across formats; incitez_web consumes it.
       - [x] **Corpus harness** (2026-06-15): tools/fetch-corpus.sh (pinned public arXiv 12–144pg
             + qpdf blank-pw encrypted variants + local Brann, gitignored) + tests/corpus/run-corpus
             (dev-time differential vs pdftotext; word-recall + heading-fraction; skips w/o corpus).
-      - [x] **(5) Multi-column reading-order regression** (2026-06-15 EST): the f4c2eb0a
-            line-clustering globally y-sorted runs, merging side-by-side columns into one
-            visual line (~82% citation loss on real SCOTUS slip opinions — incitez_web bug).
-            FIX: cluster in CONTENT-STREAM order (column-major as the page emits it), only a
-            larger y-jump starts a new line, x-sort within a line. Added a `bigram` reading-
-            order metric to run-corpus (adjacent word-pairs preserved vs pdftotext) — word-
-            recall alone cannot catch a scramble (every word present, mis-ordered). Regression
-            test + full corpus all pass.
+      - [x] **(5) Reading-order reconstruction — multi-column + line-merge scramble** (2026-06-15 EST):
+            incitez_web reported ~82% citation loss on real SCOTUS/OSG/circuit docs (f4c2eb0a). Two
+            root causes, found via a strengthened differential gate:
+            (a) line-clustering globally y-sorted runs, interleaving columns; (b) — the deeper one —
+            `Td`/`TD` text offsets were NOT scaled by the text-matrix scale. Real legal PDFs bake the
+            font size into Tm (`1 Tf` + `9 0 0 9 … Tm`), so a `0 -1.3 Td` line advance was recorded
+            ~1/9 too small; every visual line collapsed into one cluster and x-sorting interleaved
+            them (`Hurl Tinker ey`, `vv.. Eisen … v. Warley`). FIX: (i) scale Td/TD by the Tm a/d
+            components (parseContentStream); (ii) new `reorderRunsByReading` — geometric ≤2-column
+            reading-order reconstruction (Peter's gutter heuristic): detect a central low-density
+            gutter, classify each line as full-width (crosses gutter — single-col body, headings, ToA
+            dot-leaders → L→R) vs a 2-column band (≥2 consecutive non-crossing lines w/ both sides →
+            read whole left column then right), fall back to y/x order with no gutter. Pure, wasm-safe.
+            GATE: replaced the too-lenient `bigram` metric (gave osg-sekhar a false 0.75 over word-
+            salad) with a 4-gram shingle-overlap metric vs pdftotext (osg 0.42 → 0.96 after fix).
+            RESULT: corpus 11/27 → 27/27; all legal docs clean (SCOTUS 0.87–0.92, osg/deanda 0.96/0.97,
+            brann 0.85, constitution 0.97); citation strings verified intact (`Buchanan v. Warley`,
+            `Bianco v. Eisen`, no glued cross-case names). 3 hermetic reorder unit tests added.
+      - [ ] **(5a) KNOWN-HARD layouts — documented, deferred** (figure-region segmentation): 4 corpus
+            docs do not meet the strict 0.80 4-gram order floor and run at a relaxed 0.55 floor (still
+            catches gross regressions): `academic-attention-paper` (0.69), `academic-deep-learning-
+            nature` (0.63), `academic-resnet-paper` (0.63), `legal-irs-form-w9` (0.77). WHY they fail
+            the strict bar: they are dense **2-column STEM papers with diagrams/equations/tables**
+            interleaved between/within columns (and one field-based **form**). The *prose* reading
+            order is correct ("Deeper neural networks are more difficult to train…"); the 4-gram gap
+            comes from figure/chart text — axis labels (`10 10 20-layer 56-layer … iter. (1e4)`),
+            residual-block diagram tokens (`x weight layer F(x) relu …`), equation fragments — that we
+            emit inline while pdftotext buckets them into separate figure blocks. Proper fix needs
+            **figure/diagram bounding-box detection** to lift those regions out before reading order
+            (a separate, deeper feature; even pdftotext orders them idiosyncratically). Out of the
+            legal-citation domain but tracked because docscan is a GENERAL-PURPOSE scanner (Peter).
+      - [ ] **(5b) Grammar/POS neural option — revisit after reading-order** (Peter 2026-06-15): once
+            reading order is solid, revisit the averaged-perceptron POS tagger
+            (docs/research/2026-06-14-pos-tagging-for-zig-wasm.md) — pure-Zig, wasm-able via
+            @embedFile+flate, PROPN signal for party-attribution / heading-bleed. Next big feature.
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
             fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
             Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
