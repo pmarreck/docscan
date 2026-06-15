@@ -251,11 +251,26 @@ citation "surpass" is live across formats; incitez_web consumes it.
       `<...>` strings inside a stopgap font are still WinAnsi-CMap-decoded (rare — hex is a
       CID/composite-font form, which carries ToUnicode; would need a raw-bytes mode in
       extractHexStringText that keeps high bytes).
-- [ ] **Brann real-brief pdf split** (~19 chars/line, citations split mid-token): adaptive-gap
-      did NOT fix it. Its content stream is pathological (cumulative TD, spurious `5.00 Tf`
-      between body spans, erratic positioning). Needs instrumented diagnosis of the actual
-      split path. Fixture: `tests/corpus/legal-brann-appellate-brief.pdf` (3.5MB > jj 1MB
-      snapshot limit → NOT committed; decide gitignore vs `snapshot.max-new-file-size`).
+- [ ] **Brann real-brief reconstruction** (citations split across lines). DIAGNOSED 2026-06-15
+      (empirical, with pdftotext as an independent oracle): NOT a wrap problem — the PDF emits
+      per-styling-run fragments (italic party names split from roman prose) and docscan emits a
+      newline per run. pdftotext reflows it into correct LINES, and ground-truth bboxes show
+      runs share a baseline y per line (Following/five-day/jury/trial/Matrix all yMin≈125.5),
+      so clustering-by-y IS achievable; docscan also tracks real positions (x=211.68). Exact
+      intra-run SPACING is genuinely positional (even pdftotext emits "trial , the") — secondary,
+      doesn't split citations. Agreed roadmap (Peter 2026-06-15):
+      - [x] **(1) Crash bug** (2026-06-15 EST): headingLevelForSize did `@intCast(i+1)→u8`;
+            a PDF with >255 distinct heading sizes (Brann's erratic sizing) overflowed it
+            (Debug panic / ReleaseFast UB). Now saturates at u8 max. Regression test added.
+      - [ ] **(2) Separate extraction vs index concerns**: audit normalization run inside
+            parse()/applySections (wordfix.normalizeText adds space AFTER `,;:`+letter; the
+            space-BEFORE-comma is a run-join artifact, NOT intentional). Move index-tokenization
+            concerns to a pre-index pass so extract()/WASM/incitez get faithful text.
+      - [ ] **(3) Detokenizer-aware run join** (geometry-independent): cluster same-y runs into
+            lines; no space before attaching punctuation (`,.;:)`), none after `(`/open-quote.
+            Fixes the space-before-comma AND the citation-splitting in one move.
+      - [ ] **(4) Grammar/POS** for the residual ambiguous joins (the deferred tagger).
+      Fixture: `tests/corpus/legal-brann-appellate-brief.pdf` (3.5MB, gitignored).
       incitez_web holds pdf on `incitez_clean` (recall-safe) until fixed.
 - [x] **POS/grammar research** (2026-06-14): docs/research/2026-06-14-pos-tagging-for-zig-wasm.md — RECOMMENDATION: averaged-perceptron tagger (pure-Zig, wasm-able via @embedFile+flate like wordfix dicts); PROPN tag = party-attribution signal for the heading-bleed problem. Implementation deferred.
       party-name signal (helps the heading-bleed problem). Synthesis still owed.

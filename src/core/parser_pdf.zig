@@ -1653,7 +1653,10 @@ fn inferStructure(allocator: Allocator, spans: []const TextSpan) ![]const Sectio
 
 fn headingLevelForSize(size: f32, heading_sizes: []const f32) u8 {
 	for (heading_sizes, 0..) |hs, i| {
-		if (@abs(hs - size) < 0.01) return @intCast(i + 1);
+		// Saturate: real documents never have 255 heading levels, but a pathological
+		// PDF can declare >255 distinct font sizes (Brann's erratic sizing). Clamp to
+		// the u8 max instead of overflowing the cast.
+		if (@abs(hs - size) < 0.01) return @intCast(@min(i + 1, @as(usize, std.math.maxInt(u8))));
 	}
 	return 1;
 }
@@ -2962,4 +2965,28 @@ test "pdf: stopgap font UTF-8 bytes in a TJ array are decoded as UTF-8, not moji
 	try testing.expect(std.mem.indexOf(u8, c, "café") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "résumé") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "Ã©") == null);
+}
+
+test "pdf: >255 distinct heading font sizes must not overflow the heading level" {
+	// Brann (and any PDF with erratic/fractional sizing) declares >255 distinct
+	// font sizes above the heading threshold. headingLevelForSize did
+	// @intCast(i+1) into a u8 → panic in Debug / UB in ReleaseFast. The level
+	// must saturate, not overflow. Regression: parse() must complete cleanly.
+	var items = std.ArrayList(TestTextItem).empty;
+	defer items.deinit(testing.allocator);
+	// Dominant body size 12 (most common → threshold 13.8, 1.5x = 18).
+	try items.append(testing.allocator, .{ .text = "body alpha", .font_size = 12, .y_pos = 700 });
+	try items.append(testing.allocator, .{ .text = "body beta", .font_size = 12, .y_pos = 680 });
+	try items.append(testing.allocator, .{ .text = "body gamma", .font_size = 12, .y_pos = 660 });
+	// 256 distinct heading sizes (30..285), all well above 1.5x dominant so they
+	// all qualify as headings; the smallest lands at heading_sizes index 255.
+	var s: u32 = 30;
+	while (s < 30 + 256) : (s += 1) {
+		try items.append(testing.allocator, .{ .text = "Heading Text Here", .font_size = @floatFromInt(s), .y_pos = 640 });
+	}
+	const pdf = try buildTestPdf(testing.allocator, &.{.{ .text_items = items.items }});
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/manysizes.pdf");
+	defer freeDocument(testing.allocator, doc);
+	try testing.expect(doc.sections.len > 0);
 }
