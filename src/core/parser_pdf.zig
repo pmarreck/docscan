@@ -2232,7 +2232,19 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 				if (has_prev_body) {
 					const y_diff = @abs(span.y_position - prev_y);
 					const line_threshold = prev_font_size * 1.2;
-					if (y_diff < line_threshold) {
+					// A trailing hyphen is a hyphenation point at ANY line boundary — handle it
+					// FIRST, before the same-line/wrap classification. At this stage every span is
+					// already one visual line (clustering merged same-baseline runs), so a borderline
+					// y-gap must not route a line-break hyphen around de-hyphenation (incitez_web
+					// 2026-06-15: the stray "Bos-ton" was a wrap misclassified as same-line).
+					const blen0 = fs.content_buf.items.len;
+					const ends_hyphen = blen0 > 0 and fs.content_buf.items[blen0 - 1] == '-';
+					const hy: WrapHyphen = if (ends_hyphen) wrapHyphenDecision(fs.content_buf.items, span.text) else .not_applicable;
+					if (hy == .drop) {
+						_ = fs.content_buf.pop(); // soft line-break hyphen: drop it, the word continues (no space)
+					} else if (hy == .keep) {
+						// real compound across the boundary ("well-known"): keep the hyphen, no space
+					} else if (y_diff < line_threshold) {
 						// Same line — only add space if needed
 						const buf_len = fs.content_buf.items.len;
 						const last_is_space = buf_len > 0 and fs.content_buf.items[buf_len - 1] == ' ';
@@ -2267,8 +2279,8 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 										break :blk2 e;
 									};
 									const next_fragment = span.text[0..span_word_end];
-									@memcpy(concat_buf[prev_fragment.len..prev_fragment.len + next_fragment.len], next_fragment);
-									const combined = concat_buf[0..prev_fragment.len + next_fragment.len];
+									@memcpy(concat_buf[prev_fragment.len .. prev_fragment.len + next_fragment.len], next_fragment);
+									const combined = concat_buf[0 .. prev_fragment.len + next_fragment.len];
 									if (!wordfix.isWord(combined) and prev_fragment.len >= 2 and next_fragment.len >= 2 and isAlphaOnly(prev_fragment) and isAlphaOnly(next_fragment)) {
 										// Concatenation is not a word — this was a real space
 										try fs.content_buf.append(allocator, ' ');
@@ -2278,26 +2290,14 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 						}
 					} else {
 						// Different line. A normal single-line advance is an intra-paragraph
-						// WRAP -> join with a space (so citation tokens aren't split — the
-						// ~47% recall fix); only a larger vertical gap is a paragraph /
-						// structural boundary -> a lone '\n' (incitez's hard case-name stop).
-						// Headings are already separated upstream by font-size section detection.
-						// Adaptive when the document has a clear modal line height; else
-						// fall back to the per-span font heuristic (short/synthetic docs).
+						// WRAP -> join with a space; only a larger vertical gap is a paragraph /
+						// structural boundary -> a lone '\n'. Adaptive when the document has a clear
+						// modal line height; else fall back to the per-span font heuristic.
 						const paragraph_threshold = if (modal_gap > 0) modal_gap * 1.5 else prev_font_size * 2.2;
 						if (y_diff < paragraph_threshold) {
 							const blen = fs.content_buf.items.len;
-							// A line-break hyphen joins a word across the wrap (incitez_web
-							// 2026-06-15: case names like "Ada-\nrand"→"Adarand"). Drop a soft
-							// hyphen, keep a real compound ("well-known"), no space either way.
-							switch (wrapHyphenDecision(fs.content_buf.items, span.text)) {
-								.drop => _ = fs.content_buf.pop(),
-								.keep => {},
-								.not_applicable => {
-									const last_ws = blen > 0 and (fs.content_buf.items[blen - 1] == ' ' or fs.content_buf.items[blen - 1] == '\n');
-									if (!last_ws) try fs.content_buf.append(allocator, ' ');
-								},
-							}
+							const last_ws = blen > 0 and (fs.content_buf.items[blen - 1] == ' ' or fs.content_buf.items[blen - 1] == '\n');
+							if (!last_ws) try fs.content_buf.append(allocator, ' ');
 						} else {
 							try fs.content_buf.append(allocator, '\n');
 						}
@@ -4351,4 +4351,53 @@ test "pdf: ToA section header is not welded onto the first entry" {
 	const c = all.items;
 	try testing.expect(std.mem.indexOf(u8, c, "Cases\nAlbritton") != null); // header on its own line
 	try testing.expect(std.mem.indexOf(u8, c, "Cases Albritton") == null); // not welded
+}
+
+/// Two lines whose vertical gap (13) is just under the section-assembly same-line
+/// threshold (font 12 → 14.4) — a genuine wrap that the gap MIS-classifies as same-line.
+/// The line-break hyphen "Bos-"/"ton" must still de-hyphenate (handled before the
+/// same-line/wrap split), while a true compound across the same gap is kept.
+fn buildPdfBorderlineHyphen(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	const stream =
+		"BT\n/F1 12 Tf\n100 700 Td\n(Bisexual Group of Bos-) Tj\n" ++
+		"0 -13 Td\n(ton, Inc., 515 U. S. 557) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: line-break hyphen de-hyphenates even when the gap is misclassified as same-line" {
+	// incitez_web 2026-06-15: the stray "Bos-ton" in 303 — a wrap whose y-gap fell just
+	// under the same-line threshold, bypassing the wrap-only de-hyphenation. Hyphen handling
+	// now runs before the same-line/wrap split, so it de-hyphenates regardless.
+	const pdf = try buildPdfBorderlineHyphen(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/borderline.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "Boston") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "Bos-ton") == null);
 }
