@@ -618,17 +618,21 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 /// Walk /Resources/XObject entries on a page. For each form XObject
 /// (Subtype = /Form), parse its content stream for text spans.
 fn extractFormXObjectText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pdf_objects.DictEntry, spans: *std.ArrayList(TextSpan), page_num: u32, page_font_maps: *FontMap) void {
-	// Find /Resources (direct or indirect)
+	// Find /Resources (direct or indirect). When resolved via an indirect reference,
+	// getObject returns a freshly-allocated value we OWN and must free at function
+	// end — the resources dict is borrowed from it throughout the XObject loop below.
+	// A directly-inlined /Resources is borrowed from page_dict and must NOT be freed.
+	var owned_res: ?pdf_objects.PdfValue = null;
+	defer if (owned_res) |ov| pdf_objects.freePdfValue(allocator, ov);
 	const resources = blk: {
 		if (pdf_objects.getDictDict(page_dict, "Resources")) |r| break :blk r;
 		const res_ref = pdf_objects.getDictRef(page_dict, "Resources") orelse return;
 		const res_val = (ctx.getObject(res_ref.obj) catch return) orelse return;
-		// Note: we can't defer free here because we need the dict to outlive this scope.
-		// The resource dict is borrowed from the page object, which is managed by ctx.
 		if (res_val != .dict) {
 			pdf_objects.freePdfValue(allocator, res_val);
 			return;
 		}
+		owned_res = res_val; // own it; the defer above frees it after the loop
 		break :blk res_val.dict;
 	};
 
@@ -2989,4 +2993,106 @@ test "pdf: >255 distinct heading font sizes must not overflow the heading level"
 	const doc = try parse(testing.allocator, pdf, "/test/manysizes.pdf");
 	defer freeDocument(testing.allocator, doc);
 	try testing.expect(doc.sections.len > 0);
+}
+
+/// Build a 1-page PDF whose /Resources is an INDIRECT reference (5 0 R) rather
+/// than an inline dict. Real PDFs (e.g. the Brann brief) do this; buildTestPdf
+/// always inlines /Resources, so only this shape exercises the getObject path in
+/// extractFormXObjectText that leaked.
+fn buildPdfIndirectResources(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	// Page with INDIRECT /Resources (5 0 R).
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources 5 0 R >>\nendobj\n");
+	const stream = "BT\n/F1 12 Tf\n100 700 Td\n(Hello world) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) {
+		try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	}
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: indirect /Resources is freed, not leaked (extractFormXObjectText ownership)" {
+	// Regression: extractFormXObjectText resolved an indirect /Resources via
+	// getObject (a fresh allocation) but never freed it on the common early-return
+	// paths — a per-page leak on real PDFs (~976 allocations on the 90-page Brann
+	// brief). testing.allocator fails the test if parse() leaks; the sanity check
+	// confirms extraction still works.
+	const pdf = try buildPdfIndirectResources(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/indirect-res.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	try testing.expect(std.mem.indexOf(u8, all.items, "Hello world") != null);
+}
+
+test "pdf: parse() leak sweep over allocation-heavy document shapes" {
+	// MFIC leak gate: parse() + freeDocument across the shapes whose resolution
+	// paths allocate the most — direct/indirect /Resources, form XObjects,
+	// encrypted streams, TJ arrays, multi-page. testing.allocator fails the test on
+	// ANY leak. Extend this list whenever a new leak is found (add the repro here).
+	const a = testing.allocator;
+
+	// 1. Inline /Resources + a heading (the common synthetic shape).
+	{
+		const pdf = try buildTestPdf(a, &.{.{ .text_items = &.{
+			.{ .text = "Big Heading", .font_size = 24, .y_pos = 740 },
+			.{ .text = "alpha beta gamma body", .font_size = 12, .y_pos = 700 },
+		} }});
+		defer a.free(pdf);
+		const doc = try parse(a, pdf, "/t/inline.pdf");
+		freeDocument(a, doc);
+	}
+	// 2. Indirect /Resources (the leak fixed in this commit).
+	{
+		const pdf = try buildPdfIndirectResources(a);
+		defer a.free(pdf);
+		const doc = try parse(a, pdf, "/t/indirect.pdf");
+		freeDocument(a, doc);
+	}
+	// 3. Form XObject (the extractFormXObjectText path).
+	{
+		const pdf = try buildTestPdfWithFormXObject(a, "Form layer text here");
+		defer a.free(pdf);
+		const doc = try parse(a, pdf, "/t/form.pdf");
+		freeDocument(a, doc);
+	}
+	// 4. Encrypted PDFs (decryptor + crypt-filter allocations).
+	for ([_][]const u8{
+		@embedFile("fixtures/encrypted_rc4_128.pdf"),
+		@embedFile("fixtures/encrypted_aes_128.pdf"),
+		@embedFile("fixtures/encrypted_v5r6_aes256.pdf"),
+	}) |enc| {
+		const doc = try parse(a, enc, "/t/enc.pdf");
+		freeDocument(a, doc);
+	}
+	// 5. TJ array + multi-page.
+	{
+		const pdf = try buildTestPdf(a, &.{
+			.{ .text_items = &.{.{ .text = "page one TJ text", .font_size = 12, .y_pos = 700, .tj = true }} },
+			.{ .text_items = &.{.{ .text = "page two body text", .font_size = 12, .y_pos = 700 }} },
+		});
+		defer a.free(pdf);
+		const doc = try parse(a, pdf, "/t/tj.pdf");
+		freeDocument(a, doc);
+	}
 }

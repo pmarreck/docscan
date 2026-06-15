@@ -262,13 +262,26 @@ citation "surpass" is live across formats; incitez_web consumes it.
       - [x] **(1) Crash bug** (2026-06-15 EST): headingLevelForSize did `@intCast(i+1)→u8`;
             a PDF with >255 distinct heading sizes (Brann's erratic sizing) overflowed it
             (Debug panic / ReleaseFast UB). Now saturates at u8 max. Regression test added.
-      - [ ] **(2) Separate extraction vs index concerns**: audit normalization run inside
-            parse()/applySections (wordfix.normalizeText adds space AFTER `,;:`+letter; the
-            space-BEFORE-comma is a run-join artifact, NOT intentional). Move index-tokenization
-            concerns to a pre-index pass so extract()/WASM/incitez get faithful text.
-      - [ ] **(3) Detokenizer-aware run join** (geometry-independent): cluster same-y runs into
-            lines; no space before attaching punctuation (`,.;:)`), none after `(`/open-quote.
-            Fixes the space-before-comma AND the citation-splitting in one move.
+      - [x] **(1b) parse() memory leak** (2026-06-15 EST): extractFormXObjectText resolved an
+            INDIRECT /Resources via getObject (fresh alloc) but never freed it on early-return
+            paths — a per-page leak on real PDFs (~976 allocs on Brann; masked by the CLI arena,
+            caught by testing.allocator). Now tracks ownership + frees. Added a comprehensive
+            "parse() leak sweep" test over allocation-heavy shapes (inline/indirect resources,
+            form XObjects, encrypted, TJ, multi-page) as the standing leak gate — extend it
+            whenever a new leak is found.
+      - [x] **(2) Separate extraction vs index concerns** (2026-06-15 EST): AUDIT result —
+            boundary already clean. Extraction (applySections) is faithful-restoration only
+            (ligatures, de-hyphenation, word-rejoin, punctuation-spacing *restoration*); FTS5's
+            unicode61 tokenizer does punctuation-stripping/case-folding at INDEX time; the index
+            path adds no extra normalization. The space-BEFORE-comma is a run-join artifact (not
+            an index concern). Ruling (Peter): keep punctuation-spacing restoration as faithful.
+      - [ ] **(3) Line-aware re-section** (root cause, chosen by Peter 2026-06-15): erratic
+            PER-RUN font sizes (9.2–16.2 mid-sentence) fool the per-SPAN heading detector →
+            body runs misclassified as headings → hundreds of bogus 1-run sections. docscan's y
+            is reliable, so: cluster runs into LINES by y; per-line representative size = MEDIAN
+            (not per-run); detect headings per LINE; join runs within a line with detokenizer
+            spacing (no space before `,.;:)`); lines → paragraphs. Detokenizer spacing (your
+            original concern) becomes polish once bogus splits stop.
       - [ ] **(4) Grammar/POS** for the residual ambiguous joins (the deferred tagger).
       Fixture: `tests/corpus/legal-brann-appellate-brief.pdf` (3.5MB, gitignored).
       incitez_web holds pdf on `incitez_clean` (recall-safe) until fixed.
