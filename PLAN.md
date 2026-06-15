@@ -338,9 +338,12 @@ citation "surpass" is live across formats; incitez_web consumes it.
             — Peter). (iii) ToA dot leaders → lone newline (`dotLeaderToNewline`, 5+ dots, lexical
             /(?:\.[ \t]*){5,}/) as a hard antecedent stop for incitez's walk-back; preserves
             "..."/"...."/reporter spacing "U. S.". Classifier-over-set + synthetic-PDF tests; corpus
-            27/27 held, wasm reporter-spacing smoke green. REMAINING residual: one dropped space
-            ("GasCo."→"Gas Co.", "AdamS."→"Adam S.") — a run-boundary spacing case, different
-            mechanism, deferred.
+            27/27 held, wasm reporter-spacing smoke green. (iv) the dropped-space class
+            ("GasCo."→"Gas Co.", "AdamS."→"Adam S.") is ALSO fixed — a side effect of (ii):
+            isWord("GasCo")=false makes the run-joiner restore the space at the run boundary,
+            while a genuine single-token name ("BethEnergy", no run boundary) is left intact
+            (so "PepsiCo" won't wrongly split). Regression test locks both. ALL 4 of
+            incitez_web's residual artifacts resolved.
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
             fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
             Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
