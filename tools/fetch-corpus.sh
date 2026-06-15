@@ -45,7 +45,9 @@ done
 # a password (the case docscan supports). Owner password is arbitrary.
 SRC="$DEST/arxiv_resnet.pdf"
 if command -v qpdf >/dev/null 2>&1 && [ -f "$SRC" ]; then
-	qpdf --encrypt "" owner 128 --use-aes=n -- "$SRC" "$DEST/enc_rc4_128.pdf" 2>/dev/null && echo "ok    enc_rc4_128 (qpdf RC4-128)"
+	# qpdf >=11 refuses to write RC4 (deprecated) without --allow-weak-crypto, and
+	# leaves a 0-byte stub on failure — so pass the flag and verify non-empty output.
+	if qpdf --allow-weak-crypto --encrypt "" owner 128 --use-aes=n -- "$SRC" "$DEST/enc_rc4_128.pdf" && [ -s "$DEST/enc_rc4_128.pdf" ]; then echo "ok    enc_rc4_128 (qpdf RC4-128)"; else echo "WARN  enc_rc4_128 generation failed"; fi
 	qpdf --encrypt "" owner 128 --use-aes=y -- "$SRC" "$DEST/enc_aes_128.pdf" 2>/dev/null && echo "ok    enc_aes_128 (qpdf AES-128)"
 	qpdf --encrypt "" owner 256 -- "$SRC" "$DEST/enc_aes_256.pdf" 2>/dev/null && echo "ok    enc_aes_256 (qpdf AES-256)"
 else
