@@ -327,6 +327,20 @@ citation "surpass" is live across formats; incitez_web consumes it.
             reading order is solid, revisit the averaged-perceptron POS tagger
             (docs/research/2026-06-14-pos-tagging-for-zig-wasm.md) — pure-Zig, wasm-able via
             @embedFile+flate, PROPN signal for party-attribution / heading-bleed. Next big feature.
+      - [x] **(5c) Residual ToA/citation text-edges** (2026-06-15 EST): incitez_web's scan of the
+            reading-order build (9207be47) found ≈99.6% of ~1,200 named citations clean; the
+            last edges, now fixed: (i) proper-noun case names hyphenated across a line wrap
+            ("Ada-\nrand"→"Adarand", "BethEn-\nergy"→"BethEnergy") — `wrapHyphenDecision` drops a
+            soft line-break hyphen (joined is a word, or left fragment is not a word, or
+            Capitalized-left+lowercase-tail proper-noun split) and keeps real compounds
+            ("well-known"); mid-line "e-mail"/"x-ray" untouched. (ii) `isWord` now rejects
+            mid-word capitalization (camelCase "SmithJones"/"GasCo" are concatenations, not words
+            — Peter). (iii) ToA dot leaders → lone newline (`dotLeaderToNewline`, 5+ dots, lexical
+            /(?:\.[ \t]*){5,}/) as a hard antecedent stop for incitez's walk-back; preserves
+            "..."/"...."/reporter spacing "U. S.". Classifier-over-set + synthetic-PDF tests; corpus
+            27/27 held, wasm reporter-spacing smoke green. REMAINING residual: one dropped space
+            ("GasCo."→"Gas Co.", "AdamS."→"Adam S.") — a run-boundary spacing case, different
+            mechanism, deferred.
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
             fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
             Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
