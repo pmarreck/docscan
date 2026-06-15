@@ -7,10 +7,13 @@ consumer codes to.
 
 The artifact is a **parse-to-text slice**: it turns a docx / pdf / md / txt file
 into plain UTF-8 text, fully client-side, with NO server and NO external
-library. The sqlite/sqlite-vec/FTS5 search + embedding machinery, the
-ocrmypdf/Ghostscript OCR shell-out, and the uchardet (C++) charset detector are
-all comptime-excluded — this is parse-to-text ONLY. (Deliberately mirrors how
-incitez's WASM build comptime-excludes its PCRE2 engine.)
+library. The sqlite/sqlite-vec/FTS5 search + embedding machinery and the
+ocrmypdf/Ghostscript OCR shell-out are comptime-excluded — this is parse-to-text
+ONLY. (Deliberately mirrors how incitez's WASM build comptime-excludes its PCRE2
+engine.) NOTE: charset detection + transcoding now ARE in the slice — the old
+C++ uchardet was replaced by pure-Zig chardetz + generated codepage tables, so
+the slice can detect and convert legacy single-byte encodings (and UTF-16/32) on
+its own; only CJK multibyte is detected-but-not-yet-transcoded.
 
 It pairs with incitez's WASM ABI: extract text here, feed that text to
 `incitez_extract` for citations. Same memory protocol on purpose.
@@ -33,10 +36,11 @@ It pairs with incitez's WASM ABI: extract text here, feed that text to
 - **Garnix cache:** Garnix builds `packages.*` and runs `checks.wasm` (a Node
   smoke test) on every push to `yolo`, so the artifact is served from
   `cache.garnix.io`.
-- **Size:** ~964 KB. Note: ~86% of that is wordfix's embedded dictionaries
-  (`dictionary.zlib` + `proper_nouns.zlib`), which power de-hyphenation and the
-  text-quality / scan-detection heuristic; the actual parser code is ~136 KB.
-  The file barely gzips (the dictionaries are already compressed).
+- **Size:** ~1.17 MB. Most of that is wordfix's embedded dictionaries
+  (`dictionary.zlib` + `proper_nouns.zlib`, which power de-hyphenation and the
+  text-quality / scan-detection heuristic) plus chardetz's charset-detection
+  tables (added when detection moved into the slice). The file barely gzips (the
+  dictionaries are already compressed).
 
 ---
 
@@ -83,8 +87,9 @@ JS side.
 | `2` | txt (UTF-8 — passed through as-is) |
 | `3` | pdf |
 
-Legacy `.doc` (OLE2) and raw `.txt` of unknown charset are **out of scope** for
-the slice (they would need the C++ uchardet detector). Use docx/pdf/md/utf8-txt.
+Legacy `.doc` (OLE2) is **out of scope** for the slice. Raw `.txt` is passed
+through as UTF-8 as-is (the slice does not yet run charset detection on the txt
+path — only the PDF stopgap-font path uses chardetz today). Use docx/pdf/md/utf8-txt.
 
 ---
 

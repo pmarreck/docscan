@@ -26,6 +26,11 @@ const CMap = struct {
 	/// Range mappings: start_glyph -> (end_glyph, base_unicode)
 	ranges: std.ArrayList(CMapRange),
 	allocator: Allocator,
+	/// True when this CMap is the WinAnsi (CP1252) *default* guess for a simple
+	/// font that declared no recognized /Encoding. Such fonts' bytes are deferred
+	/// for the decode-both charset heuristic (see resolveStopgapEncoding) rather
+	/// than trusted; ToUnicode and explicitly-declared encodings leave this false.
+	stopgap: bool = false,
 
 	const CMapRange = struct {
 		start: u16,
@@ -278,6 +283,9 @@ const TextSpan = struct {
 	page: u32,
 	y_position: f32,
 	x_position: f32,
+	/// True while this span still holds RAW undecoded bytes from a stopgap font;
+	/// resolveStopgapEncoding() picks the encoding, decodes in place, and clears this.
+	raw: bool = false,
 };
 /// A flat section before nesting is applied.
 const FlatSection = struct {
@@ -422,6 +430,56 @@ fn parsePageLabels(ctx: *PdfContext, catalog: []const pdf_objects.DictEntry) ?[]
 	return null;
 }
 
+/// Decode-both charset heuristic for simple PDF fonts that hit the WinAnsi
+/// (CP1252) stopgap. Their text bytes were kept RAW (TextSpan.raw); here we
+/// decide ONE encoding for all of them: the implicit default (WINDOWS-1252)
+/// unless an independently chardetz-detected charset decodes the same bytes to
+/// higher-quality text (wordfix.textQuality is the independent judge — neither
+/// the PDF's implicit claim nor the detector is trusted alone). Detection runs
+/// over the concatenation of ALL stopgap bytes for confidence; each span is then
+/// decoded with the winner. No-op when there are no stopgap spans.
+fn resolveStopgapEncoding(allocator: Allocator, spans: *std.ArrayList(TextSpan)) void {
+	var any_raw = false;
+	var concat = std.ArrayList(u8).empty;
+	defer concat.deinit(allocator);
+	for (spans.items) |s| {
+		if (!s.raw) continue;
+		any_raw = true;
+		concat.appendSlice(allocator, s.text) catch return;
+	}
+	if (!any_raw) return;
+
+	// Default to WinAnsi (CP1252) — the historical stopgap behavior.
+	var chosen: []const u8 = "WINDOWS-1252";
+	if (encoding.detectEncoding(allocator, concat.items)) |det| {
+		if (!std.mem.eql(u8, det, "WINDOWS-1252") and !std.mem.eql(u8, det, "ASCII")) {
+			if (std.mem.eql(u8, det, "UTF-8") and std.unicode.utf8ValidateSlice(concat.items)) {
+				// Valid multibyte UTF-8 is high-precision: trust it outright.
+				chosen = det;
+			} else {
+				const win = encoding.toUtf8(allocator, concat.items, "WINDOWS-1252") catch null;
+				const alt = encoding.toUtf8(allocator, concat.items, det) catch null;
+				defer if (win) |w| allocator.free(w);
+				defer if (alt) |a| allocator.free(a);
+				if (win != null and alt != null and
+					wordfix.textQuality(alt.?) > wordfix.textQuality(win.?))
+				{
+					chosen = det;
+				}
+			}
+		}
+	}
+
+	// Decode each stopgap span with the chosen encoding, replacing its raw bytes.
+	for (spans.items) |*s| {
+		if (!s.raw) continue;
+		const decoded = encoding.toUtf8(allocator, s.text, chosen) catch continue;
+		allocator.free(s.text);
+		s.text = decoded;
+		s.raw = false;
+	}
+}
+
 /// Parse a PDF byte buffer into a Document with inferred heading structure.
 /// Caller owns the returned Document; free with `freeDocument`.
 pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Document {
@@ -451,6 +509,11 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	}
 
 	try collectPageSpans(allocator, &ctx, pages_ref.obj, &spans, 1);
+
+	// Decode-both charset heuristic: stopgap-font spans were kept as RAW bytes;
+	// pick their encoding now (declared WinAnsi vs chardetz-detected, judged by
+	// wordfix.textQuality) over ALL such bytes at once for detection confidence.
+	resolveStopgapEncoding(allocator, &spans);
 
 	// Infer structure from font sizes
 	const sections = try inferStructure(allocator, spans.items);
@@ -738,14 +801,19 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 		// deterministic (no charset guessing) and pure-Zig (works in the wasm slice, where
 		// the uchardet charset detector is comptime-excluded).
 		const enc_name = pdf_objects.getDictName(font_obj_dict, "Encoding");
+		var is_stopgap = false;
 		const enc_table: ?*const [256]u21 = blk: {
 			if (enc_name) |ename| {
 				if (encoding.getEncodingTable(ename)) |t| break :blk t;
 			}
+			// No declared/recognized /Encoding — WinAnsi is only a GUESS. Mark it
+			// stopgap so resolveStopgapEncoding can override it via charset detection.
+			is_stopgap = true;
 			break :blk encoding.getEncodingTable("WinAnsiEncoding");
 		};
 		if (enc_table) |table| {
 			var cmap = buildCMapFromEncodingTable(allocator, table);
+			cmap.stopgap = is_stopgap;
 			const owned_name = allocator.dupe(u8, font_name) catch {
 				cmap.deinit();
 				continue;
@@ -783,7 +851,15 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 			const raw_str = extractStreamString(allocator, stream, &pos) catch continue;
 			// Decode through CMap if available (needed for CID fonts in OCR'd PDFs)
 			const cmap = getCurrentCMap(font_maps, current_font_name);
-			const str = if (cmap) |cm| (decodeThroughCMap(allocator, raw_str, cm) orelse raw_str) else raw_str;
+			// Stopgap fonts (the WinAnsi default guess) defer decoding: keep the RAW
+			// bytes so resolveStopgapEncoding can pick the encoding from the whole doc.
+			const is_stopgap = if (cmap) |cm| cm.stopgap else false;
+			const str = if (is_stopgap)
+				raw_str
+			else if (cmap) |cm|
+				(decodeThroughCMap(allocator, raw_str, cm) orelse raw_str)
+			else
+				raw_str;
 			const str_is_decoded = (str.ptr != raw_str.ptr);
 			if (str_is_decoded) allocator.free(raw_str);
 			// Look ahead for Tj or '
@@ -798,6 +874,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							.page = page_num,
 							.y_position = y_pos,
 							.x_position = x_pos,
+							.raw = is_stopgap,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -810,6 +887,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							.page = page_num,
 							.y_position = y_pos,
 							.x_position = x_pos,
+							.raw = is_stopgap,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -2815,4 +2893,32 @@ test "decrypt blank-password PDFs (RC4-128, AES-128, AES-256/R6) and extract tex
 		try testing.expect(std.mem.indexOf(u8, all.items, "Internet") != null);
 		try testing.expect(std.mem.indexOf(u8, all.items, "Requirement") != null);
 	}
+}
+
+test "pdf: stopgap font whose bytes are UTF-8 is decoded as UTF-8, not CP1252 mojibake" {
+	// Peter 2026-06-14 decode-both heuristic: a simple font with no ToUnicode and no
+	// /Encoding hits the WinAnsi (CP1252) stopgap. If its text bytes are actually UTF-8
+	// (a very common real-world case), byte-wise CP1252 decoding mangles every accented
+	// char into mojibake ("café" -> "cafÃ©"). The heuristic must detect the bytes are
+	// UTF-8 (chardetz) and keep them — scored higher by wordfix.textQuality than the
+	// garbled CP1252 decode.
+	const utf8_text = "Café société résumé naïve façade — the Zürich café served " ++
+		"crème brûlée and piña colada to every señor and señora at the soirée.";
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = utf8_text, .font_size = 12, .y_pos = 700 },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/utf8-stopgap.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	// Correct UTF-8 survived: the literal accented words are intact.
+	try testing.expect(std.mem.indexOf(u8, c, "café") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "résumé") != null);
+	// No CP1252 mojibake: "Ã©" (0xC3 0x83 0xC2 0xA9) is the tell-tale of é misread as CP1252.
+	try testing.expect(std.mem.indexOf(u8, c, "Ã©") == null);
 }

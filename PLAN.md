@@ -235,13 +235,19 @@ citation "surpass" is live across formats; incitez_web consumes it.
       differential-tested vs `iconv` over all 256 bytes × 22 charsets (5632 cells; hermetic
       `@embedFile` oracle in codepages_test.zig). At generation iconv and MAPPINGS agreed on
       all cells (0 divergences). Regenerate via `tools/gen_codepages.sh`.
-- [ ] **Encoding HEURISTIC (NEXT — Peter 2026-06-14): do NOT trust the chunk's CLAIMED
-      /Encoding NOR chardetz detection alone.** Per non-ASCII text run, decode it BOTH ways
-      (declared vs chardetz-detected), score each with `wordfix.textQuality`, keep the higher.
-      MFIC-style: the dictionary is the independent judge — neither the PDF's claim nor the
-      detector's claim is trusted alone. (Agreement => same result; pure-ASCII => no-op;
-      wrong-claim => garbled decode scores low and loses.) Wire into the PDF text path;
-      this RETIRES the WinAnsi-default stopgap in parser_pdf.zig (~line 739).
+- [x] **Encoding HEURISTIC (decode-both, 2026-06-14 EST):** simple PDF fonts with no
+      ToUnicode and no recognized /Encoding are marked `stopgap` (CMap.stopgap); their
+      Tj/' text is kept as RAW bytes (TextSpan.raw) instead of being committed to the
+      WinAnsi guess. `resolveStopgapEncoding` (parser_pdf.zig) then concatenates ALL such
+      bytes in the doc (detection confidence), runs `chardetz` detection, and keeps the
+      higher-scoring of {WinAnsi decode, detected decode} per `wordfix.textQuality` — with
+      a fast path that trusts valid multibyte UTF-8 outright. Neither the PDF's implicit
+      claim nor the detector is trusted alone; the dictionary is the independent judge.
+      Fixes the classic UTF-8-as-CP1252 mojibake ("café"→"cafÃ©") while preserving genuine
+      CP1252 docs (the WinAnsi default still wins when nothing beats it). chardetz detection
+      now actually runs in the wasm slice too (+148KB → ~1.17MB). Test: parser_pdf.zig
+      "stopgap font whose bytes are UTF-8…". TODO: extend deferral to TJ-array and hex
+      string operators (currently Tj/' only; TJ/hex still use the WinAnsi CMap directly).
 - [ ] **Brann real-brief pdf split** (~19 chars/line, citations split mid-token): adaptive-gap
       did NOT fix it. Its content stream is pathological (cumulative TD, spurious `5.00 Tf`
       between body spans, erratic positioning). Needs instrumented diagnosis of the actual
