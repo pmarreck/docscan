@@ -292,6 +292,26 @@ citation "surpass" is live across formats; incitez_web consumes it.
       - [x] **Corpus harness** (2026-06-15): tools/fetch-corpus.sh (pinned public arXiv 12–144pg
             + qpdf blank-pw encrypted variants + local Brann, gitignored) + tests/corpus/run-corpus
             (dev-time differential vs pdftotext; word-recall + heading-fraction; skips w/o corpus).
+      - [x] **(5) Multi-column reading-order regression** (2026-06-15 EST): the f4c2eb0a
+            line-clustering globally y-sorted runs, merging side-by-side columns into one
+            visual line (~82% citation loss on real SCOTUS slip opinions — incitez_web bug).
+            FIX: cluster in CONTENT-STREAM order (column-major as the page emits it), only a
+            larger y-jump starts a new line, x-sort within a line. Added a `bigram` reading-
+            order metric to run-corpus (adjacent word-pairs preserved vs pdftotext) — word-
+            recall alone cannot catch a scramble (every word present, mis-ordered). Regression
+            test + full corpus all pass.
+      - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
+            fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
+            Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
+            /Encoding /Differences glyph NAMES (Custom fonts, any code); pass-2 repairs Adobe
+            StandardEncoding ligature POSITIONS (174=fi,175=fl,…) still holding a lone-f stub
+            (Builtin fonts — the real SCOTUS case, NO /Differences). Both paths have hermetic
+            tests; pass-2's proven non-vacuous by neutering (exactly one test fails → reverts
+            to "defnes"). Validated on legal-scotus-303-creative (fi/fl/ffi words all correct,
+            zero stubs).
+      - [x] **Corpus committed** (2026-06-15 EST): incitez_web-donated layout-diverse legal
+            fixtures (8 SCOTUS slip ops + OSG/circuit/district briefs) committed to
+            tests/corpus/ (jj snapshot.max-new-file-size raised to 16MiB); run-corpus 27/27.
       - [ ] **(4) Grammar/POS** for the residual ambiguous joins (the deferred tagger).
       Fixture: `tests/corpus/legal-brann-appellate-brief.pdf` (3.5MB, gitignored).
       incitez_web holds pdf on `incitez_clean` (recall-safe) until fixed.
@@ -301,4 +321,4 @@ citation "surpass" is live across formats; incitez_web consumes it.
       extend to the other parsers if they don't route through wordfix.
 - [ ] **Citation pipeline Phase 2** — offset map + `docscan_extract_structured` (deferred;
       md/txt exact first, pdf/docx pending incitez_web highlight-needs convo).
-- [ ] Stray uncommitted `docs/superpowers/plans/2026-04-15-libvips-ocr-preprocessing.md`.
+- [x] Committed `docs/superpowers/plans/2026-04-15-libvips-ocr-preprocessing.md` (libvips OCR-preprocessing plan) (2026-06-15 EST).
