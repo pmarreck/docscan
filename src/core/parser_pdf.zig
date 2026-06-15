@@ -736,50 +736,71 @@ fn ligatureExpansion(name: []const u8) ?[]const u8 {
 	return null;
 }
 
-/// Override a font CMap's mapping for codes whose /Encoding /Differences glyph name
-/// is a standard f-ligature, expanding them to component letters. Many real fonts
-/// (SCOTUS slip-opinion Century types) ship a BROKEN ToUnicode mapping the fi/fl
-/// glyphs to just "f" — the /Differences glyph NAME is the reliable source, so it
-/// takes precedence here (matching poppler's glyph-name recovery). /Encoding may be
-/// an inline dict or an indirect reference; a name-valued /Encoding has no Differences.
-fn overrideLigatureDifferences(allocator: Allocator, ctx: *PdfContext, font_dict: []const pdf_objects.DictEntry, cmap: *CMap) void {
-	var owned: ?pdf_objects.PdfValue = null;
-	defer if (owned) |o| pdf_objects.freePdfValue(allocator, o);
-	const enc_dict: []const pdf_objects.DictEntry = blk: {
-		if (pdf_objects.getDictDict(font_dict, "Encoding")) |d| break :blk d;
-		const ref = pdf_objects.getDictRef(font_dict, "Encoding") orelse return;
-		const val = (ctx.getObject(ref.obj) catch return) orelse return;
-		if (val != .dict) {
-			pdf_objects.freePdfValue(allocator, val);
-			return;
-		}
-		owned = val;
-		break :blk val.dict;
+/// Set cmap.char_map[code] = dup(value), freeing any prior value.
+fn setCMapEntry(allocator: Allocator, cmap: *CMap, code: u16, value: []const u8) void {
+	const owned = allocator.dupe(u8, value) catch return;
+	const gop = cmap.char_map.getOrPut(code) catch {
+		allocator.free(owned);
+		return;
 	};
-	const diffs = pdf_objects.getDictArray(enc_dict, "Differences") orelse return;
-	var code: u16 = 0;
-	for (diffs) |elem| {
-		switch (elem) {
-			.integer => |n| {
-				if (n >= 0 and n <= 0xFFFF) code = @intCast(n);
-			},
-			.name => |nm| {
-				if (ligatureExpansion(nm)) |exp| {
-					const owned_exp = allocator.dupe(u8, exp) catch {
-						code +%= 1;
-						continue;
-					};
-					const gop = cmap.char_map.getOrPut(code) catch {
-						allocator.free(owned_exp);
-						code +%= 1;
-						continue;
-					};
-					if (gop.found_existing) allocator.free(gop.value_ptr.*);
-					gop.value_ptr.* = owned_exp;
-				}
-				code +%= 1;
-			},
-			else => {},
+	if (gop.found_existing) allocator.free(gop.value_ptr.*);
+	gop.value_ptr.* = owned;
+}
+
+/// Repair f-ligature glyphs whose ToUnicode is broken (maps fi/fl/ffi to just
+/// "f"/"ff" — common in real fonts; SCOTUS Century types do this → "defines"
+/// becomes "defnes"). Recovers the component letters from two sources, matching
+/// poppler's glyph-name recovery:
+///   1. /Encoding /Differences glyph NAMES (authoritative, any code) — Custom fonts.
+///   2. StandardEncoding ligature POSITIONS (174=fi, 175=fl, …) where the CMap
+///      still holds a lone-"f"/"ff" stub — Builtin/Standard fonts with no
+///      /Differences (e.g. the SCOTUS small-caps Century faces).
+fn overrideLigatureDifferences(allocator: Allocator, ctx: *PdfContext, font_dict: []const pdf_objects.DictEntry, cmap: *CMap) void {
+	// Pass 1: /Differences glyph names (authoritative for any code).
+	pass1: {
+		var owned: ?pdf_objects.PdfValue = null;
+		defer if (owned) |o| pdf_objects.freePdfValue(allocator, o);
+		const enc_dict: []const pdf_objects.DictEntry = b: {
+			if (pdf_objects.getDictDict(font_dict, "Encoding")) |d| break :b d;
+			const ref = pdf_objects.getDictRef(font_dict, "Encoding") orelse break :pass1;
+			const val = (ctx.getObject(ref.obj) catch break :pass1) orelse break :pass1;
+			if (val != .dict) {
+				pdf_objects.freePdfValue(allocator, val);
+				break :pass1;
+			}
+			owned = val;
+			break :b val.dict;
+		};
+		const diffs = pdf_objects.getDictArray(enc_dict, "Differences") orelse break :pass1;
+		var code: u16 = 0;
+		for (diffs) |elem| {
+			switch (elem) {
+				.integer => |n| {
+					if (n >= 0 and n <= 0xFFFF) code = @intCast(n);
+				},
+				.name => |nm| {
+					if (ligatureExpansion(nm)) |exp| setCMapEntry(allocator, cmap, code, exp);
+					code +%= 1;
+				},
+				else => {},
+			}
+		}
+	}
+
+	// Pass 2: StandardEncoding ligature positions still holding a broken "f"/"ff"
+	// stub (Builtin/Standard fonts: no /Differences + broken ToUnicode).
+	for (0..256) |i| {
+		const exp: []const u8 = switch (encoding.standard_encoding_to_unicode[i]) {
+			0xFB01 => "fi",
+			0xFB02 => "fl",
+			0xFB03 => "ffi",
+			0xFB04 => "ffl",
+			0xFB05, 0xFB06 => "st",
+			else => continue,
+		};
+		const cur = cmap.char_map.get(@intCast(i)) orelse continue;
+		if (std.mem.eql(u8, cur, "f") or std.mem.eql(u8, cur, "ff")) {
+			setCMapEntry(allocator, cmap, @intCast(i), exp);
 		}
 	}
 }
@@ -3495,7 +3516,7 @@ test "pdf: multi-column reading order is preserved (no cross-column interleave)"
 fn buildPdfBrokenLigatureToUnicode(allocator: Allocator) ![]const u8 {
 	var buf = std.ArrayList(u8).empty;
 	errdefer buf.deinit(allocator);
-	var offs: [7]usize = undefined;
+	var offs: [8]usize = undefined;
 	try buf.appendSlice(allocator, "%PDF-1.4\n");
 	offs[1] = buf.items.len;
 	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
@@ -3511,7 +3532,71 @@ fn buildPdfBrokenLigatureToUnicode(allocator: Allocator) ![]const u8 {
 	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
 	// Font: Differences names 174=/fi 175=/fl, but ToUnicode (obj 6) is broken.
 	offs[5] = buf.items.len;
-	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /CenturyExpanded /Encoding << /Type /Encoding /Differences [174 /fi 175 /fl] >> /ToUnicode 6 0 R >>\nendobj\n");
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /CenturyExpanded /Encoding 7 0 R /ToUnicode 6 0 R >>\nendobj\n");
+	// Broken ToUnicode: both ligature codes map to plain "f" (U+0066).
+	const cmap =
+		"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n" ++
+		"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n" ++
+		"2 beginbfchar\n<AE> <0066>\n<AF> <0066>\nendbfchar\nendcmap\nend\nend\n";
+	offs[6] = buf.items.len;
+	try buf.print(allocator, "6 0 obj\n<< /Length {d} >>\nstream\n", .{cmap.len});
+	try buf.appendSlice(allocator, cmap);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	// /Encoding as an INDIRECT object (like real SCOTUS fonts: /Encoding 1656 0 R).
+	offs[7] = buf.items.len;
+	try buf.appendSlice(allocator, "7 0 obj\n<< /Type /Encoding /Differences [174 /fi 175 /fl] >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 8\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 7) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 8 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: ligature glyphs recovered from /Differences when ToUnicode is broken" {
+	// incitez_web 2026-06-15: SCOTUS Century fonts map the fi/fl ligature glyphs to
+	// just "f" in ToUnicode ("defines"→"defnes"). The /Differences glyph name is the
+	// reliable source; it must override the broken ToUnicode → component letters.
+	const pdf = try buildPdfBrokenLigatureToUnicode(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/ligature.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "defines") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "flag") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "defnes") == null);
+}
+
+/// Build a 1-page PDF with a BUILTIN Type1 font (NO /Encoding, hence no
+/// /Differences) whose ToUnicode CMap is BROKEN — codes 174/175 (the Adobe
+/// StandardEncoding fi/fl ligature POSITIONS) both map to "f". This is the
+/// SCOTUS small-caps Century case where pass-1 (glyph-name recovery) cannot
+/// fire — only pass-2 (StandardEncoding position recovery) can. "de<AE>nes
+/// <AF>ag" must still extract as "defines flag", not "defnes fag".
+fn buildPdfBuiltinLigatureToUnicode(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [7]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	// Content stream: "de" + 0xAE(fi) + "nes " + 0xAF(fl) + "ag"  → "defines flag".
+	const stream = "BT\n/F1 12 Tf\n100 700 Td\n(de\xAEnes \xAFag) Tj\nET\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	// Builtin font: NO /Encoding at all (relies on the font's builtin StandardEncoding).
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /CenturyExpanded /ToUnicode 6 0 R >>\nendobj\n");
 	// Broken ToUnicode: both ligature codes map to plain "f" (U+0066).
 	const cmap =
 		"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n" ++
@@ -3530,13 +3615,16 @@ fn buildPdfBrokenLigatureToUnicode(allocator: Allocator) ![]const u8 {
 	return try buf.toOwnedSlice(allocator);
 }
 
-test "pdf: ligature glyphs recovered from /Differences when ToUnicode is broken" {
-	// incitez_web 2026-06-15: SCOTUS Century fonts map the fi/fl ligature glyphs to
-	// just "f" in ToUnicode ("defines"→"defnes"). The /Differences glyph name is the
-	// reliable source; it must override the broken ToUnicode → component letters.
-	const pdf = try buildPdfBrokenLigatureToUnicode(testing.allocator);
+test "pdf: ligature glyphs recovered from StandardEncoding positions (Builtin font, no /Differences)" {
+	// incitez_web 2026-06-15: real SCOTUS body fonts are BUILTIN (no /Differences),
+	// so pass-1 glyph-name recovery cannot fire. Codes 174/175 are the Adobe
+	// StandardEncoding fi/fl positions and the broken ToUnicode leaves a lone "f"
+	// there — pass-2 (position recovery) must restore the components. Without
+	// /Differences only pass-2 can change cmap[174] "f"→"fi", so "defines"
+	// appearing proves pass-2 fired. Validated on legal-scotus-303-creative-2023.pdf.
+	const pdf = try buildPdfBuiltinLigatureToUnicode(testing.allocator);
 	defer testing.allocator.free(pdf);
-	const doc = try parse(testing.allocator, pdf, "/test/ligature.pdf");
+	const doc = try parse(testing.allocator, pdf, "/test/ligature-builtin.pdf");
 	defer freeDocument(testing.allocator, doc);
 	var all = std.ArrayList(u8).empty;
 	defer all.deinit(testing.allocator);
