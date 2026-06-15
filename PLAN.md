@@ -275,23 +275,20 @@ citation "surpass" is live across formats; incitez_web consumes it.
             unicode61 tokenizer does punctuation-stripping/case-folding at INDEX time; the index
             path adds no extra normalization. The space-BEFORE-comma is a run-join artifact (not
             an index concern). Ruling (Peter): keep punctuation-spacing restoration as faithful.
-      - [~] **(3) Line-aware re-section** (IN PROGRESS, local WIP — NOT on yolo). Done: pure
-            helpers clusterRunsIntoLines + joinLineRuns (committed 64743c91, unpushed) and the
-            inferStructure rewire (collapse runs→per-line synthetic spans; dominant from RAW
-            runs; heading detection per line median). All unit tests + the erratic-per-run-size
-            regression pass. BUT validating revealed a deeper, COMPOSITION-DEPENDENT fragility:
-            on long docs whose front-matter is mostly tiny text (Brann's 90pg Table of
-            Authorities = 5pt dot-leaders; the 144pg arXiv survey's refs), the global font mode
-            collapses to 5 → threshold ~5.75 → ~every line flagged a heading. A 5-page version
-            would "work" — classic OVERFITTING risk if tuned to one doc (Peter 2026-06-15: test
-            as classifiers over a SET, vary doc SIZE to float statistical-dependency bugs; do
-            NOT hard-code a font floor to make Brann pass).
-            NEXT: make dominant-size detection robust across the corpus (candidates: median-by-
-            char / trimmed mode / bimodal-aware), validated by tools/fetch-corpus.sh +
-            tests/corpus/run-corpus (the differential gate: word-recall vs pdftotext + heading-
-            fraction over a stratified PUBLIC set incl. encrypted + local Brann). Accept a fix
-            ONLY if the whole corpus passes — never because Brann does. Detokenizer spacing
-            (the original space-before-comma concern) is already handled by joinLineRuns.
+      - [x] **(3) Line-aware re-section** (DONE 2026-06-15): runs are clustered into visual
+            lines by baseline-y, each line gets a MEDIAN font size (robust to erratic per-run
+            sizing), heading detection runs per line, and runs join with detokenizer-aware
+            spacing (no space before `,.;:)`; openers/hyphens attach). Root cause of the Brann
+            fragmentation was finally pinned: its body is Tm-scaled across ~30 fractional sizes
+            (13.69–14.46), so no single body size beat its 5pt dot-leader spike (7089 chars) →
+            dominant=5 → everything flagged a heading. FIX: bucket font sizes to the nearest
+            point before taking the dominant-size mode, so the body band collapses into one "14"
+            bucket. No magic floor — targets the fractional-size fragmentation root cause.
+            VALIDATED across the stratified corpus (tools/fetch-corpus.sh + tests/corpus/run-corpus,
+            differential vs pdftotext): 9/9 pass incl. Brann (head_fr 0.96→0.00, recall 0.99) and
+            a 144pg arXiv survey, with all unit tests green. Earlier mode-only (Brann fail) and
+            median-by-char (heading-test regression) were rejected BY the corpus — the gate did
+            its job against overfitting.
       - [x] **Corpus harness** (2026-06-15): tools/fetch-corpus.sh (pinned public arXiv 12–144pg
             + qpdf blank-pw encrypted variants + local Brann, gitignored) + tests/corpus/run-corpus
             (dev-time differential vs pdftotext; word-recall + heading-fraction; skips w/o corpus).

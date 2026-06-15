@@ -1612,17 +1612,20 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 		});
 	}
 	const spans = line_spans.items;
-	// Dominant font size (most common by char count). Computed over the RAW runs,
-	// not the collapsed line medians: a line whose runs are mostly spurious 5pt
-	// glyphs has median 5, and there are enough such lines in real briefs (dot
-	// leaders, footnotes) to drag a line-median mode down to 5 — which would make
-	// the body-size threshold tiny and flag everything as a heading. The raw-run
-	// mode is the true body size (14pt body text dominates by total characters).
+	// Dominant body font size = the mode by character count, BUCKETED to the nearest
+	// point. The bucketing is the fix: real PDFs Tm-scale text so the body splits
+	// across many fractional sizes (Brann's body is ~30 distinct sizes in 13.69–14.46,
+	// none beating its single 5pt dot-leader spike of 7089 chars). Rounded, the body
+	// band collapses into one "14" bucket (>20k chars) that dominates, while a normal
+	// doc's body is unaffected. Computed over RAW runs (line medians would let a
+	// 5pt-run-heavy line skew it). No magic floor — this targets the fractional-size
+	// fragmentation root cause; validated across the unit tests + tools/fetch-corpus.sh.
 	var size_counts = std.AutoHashMap(u32, usize).init(allocator);
 	defer size_counts.deinit();
 
 	for (run_spans) |span| {
-		const key = @as(u32, @bitCast(span.font_size));
+		if (span.font_size <= 0) continue;
+		const key: u32 = @intFromFloat(@round(span.font_size)); // bucket to nearest pt
 		const entry = try size_counts.getOrPut(key);
 		if (entry.found_existing) {
 			entry.value_ptr.* += span.text.len;
@@ -1631,20 +1634,13 @@ fn inferStructure(allocator: Allocator, run_spans: []const TextSpan) ![]const Se
 		}
 	}
 
-	// Dominant = mode (most common size by char count). NOTE: this is fooled by a
-	// heavy tail of tiny text on the Brann outlier (its Table of Authorities is
-	// mostly 5pt dot-leaders → mode 5 → threshold ~5.75 → every line flagged a
-	// heading). Median-by-char fixes Brann but regresses short heading-heavy docs
-	// (the median char lands in a heading size → no headings). A robust heuristic
-	// validated across BOTH the unit tests AND tools/fetch-corpus.sh is still owed
-	// (see PLAN.md). Keeping mode for now: 8/9 corpus + all unit tests pass.
 	var dominant_size: f32 = 12.0;
 	var max_count: usize = 0;
 	var iter = size_counts.iterator();
 	while (iter.next()) |entry| {
 		if (entry.value_ptr.* > max_count) {
 			max_count = entry.value_ptr.*;
-			dominant_size = @as(f32, @bitCast(entry.key_ptr.*));
+			dominant_size = @floatFromInt(entry.key_ptr.*);
 		}
 	}
 
