@@ -1438,11 +1438,6 @@ fn freeLines(allocator: Allocator, cl: ClusteredLines) void {
 	allocator.free(cl.backing);
 }
 
-fn lineReadingOrderLessThan(_: void, a: TextSpan, b: TextSpan) bool {
-	if (a.page != b.page) return a.page < b.page;
-	return a.y_position > b.y_position; // PDF y grows upward → top-to-bottom is y desc
-}
-
 fn lineXLessThan(_: void, a: TextSpan, b: TextSpan) bool {
 	return a.x_position < b.x_position;
 }
@@ -1460,15 +1455,17 @@ fn medianRunSize(runs: []const TextSpan) f32 {
 	return (buf[n / 2 - 1] + buf[n / 2]) / 2.0;
 }
 
-/// Group spans into visual lines by baseline-y proximity (pdfminer's line-overlap
-/// idea: same line when baselines are within ~half the larger run's height — well
-/// below normal line spacing). Spans are sorted into reading order first (page
-/// asc, y desc), grouped, then each line's runs are x-sorted. Pure; the document
-/// is untouched. Caller frees the result with `freeLines`.
+/// Group spans into visual lines, PRESERVING content-stream order. The stream
+/// already emits text in reading order — including column-major multi-column
+/// layouts — so we must NOT globally re-sort by y: doing so interleaves columns
+/// that share a y-band (the f4c2eb0a multi-column regression that scrambled SCOTUS
+/// citations). Instead we cluster CONSECUTIVE runs whose baselines are within
+/// ~half the larger run's height; a new line starts on any larger y jump (the next
+/// line, or the top of the next column). Each line's runs are then x-sorted. Pure;
+/// caller frees with `freeLines`.
 fn clusterRunsIntoLines(allocator: Allocator, spans: []const TextSpan) !ClusteredLines {
 	const backing = try allocator.dupe(TextSpan, spans);
 	errdefer allocator.free(backing);
-	std.mem.sort(TextSpan, backing, {}, lineReadingOrderLessThan);
 
 	var lines = std.ArrayList(PdfLine).empty;
 	errdefer lines.deinit(allocator);
@@ -3392,4 +3389,33 @@ test "pdf: erratic per-run font sizes on one line stay one body section (line-aw
 	for (doc.sections) |s| {
 		if (s.heading) |h| try testing.expect(std.mem.indexOf(u8, h, "obtained") == null);
 	}
+}
+
+test "pdf: multi-column reading order is preserved (no cross-column interleave)" {
+	// Regression (incitez_web 2026-06-15): the line-aware re-section globally sorted
+	// spans by (page, y desc), so two columns sharing a y-band were merged into one
+	// "line" and interleaved — scrambling reading order and gluing citations across
+	// the column gap. The content stream already emits columns in reading order
+	// (column-major here), so clustering must PRESERVE stream order, not re-sort by y.
+	// Two columns, emitted column-major, at overlapping y-bands:
+	const pdf = try buildTestPdf(testing.allocator, &.{.{ .text_items = &.{
+		.{ .text = "The plaintiff timely filed", .font_size = 12, .y_pos = 700, .x_pos = 60 },
+		.{ .text = "its opening brief today.", .font_size = 12, .y_pos = 684, .x_pos = 60 },
+		.{ .text = "The respondent then", .font_size = 12, .y_pos = 700, .x_pos = 330 },
+		.{ .text = "moved for a dismissal.", .font_size = 12, .y_pos = 684, .x_pos = 330 },
+	} }});
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/twocol.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	// Column 1 must come entirely before column 2 (reading order), not interleaved.
+	const c1 = std.mem.indexOf(u8, c, "opening brief today.") orelse 0;
+	const c2 = std.mem.indexOf(u8, c, "The respondent then") orelse c.len;
+	try testing.expect(c1 < c2);
+	// The tell-tale cross-column splice must NOT appear.
+	try testing.expect(std.mem.indexOf(u8, c, "filed The respondent") == null);
+	try testing.expect(std.mem.indexOf(u8, c, "filed its") != null or std.mem.indexOf(u8, c, "filed\nits") != null);
 }
