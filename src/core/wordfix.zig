@@ -95,6 +95,16 @@ pub fn isWord(word: []const u8) bool {
 	const d = dict orelse return false;
 	var lower_buf: [128]u8 = undefined;
 	if (word.len == 0 or word.len > lower_buf.len) return false;
+	// Reject camelCase concatenations: no single real word has an internal
+	// lowercase→uppercase transition, so "SmithJones"/"BethEnergy"/"GasCo" are two
+	// tokens jammed together, not a word (Peter 2026-06-15). Lowercasing below would
+	// otherwise hide this and let a name-list entry match.
+	{
+		var k: usize = 1;
+		while (k < word.len) : (k += 1) {
+			if (std.ascii.isUpper(word[k]) and std.ascii.isLower(word[k - 1])) return false;
+		}
+	}
 	for (word, 0..) |c, idx| {
 		lower_buf[idx] = std.ascii.toLower(c);
 	}
@@ -935,6 +945,21 @@ test "isWord finds common words" {	try testing.expect(isWord("hello"));
 	try testing.expect(isWord("obviously"));
 	try testing.expect(!isWord("xyzzy123"));
 	try testing.expect(!isWord("qzxjk"));
+}
+
+test "isWord rejects mid-word capitalization (camelCase concatenations)" {
+	// No single real word has an internal lowercase→uppercase transition; these are
+	// two tokens jammed together (Peter 2026-06-15). Rejecting them stops the
+	// de-hyphenation dictionary check from treating "Smith"+"Jones" → "SmithJones" as
+	// a real word and wrongly dropping the hyphen.
+	try testing.expect(!isWord("SmithJones"));
+	try testing.expect(!isWord("BethEnergy"));
+	try testing.expect(!isWord("GasCo"));
+	try testing.expect(!isWord("iPhone"));
+	// Single capitalized words / acronyms must still resolve normally.
+	try testing.expect(isWord("Hello"));
+	try testing.expect(isWord("HELLO"));
+	try testing.expect(isWord("known"));
 }
 
 test "rejoin fixes split words" {
