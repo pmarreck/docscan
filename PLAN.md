@@ -246,8 +246,11 @@ citation "surpass" is live across formats; incitez_web consumes it.
       Fixes the classic UTF-8-as-CP1252 mojibake ("café"→"cafÃ©") while preserving genuine
       CP1252 docs (the WinAnsi default still wins when nothing beats it). chardetz detection
       now actually runs in the wasm slice too (+148KB → ~1.17MB). Test: parser_pdf.zig
-      "stopgap font whose bytes are UTF-8…". TODO: extend deferral to TJ-array and hex
-      string operators (currently Tj/' only; TJ/hex still use the WinAnsi CMap directly).
+      "stopgap font whose bytes are UTF-8…" (Tj) and "…in a TJ array…" (TJ). Covers the
+      Tj/' and TJ-array operators (the common simple-font text paths). Remaining gap: hex
+      `<...>` strings inside a stopgap font are still WinAnsi-CMap-decoded (rare — hex is a
+      CID/composite-font form, which carries ToUnicode; would need a raw-bytes mode in
+      extractHexStringText that keeps high bytes).
 - [ ] **Brann real-brief pdf split** (~19 chars/line, citations split mid-token): adaptive-gap
       did NOT fix it. Its content stream is pathological (cumulative TD, spurious `5.00 Tf`
       between body spans, erratic positioning). Needs instrumented diagnosis of the actual

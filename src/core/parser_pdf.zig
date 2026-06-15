@@ -933,7 +933,9 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 
 		// PDF array: [...] — could be TJ operand
 		if (ch == '[') {
-			const arr_text = extractTJArray(allocator, stream, &pos, getCurrentCMap(font_maps, current_font_name)) catch continue;
+			const tj_cmap = getCurrentCMap(font_maps, current_font_name);
+			const tj_is_stopgap = if (tj_cmap) |cm| cm.stopgap else false;
+			const arr_text = extractTJArray(allocator, stream, &pos, tj_cmap) catch continue;
 			const next_pos = skipStreamWhitespace(stream, pos);
 			if (next_pos + 1 < stream.len and stream[next_pos] == 'T' and stream[next_pos + 1] == 'J') {
 				pos = next_pos + 2;
@@ -944,6 +946,7 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 						.page = page_num,
 						.y_position = y_pos,
 						.x_position = x_pos,
+						.raw = tj_is_stopgap,
 					}) catch return PdfError.OutOfMemory;
 						continue;
 				}
@@ -1314,7 +1317,12 @@ fn extractTJArray(allocator: Allocator, data: []const u8, pos: *usize, cmap: ?*c
 		if (c == '(') {
 			const raw_str = try extractStreamString(allocator, data, &p);
 			// Decode through CMap for CID/encoded fonts (same as Tj handler)
-			const str = if (cmap) |cm| (decodeThroughCMap(allocator, raw_str, cm) orelse raw_str) else raw_str;
+			// Stopgap fonts defer decoding (keep raw bytes for resolveStopgapEncoding);
+			// kerning spaces below are ASCII (0x20), charset-agnostic, so they survive.
+			const str = if (cmap) |cm|
+				(if (cm.stopgap) raw_str else (decodeThroughCMap(allocator, raw_str, cm) orelse raw_str))
+			else
+				raw_str;
 			const str_is_decoded = (str.ptr != raw_str.ptr);
 			if (str_is_decoded) allocator.free(raw_str);
 			defer allocator.free(str);
@@ -1790,9 +1798,17 @@ fn buildTestPdf(allocator: Allocator, pages: []const TestPage) ![]const u8 {
 		for (page.text_items) |item| {
 			try stream_buf.appendSlice(allocator, "BT\n");
 			try stream_buf.print(allocator, "/F1 {d} Tf\n", .{@as(u32, @intFromFloat(item.font_size))});
-			try stream_buf.print(allocator, "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });			try stream_buf.appendSlice(allocator, "(");
-			try stream_buf.appendSlice(allocator, item.text);
-			try stream_buf.appendSlice(allocator, ") Tj\n");
+			try stream_buf.print(allocator, "{d} {d} Td\n", .{ @as(i32, @intFromFloat(item.x_pos)), @as(i32, @intFromFloat(item.y_pos)) });
+			if (item.tj) {
+				// Emit as a TJ array (kerning form): [(text)] TJ
+				try stream_buf.appendSlice(allocator, "[(");
+				try stream_buf.appendSlice(allocator, item.text);
+				try stream_buf.appendSlice(allocator, ")] TJ\n");
+			} else {
+				try stream_buf.appendSlice(allocator, "(");
+				try stream_buf.appendSlice(allocator, item.text);
+				try stream_buf.appendSlice(allocator, ") Tj\n");
+			}
 			try stream_buf.appendSlice(allocator, "ET\n");
 		}
 
@@ -1849,6 +1865,8 @@ const TestTextItem = struct {
 	font_size: f32,
 	y_pos: f32,
 	x_pos: f32 = 0,
+	/// Emit this item as a TJ array `[(text)] TJ` instead of `(text) Tj`.
+	tj: bool = false,
 };
 // ── Tests ──────────────────────────────────────────────────────────
 
@@ -2920,5 +2938,28 @@ test "pdf: stopgap font whose bytes are UTF-8 is decoded as UTF-8, not CP1252 mo
 	try testing.expect(std.mem.indexOf(u8, c, "café") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "résumé") != null);
 	// No CP1252 mojibake: "Ã©" (0xC3 0x83 0xC2 0xA9) is the tell-tale of é misread as CP1252.
+	try testing.expect(std.mem.indexOf(u8, c, "Ã©") == null);
+}
+
+test "pdf: stopgap font UTF-8 bytes in a TJ array are decoded as UTF-8, not mojibake" {
+	// Real PDFs (legal briefs especially) emit body text via TJ arrays for kerning,
+	// not bare Tj. The decode-both heuristic must defer TJ text from stopgap fonts too,
+	// else the common case stays garbled. Same UTF-8-as-CP1252 mojibake check, via TJ.
+	const utf8_text = "Café société résumé naïve façade — the Zürich café served " ++
+		"crème brûlée and piña colada to every señor and señora at the soirée.";
+	const pdf = try buildTestPdf(testing.allocator, &.{
+		.{ .text_items = &.{
+			.{ .text = utf8_text, .font_size = 12, .y_pos = 700, .tj = true },
+		} },
+	});
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/utf8-stopgap-tj.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	try testing.expect(std.mem.indexOf(u8, c, "café") != null);
+	try testing.expect(std.mem.indexOf(u8, c, "résumé") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "Ã©") == null);
 }
