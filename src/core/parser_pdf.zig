@@ -1910,6 +1910,11 @@ fn runSeparator(prev: TextSpan, next: TextSpan) RunSep {
 		'(', '[', '{', '-' => return .none,
 		else => {},
 	}
+	// Sentence punctuation is always followed by a space before a word — never
+	// "word,word" (Peter 2026-06-15). This overrides the x-gap, so a dropped-space tight
+	// boundary ("Co.,Adam") is still separated. Only fires before a LETTER, so numbers
+	// keep their punctuation tight ("1,000", "3.14", a decimal/thousands separator).
+	if ((pl == ',' or pl == ';') and isAlphaByte(nf)) return .space;
 	// x-gap: if next starts at/inside prev's estimated extent, they butt together.
 	const prev_right = prev.x_position + @as(f32, @floatFromInt(prev.text.len)) * prev.font_size * 0.4;
 	if (next.x_position - prev_right < next.font_size * 0.15) {
@@ -3767,6 +3772,20 @@ test "joinLineRuns: distinct words with an x-gap get a single space" {
 	const out = try joinLineRuns(testing.allocator, line);
 	defer testing.allocator.free(out);
 	try testing.expectEqualStrings("Rawlings Sporting Goods Company, Inc.", out);
+}
+
+test "joinLineRuns: a comma is always followed by a space before a word (no word,word)" {
+	// Peter 2026-06-15: a comma never abuts the next word ("Co.,Adam" is wrong) — even
+	// when the runs butt with a tight x-gap (the dropped-space case). Numbers (1,000)
+	// keep no space because the rule only fires before a letter.
+	var runs = [_]TextSpan{
+		.{ .text = "Gas Co.,", .font_size = 12, .page = 1, .y_position = 700, .x_position = 100 },
+		.{ .text = "Adam", .font_size = 12, .page = 1, .y_position = 700, .x_position = 104 }, // butting
+	};
+	const line = PdfLine{ .runs = &runs, .page = 1, .y = 700, .size = 12 };
+	const out = try joinLineRuns(testing.allocator, line);
+	defer testing.allocator.free(out);
+	try testing.expectEqualStrings("Gas Co., Adam", out);
 }
 
 test "pdf: erratic per-run font sizes on one line stay one body section (line-aware)" {
