@@ -358,6 +358,26 @@ citation "surpass" is live across formats; incitez_web consumes it.
             incitez's cosmetic ask (B — page-refs stranded at line starts by the mid-entry leader→\n)
             is explicitly DEFERRED (incitez's walk-back already ignores leading digits; lowercase-v
             entries parse correctly). The all-caps "V." OCR line is incitez's own antecedent fix, not docscan's.
+      - [x] **(5e) Borderline line-break hyphen + LuraDocument empty-extract** (2026-06-16 EST):
+            (i) one stray "Bos-ton" in 303 — a wrap whose y-gap fell just under the same-line
+            threshold bypassed the wrap-only de-hyphenation. Since clustering already yields one span
+            per visual line, hyphen handling is now hoisted ABOVE the same-line/wrap split → fires at
+            every line boundary (all 7 "Boston" join, "Irish-American" compound kept).
+            (ii) LuraDocument-recoded scanned PDFs (LOC/older US Reports: Gideon/Brown/Mapp/Miranda/…)
+            extracted 0 chars while poppler read them. Root cause: page /Contents is an INDIRECT REF
+            to an ARRAY of stream refs (/Contents 5 0 R → [6 0 R] → stream); extractPageText handled a
+            direct stream ref + inline array but not ref→array → getStream→null→0 content. Now resolves
+            the ref and parses each stream in the array. Text layer was present (invisible 3 Tr OCR
+            layer, Type1/WinAnsi) — no JBIG2/OCR needed. Gideon 0→34,699 chars; corpus 28/28.
+            Both have synthetic-PDF regression tests.
+      - [ ] **(5f) OCR for image-only scans (no text layer) — researched, not started** (Peter 2026-06-16):
+            high-quality OCR is ML-based → clashes with the wasm32-freestanding zero-import slice, so OCR
+            must be a SEPARATE heavy capability, not in the parse-to-text slice. Options: Tesseract (C++/C-API,
+            Apache-2.0, best maturity, native via FFI + @embedFile traineddata) for the CLI; ocrs (Rust, MIT,
+            compact, WASM-clean) or lazy-loaded tesseract.js for the browser. preprocess.zig (rasterize +
+            text-region isolate) + docs/superpowers/plans/2026-04-15-libvips-ocr-preprocessing.md are the
+            scaffolding; validate's JBIG2 decoder = image front-end. extract tries the text layer first;
+            OCR only when absent. Awaiting Peter's direction (spike Tesseract-FFI native fallback vs ocrs-WASM eval).
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
             fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
             Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
