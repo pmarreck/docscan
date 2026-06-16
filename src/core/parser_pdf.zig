@@ -595,9 +595,25 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 		if (!std.mem.eql(u8, entry.key, "Contents")) continue;
 
 		if (entry.value == .reference) {
-			const stream_data = (ctx.getStream(entry.value.reference.obj) catch return) orelse return;
-			defer allocator.free(stream_data);
-			try parseContentStream(allocator, stream_data, spans, page_num, &font_maps);
+			if (ctx.getStream(entry.value.reference.obj) catch null) |stream_data| {
+				defer allocator.free(stream_data);
+				try parseContentStream(allocator, stream_data, spans, page_num, &font_maps);
+			} else if (ctx.getObject(entry.value.reference.obj) catch null) |resolved| {
+				// /Contents may indirectly reference an ARRAY of stream refs, not a stream
+				// directly: /Contents 5 0 R → [6 0 R] → stream. LuraDocument-recoded scanned
+				// PDFs (LOC/older US Reports) do this; without it the page extracts 0 chars
+				// (incitez_web 2026-06-16). Parse each referenced stream in order.
+				defer pdf_objects.freePdfValue(allocator, resolved);
+				if (resolved == .array) {
+					for (resolved.array) |item| {
+						if (item == .reference) {
+							const sd = (ctx.getStream(item.reference.obj) catch continue) orelse continue;
+							defer allocator.free(sd);
+							try parseContentStream(allocator, sd, spans, page_num, &font_maps);
+						}
+					}
+				}
+			}
 		} else if (entry.value == .array) {
 			for (entry.value.array) |item| {
 				if (item == .reference) {
@@ -4400,4 +4416,49 @@ test "pdf: line-break hyphen de-hyphenates even when the gap is misclassified as
 	const c = all.items;
 	try testing.expect(std.mem.indexOf(u8, c, "Boston") != null);
 	try testing.expect(std.mem.indexOf(u8, c, "Bos-ton") == null);
+}
+
+/// Build a PDF whose page /Contents is an INDIRECT REFERENCE to an ARRAY of stream refs
+/// (`/Contents 5 0 R`, `5 0 obj [ 6 0 R ]`, `6 0 obj <stream>`) — the LuraDocument /
+/// scanned-MRC structure that returned 0 chars (incitez_web 2026-06-16). The text must
+/// still extract.
+fn buildPdfIndirectContentsArray(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [7]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> >> >>\nendobj\n");
+	offs[4] = buf.items.len;
+	try buf.appendSlice(allocator, "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
+	// /Contents 5 0 R → an indirect ARRAY → 6 0 R is the actual content stream.
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n[ 6 0 R ]\nendobj\n");
+	const stream = "BT\n/F1 12 Tf\n3 Tr\n100 700 Td\n(Hello LuraDoc) Tj\nET\n"; // 3 Tr = invisible OCR layer
+	offs[6] = buf.items.len;
+	try buf.print(allocator, "6 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 7\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 6) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: /Contents as an indirect reference to an array of streams extracts text (LuraDocument)" {
+	const pdf = try buildPdfIndirectContentsArray(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/lura.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	try testing.expect(std.mem.indexOf(u8, all.items, "Hello LuraDoc") != null);
 }
