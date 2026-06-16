@@ -378,6 +378,25 @@ citation "surpass" is live across formats; incitez_web consumes it.
             text-region isolate) + docs/superpowers/plans/2026-04-15-libvips-ocr-preprocessing.md are the
             scaffolding; validate's JBIG2 decoder = image front-end. extract tries the text layer first;
             OCR only when absent. Awaiting Peter's direction (spike Tesseract-FFI native fallback vs ocrs-WASM eval).
+      - [x] **(5g) CTM (q/Q/cm) applied to text positions** (2026-06-16 EST): docscan extracted
+            ocrmypdf / scanned-OCR text layers as word-salad (pdftotext read them fine). Root cause:
+            ocrmypdf positions each line via the `cm` (CTM) operator — a near-identity deskew matrix
+            whose translate IS the line's page position — not Tm/Td. docscan ignored the CTM, so
+            every line collapsed to y≈0 → one cluster → x-sorted salad. Fix: proper graphics-state
+            CTM (q/Q stack + cm concatenation) transforming every text position + font height
+            (applyCtm/ctmVScale/concatCtm); identity-at-start so no change for non-cm PDFs. Also
+            concatenate /Contents-array streams (PDF §7.8.2). Verified: re-OCR'd Miranda extracts
+            clean ("Escobedo v. Illinois, 378 U. S. 478 (1964)"); corpus 29/29; hermetic cm-ordering
+            regression test. Also unbreaks docscan's own native auto-OCR fallback.
+      - [ ] **(5h) OCR quality ideas (Peter 2026-06-16, future)**: (a) **consensus OCR** — when both
+            an embedded text layer AND a re-OCR exist, spatially align words by position (now correct
+            via 5g) and keep the dictionary-valid variant per word (wordfix.isWord); the common
+            garbles (E8cobedo/c6unsel/kn6wing) are non-words so the dict cleanly picks the good one.
+            Same MFIC "two independent sources, keep the externally-validated one" pattern. Caveats:
+            proper nouns (neither in dict → confidence tiebreak), both-valid-but-different. (b)
+            **whole-word / lexicon-constrained OCR** — recognize word-images → word-probability
+            distributions (TrOCR/ocrs lean this way; Tesseract LSTM already biases to dict). Pragmatic
+            path: lexicon-constrained OCR mode + (a) gives most of the benefit without training a model.
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century
             fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes").
             Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts
