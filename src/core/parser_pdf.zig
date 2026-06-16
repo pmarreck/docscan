@@ -589,40 +589,47 @@ fn extractPageText(allocator: Allocator, ctx: *PdfContext, page_dict: []const pd
 	}
 	buildFontMaps(allocator, ctx, page_dict, &font_maps);
 
-	// Get the content stream reference
-	// /Contents can be a single reference or an array of references
+	// Get the page content stream(s). /Contents may be a single stream ref, an inline
+	// array of stream refs, or a ref that resolves to an array of stream refs (the
+	// LuraDocument scanned-PDF shape). Per PDF spec §7.8.2 an array of content streams is
+	// ONE logical stream: concatenate them (with a whitespace separator) and parse
+	// together. Parsing each separately resets the text state (position/font) at every
+	// boundary, which corrupts any PDF that splits an operator sequence across streams —
+	// e.g. ocrmypdf / scanned-OCR layers emit BT in one stream and the line's Td + Tj in
+	// the next, so per-stream parsing collapsed every line to y=0 → reading-order scramble
+	// (incitez_web 2026-06-16).
 	for (page_dict) |entry| {
 		if (!std.mem.eql(u8, entry.key, "Contents")) continue;
 
-		if (entry.value == .reference) {
-			if (ctx.getStream(entry.value.reference.obj) catch null) |stream_data| {
-				defer allocator.free(stream_data);
-				try parseContentStream(allocator, stream_data, spans, page_num, &font_maps);
-			} else if (ctx.getObject(entry.value.reference.obj) catch null) |resolved| {
-				// /Contents may indirectly reference an ARRAY of stream refs, not a stream
-				// directly: /Contents 5 0 R → [6 0 R] → stream. LuraDocument-recoded scanned
-				// PDFs (LOC/older US Reports) do this; without it the page extracts 0 chars
-				// (incitez_web 2026-06-16). Parse each referenced stream in order.
-				defer pdf_objects.freePdfValue(allocator, resolved);
-				if (resolved == .array) {
-					for (resolved.array) |item| {
-						if (item == .reference) {
-							const sd = (ctx.getStream(item.reference.obj) catch continue) orelse continue;
-							defer allocator.free(sd);
-							try parseContentStream(allocator, sd, spans, page_num, &font_maps);
-						}
-					}
+		var combined = std.ArrayList(u8).empty;
+		defer combined.deinit(allocator);
+		switch (entry.value) {
+			.reference => |ref| {
+				if (ctx.getStream(ref.obj) catch null) |sd| {
+					defer allocator.free(sd);
+					try combined.appendSlice(allocator, sd);
+				} else if (ctx.getObject(ref.obj) catch null) |resolved| {
+					defer pdf_objects.freePdfValue(allocator, resolved);
+					if (resolved == .array) for (resolved.array) |item| {
+						if (item != .reference) continue;
+						const sd = (ctx.getStream(item.reference.obj) catch continue) orelse continue;
+						defer allocator.free(sd);
+						if (combined.items.len > 0) try combined.append(allocator, '\n');
+						try combined.appendSlice(allocator, sd);
+					};
 				}
-			}
-		} else if (entry.value == .array) {
-			for (entry.value.array) |item| {
-				if (item == .reference) {
-					const stream_data = (ctx.getStream(item.reference.obj) catch continue) orelse continue;
-					defer allocator.free(stream_data);
-					try parseContentStream(allocator, stream_data, spans, page_num, &font_maps);
-				}
-			}
+			},
+			.array => |arr| for (arr) |item| {
+				if (item != .reference) continue;
+				const sd = (ctx.getStream(item.reference.obj) catch continue) orelse continue;
+				defer allocator.free(sd);
+				if (combined.items.len > 0) try combined.append(allocator, '\n');
+				try combined.appendSlice(allocator, sd);
+			},
+			else => {},
 		}
+		if (combined.items.len > 0)
+			try parseContentStream(allocator, combined.items, spans, page_num, &font_maps);
 		break;
 	}
 
@@ -935,6 +942,29 @@ fn buildFontMapsFromResources(allocator: Allocator, ctx: *PdfContext, resources:
 	}
 }
 
+
+/// Apply a row-vector affine CTM [a,b,c,d,e,f] to a point: [x y 1]·M.
+fn applyCtm(m: [6]f32, x: f32, y: f32) struct { x: f32, y: f32 } {
+	return .{ .x = m[0] * x + m[2] * y + m[4], .y = m[1] * x + m[3] * y + m[5] };
+}
+
+/// CTM vertical scale (glyph-height scaling) — used to keep font_size in device space.
+fn ctmVScale(m: [6]f32) f32 {
+	const s = @sqrt(m[2] * m[2] + m[3] * m[3]);
+	return if (s > 0.0001) s else 1.0;
+}
+
+/// Concatenate `cm` matrix onto the CTM (PDF prepends: CTM' = cm · CTM), row-vector form.
+fn concatCtm(old: [6]f32, cm: [6]f32) [6]f32 {
+	return .{
+		cm[0] * old[0] + cm[1] * old[2],
+		cm[0] * old[1] + cm[1] * old[3],
+		cm[2] * old[0] + cm[3] * old[2],
+		cm[2] * old[1] + cm[3] * old[3],
+		cm[4] * old[0] + cm[5] * old[2] + old[4],
+		cm[4] * old[1] + cm[5] * old[3] + old[5],
+	};
+}
 /// Parse a PDF content stream and extract text spans.
 /// Handles BT/ET blocks, Tf (font size), Tj/TJ (show text), Td/TD/Tm (positioning).
 /// font_maps provides ToUnicode CMap lookups for hex-encoded glyph IDs.
@@ -949,6 +979,13 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 	var y_pos: f32 = 0;
 	var x_pos: f32 = 0;
 	var in_text_block = false;
+	// Graphics-state CTM (q/Q stack + cm concatenation). Some PDFs — notably ocrmypdf /
+	// scanned-OCR text layers — position each text line via the CTM, not Tm/Td, so the
+	// device position is (text position) × CTM. Ignoring it collapsed every line to y≈0
+	// (incitez_web 2026-06-16). Row-vector affine [a,b,c,d,e,f]; identity at stream start.
+	var ctm = [6]f32{ 1, 0, 0, 1, 0, 0 };
+	var ctm_stack: [32][6]f32 = undefined;
+	var ctm_depth: usize = 0;
 	while (pos < stream.len) {
 		pos = skipStreamWhitespace(stream, pos);
 		if (pos >= stream.len) break;
@@ -979,10 +1016,10 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 					if (in_text_block and str.len > 0) {
 						spans.append(allocator, TextSpan{
 							.text = str,
-							.font_size = current_font_size,
+							.font_size = current_font_size * ctmVScale(ctm),
 							.page = page_num,
-							.y_position = y_pos,
-							.x_position = x_pos,
+							.y_position = applyCtm(ctm, x_pos, y_pos).y,
+							.x_position = applyCtm(ctm, x_pos, y_pos).x,
 							.raw = is_stopgap,
 						}) catch return PdfError.OutOfMemory;
 						continue;
@@ -992,10 +1029,10 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 					if (in_text_block and str.len > 0) {
 						spans.append(allocator, TextSpan{
 							.text = str,
-							.font_size = current_font_size,
+							.font_size = current_font_size * ctmVScale(ctm),
 							.page = page_num,
-							.y_position = y_pos,
-							.x_position = x_pos,
+							.y_position = applyCtm(ctm, x_pos, y_pos).y,
+							.x_position = applyCtm(ctm, x_pos, y_pos).x,
 							.raw = is_stopgap,
 						}) catch return PdfError.OutOfMemory;
 						continue;
@@ -1015,10 +1052,10 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 					if (in_text_block and hex_text.len > 0) {
 						spans.append(allocator, TextSpan{
 							.text = hex_text,
-							.font_size = current_font_size,
+							.font_size = current_font_size * ctmVScale(ctm),
 							.page = page_num,
-							.y_position = y_pos,
-							.x_position = x_pos,
+							.y_position = applyCtm(ctm, x_pos, y_pos).y,
+							.x_position = applyCtm(ctm, x_pos, y_pos).x,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -1027,10 +1064,10 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 					if (in_text_block and hex_text.len > 0) {
 						spans.append(allocator, TextSpan{
 							.text = hex_text,
-							.font_size = current_font_size,
+							.font_size = current_font_size * ctmVScale(ctm),
 							.page = page_num,
-							.y_position = y_pos,
-							.x_position = x_pos,
+							.y_position = applyCtm(ctm, x_pos, y_pos).y,
+							.x_position = applyCtm(ctm, x_pos, y_pos).x,
 						}) catch return PdfError.OutOfMemory;
 						continue;
 					}
@@ -1051,10 +1088,10 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 				if (in_text_block and arr_text.len > 0) {
 					spans.append(allocator, TextSpan{
 						.text = arr_text,
-						.font_size = current_font_size,
+						.font_size = current_font_size * ctmVScale(ctm),
 						.page = page_num,
-						.y_position = y_pos,
-						.x_position = x_pos,
+						.y_position = applyCtm(ctm, x_pos, y_pos).y,
+						.x_position = applyCtm(ctm, x_pos, y_pos).x,
 						.raw = tj_is_stopgap,
 					}) catch return PdfError.OutOfMemory;
 						continue;
@@ -1065,6 +1102,24 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 		}
 
 		// Check for operators/keywords
+		// q / Q — save / restore graphics state (CTM stack).
+		if (ch == 'q' and (pos + 1 >= stream.len or isDelimiter(stream[pos + 1]))) {
+			if (ctm_depth < ctm_stack.len) {
+				ctm_stack[ctm_depth] = ctm;
+				ctm_depth += 1;
+			}
+			pos += 1;
+			continue;
+		}
+		if (ch == 'Q' and (pos + 1 >= stream.len or isDelimiter(stream[pos + 1]))) {
+			if (ctm_depth > 0) {
+				ctm_depth -= 1;
+				ctm = ctm_stack[ctm_depth];
+			}
+			pos += 1;
+			continue;
+		}
+
 		if (ch == 'B' and pos + 1 < stream.len and stream[pos + 1] == 'T') {
 			if (pos + 2 >= stream.len or isDelimiter(stream[pos + 2])) {
 				in_text_block = true;
@@ -1182,6 +1237,15 @@ fn parseContentStream(allocator: Allocator, stream: []const u8, spans: *std.Arra
 							y_pos = f_val;
 							pos = ws3 + 2;
 							continue;						}
+					}
+					if (ws3 < stream.len and stream[ws3] == 'c' and ws3 + 1 < stream.len and stream[ws3 + 1] == 'm') {
+						if (ws3 + 2 >= stream.len or isDelimiter(stream[ws3 + 2])) {
+							// cm: concatenate [a b c d e f] onto the CTM. Some PDFs (ocrmypdf /
+							// scanned-OCR text layers) position each line via cm, not Tm/Td.
+							ctm = concatCtm(ctm, .{ num, num2, tm_nums[0], tm_nums[1], tm_nums[2], tm_nums[3] });
+							pos = ws3 + 2;
+							continue;
+						}
 					}
 				}
 			}
@@ -4461,4 +4525,58 @@ test "pdf: /Contents as an indirect reference to an array of streams extracts te
 	defer all.deinit(testing.allocator);
 	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
 	try testing.expect(std.mem.indexOf(u8, all.items, "Hello LuraDoc") != null);
+}
+
+/// Build a PDF whose lines are positioned ONLY via the CTM (`q … cm … BT Tj ET … Q`),
+/// not Tm/Td — the ocrmypdf / scanned-OCR text-layer shape. The three lines are emitted in
+/// SHUFFLED content order (Cherry, Apple, Banana) but at descending y (Apple=700,
+/// Banana=680, Cherry=660), so correct reading order requires honoring the cm translate.
+fn buildPdfCtmPositionedLines(allocator: Allocator) ![]const u8 {
+	var buf = std.ArrayList(u8).empty;
+	errdefer buf.deinit(allocator);
+	var offs: [6]usize = undefined;
+	try buf.appendSlice(allocator, "%PDF-1.4\n");
+	offs[1] = buf.items.len;
+	try buf.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+	offs[2] = buf.items.len;
+	try buf.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+	offs[3] = buf.items.len;
+	try buf.appendSlice(allocator, "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+	// Each line: q <translate cm> BT /F1 12 Tf (word) Tj ET Q. Shuffled content order; y via cm.
+	const stream =
+		"q\n1 0 0 1 100 660 cm\nBT\n/F1 12 Tf\n(Cherry) Tj\nET\nQ\n" ++
+		"q\n1 0 0 1 100 700 cm\nBT\n/F1 12 Tf\n(Apple) Tj\nET\nQ\n" ++
+		"q\n1 0 0 1 100 680 cm\nBT\n/F1 12 Tf\n(Banana) Tj\nET\nQ\n";
+	offs[4] = buf.items.len;
+	try buf.print(allocator, "4 0 obj\n<< /Length {d} >>\nstream\n", .{stream.len});
+	try buf.appendSlice(allocator, stream);
+	try buf.appendSlice(allocator, "\nendstream\nendobj\n");
+	offs[5] = buf.items.len;
+	try buf.appendSlice(allocator, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+	const xref_off = buf.items.len;
+	try buf.appendSlice(allocator, "xref\n0 6\n0000000000 65535 f\n");
+	var i: usize = 1;
+	while (i <= 5) : (i += 1) try buf.print(allocator, "{d:0>10} 00000 n\n", .{offs[i]});
+	try buf.appendSlice(allocator, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+	try buf.print(allocator, "startxref\n{d}\n%%EOF", .{xref_off});
+	return try buf.toOwnedSlice(allocator);
+}
+
+test "pdf: text positioned via CTM (cm) reads in geometric order (ocrmypdf layer)" {
+	// incitez_web 2026-06-16: ocrmypdf positions each line via a cm translate, not Tm/Td.
+	// Ignoring the CTM collapsed every line to y≈0 → one cluster → word-salad. With CTM,
+	// the lines sort by their cm-y. Content order is Cherry/Apple/Banana but y is
+	// Apple>Banana>Cherry, so a correct read yields Apple, then Banana, then Cherry.
+	const pdf = try buildPdfCtmPositionedLines(testing.allocator);
+	defer testing.allocator.free(pdf);
+	const doc = try parse(testing.allocator, pdf, "/test/ctm.pdf");
+	defer freeDocument(testing.allocator, doc);
+	var all = std.ArrayList(u8).empty;
+	defer all.deinit(testing.allocator);
+	for (doc.sections) |s| try all.appendSlice(testing.allocator, s.content);
+	const c = all.items;
+	const ia = std.mem.indexOf(u8, c, "Apple") orelse c.len;
+	const ib = std.mem.indexOf(u8, c, "Banana") orelse c.len;
+	const ic = std.mem.indexOf(u8, c, "Cherry") orelse c.len;
+	try testing.expect(ia < ib and ib < ic); // geometric reading order, not content order
 }
