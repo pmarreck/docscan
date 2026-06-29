@@ -1057,27 +1057,83 @@ fn parseNumberOrRef(allocator: Allocator, data: []const u8, pos: *usize) PdfErro
 
 // ── Stream Decompression ───────────────────────────────────────────
 
-/// Decompress stream data according to the stream dictionary's /Filter.
-/// Supports FlateDecode (zlib) with optional PNG Predictor (/DecodeParms).
-/// Unfiltered streams are returned as-is (duped).
-fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const DictEntry) PdfError![]const u8 {
-	const filter = getDictName(dict, "Filter");
-
-	if (filter == null) {
-		// No filter — return a copy of the raw data
-		return allocator.dupe(u8, stream_data) catch return PdfError.OutOfMemory;
+/// Decode Adobe ASCII85 (base-85) stream data. Tolerates leading "<~", whitespace,
+/// the "z" all-zero shorthand, and the "~>" EOD marker. Each group of 5 base-85 digits
+/// → 4 bytes; a final partial group of n digits → n-1 bytes (padded with 'u').
+fn decodeAscii85(allocator: Allocator, data: []const u8) PdfError![]const u8 {
+	var out = std.ArrayList(u8).empty;
+	errdefer out.deinit(allocator);
+	var i: usize = 0;
+	if (data.len >= 2 and data[0] == '<' and data[1] == '~') i = 2; // optional <~ prefix
+	var tuple: [5]u8 = undefined;
+	var count: usize = 0;
+	while (i < data.len) : (i += 1) {
+		const c = data[i];
+		if (c == '~') break; // EOD (~>)
+		if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c or c == 0) continue; // whitespace
+		if (c == 'z') {
+			if (count != 0) return PdfError.DecompressionFailed; // 'z' only at group boundary
+			try out.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0 });
+			continue;
+		}
+		if (c < '!' or c > 'u') return PdfError.DecompressionFailed; // outside base-85 range
+		tuple[count] = c - '!';
+		count += 1;
+		if (count == 5) {
+			var v: u32 = 0;
+			for (tuple) |d| v = v *% 85 +% d;
+			try out.appendSlice(allocator, &[_]u8{
+				@truncate(v >> 24), @truncate(v >> 16), @truncate(v >> 8), @truncate(v),
+			});
+			count = 0;
+		}
 	}
+	if (count > 0) {
+		if (count == 1) return PdfError.DecompressionFailed; // a single trailing digit is invalid
+		var j = count;
+		while (j < 5) : (j += 1) tuple[j] = 84; // pad with 'u'
+		var v: u32 = 0;
+		for (tuple) |d| v = v *% 85 +% d;
+		const bytes = [_]u8{ @truncate(v >> 24), @truncate(v >> 16), @truncate(v >> 8), @truncate(v) };
+		try out.appendSlice(allocator, bytes[0 .. count - 1]);
+	}
+	return out.toOwnedSlice(allocator) catch return PdfError.OutOfMemory;
+}
 
-	if (std.mem.eql(u8, filter.?, "FlateDecode")) {
-		const decompressed = try inflateZlib(allocator, stream_data);
+/// Decode ASCIIHexDecode stream data: hex digit pairs → bytes; whitespace ignored;
+/// ">" is EOD; an odd final digit is paired with an implicit '0'.
+fn decodeAsciiHex(allocator: Allocator, data: []const u8) PdfError![]const u8 {
+	var out = std.ArrayList(u8).empty;
+	errdefer out.deinit(allocator);
+	var hi: ?u8 = null;
+	for (data) |c| {
+		if (c == '>') break; // EOD
+		const nib: u8 = switch (c) {
+			'0'...'9' => c - '0',
+			'a'...'f' => c - 'a' + 10,
+			'A'...'F' => c - 'A' + 10,
+			' ', '\t', '\n', '\r', 0x0c, 0 => continue, // whitespace
+			else => return PdfError.DecompressionFailed,
+		};
+		if (hi) |h| {
+			try out.append(allocator, (h << 4) | nib);
+			hi = null;
+		} else hi = nib;
+	}
+	if (hi) |h| try out.append(allocator, h << 4); // odd trailing digit → low nibble 0
+	return out.toOwnedSlice(allocator) catch return PdfError.OutOfMemory;
+}
 
-		// Check for DecodeParms with Predictor (PNG prediction)
-		const decode_parms = getDictDict(dict, "DecodeParms");
-		if (decode_parms) |parms| {
-			const predictor = getDictInt(parms, "Predictor") orelse 1;
+/// Apply a single named PDF stream filter (with its optional DecodeParms). Returns a
+/// freshly-allocated buffer the caller owns. Accepts the PDF inline abbreviations
+/// (Fl/A85/AHx). LZW and image filters (DCT/CCITT/RunLength) are unsupported.
+fn applyOneFilter(allocator: Allocator, data: []const u8, name: []const u8, parms: ?[]const DictEntry) PdfError![]const u8 {
+	if (std.mem.eql(u8, name, "FlateDecode") or std.mem.eql(u8, name, "Fl")) {
+		const decompressed = try inflateZlib(allocator, data);
+		if (parms) |p| {
+			const predictor = getDictInt(p, "Predictor") orelse 1;
 			if (predictor >= 10) {
-				// PNG predictor (10-14): needs un-prediction
-				const columns_val = getDictInt(parms, "Columns") orelse 1;
+				const columns_val = getDictInt(p, "Columns") orelse 1;
 				const columns: usize = std.math.cast(usize, columns_val) orelse return PdfError.InvalidPdf;
 				const result = applyPngUnpredict(allocator, decompressed, columns) catch {
 					allocator.free(decompressed);
@@ -1087,12 +1143,59 @@ fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const
 				return result;
 			}
 		}
-
 		return decompressed;
 	}
-
-	// Unsupported filter
+	if (std.mem.eql(u8, name, "ASCII85Decode") or std.mem.eql(u8, name, "A85")) {
+		return decodeAscii85(allocator, data);
+	}
+	if (std.mem.eql(u8, name, "ASCIIHexDecode") or std.mem.eql(u8, name, "AHx")) {
+		return decodeAsciiHex(allocator, data);
+	}
 	return PdfError.UnsupportedFeature;
+}
+
+/// Decompress stream data according to the stream dictionary's /Filter. Supports a single
+/// filter OR a /Filter ARRAY (a chain applied in order, e.g. [/ASCII85Decode /FlateDecode]
+/// — real-world: ASCII85+Flate-encoded content streams). Each filter's /DecodeParms is
+/// matched positionally when /DecodeParms is itself an array. Unfiltered streams are duped.
+fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const DictEntry) PdfError![]const u8 {
+	// /Filter is either a single name or an array of names (the chain).
+	const filter_array = getDictArray(dict, "Filter");
+	const single_filter = getDictName(dict, "Filter");
+	if (filter_array == null and single_filter == null) {
+		return allocator.dupe(u8, stream_data) catch return PdfError.OutOfMemory; // no filter
+	}
+
+	// /DecodeParms is a single dict (single filter) or an array of dicts (chain), matched
+	// positionally. A null/missing element means "no parms for that filter".
+	const parms_array = getDictArray(dict, "DecodeParms");
+	const single_parms = getDictDict(dict, "DecodeParms");
+
+	const n: usize = if (filter_array) |fa| fa.len else 1;
+	var current: []const u8 = stream_data;
+	var owns_current = false; // whether `current` is an allocation we must free
+	errdefer if (owns_current) allocator.free(current);
+
+	var idx: usize = 0;
+	while (idx < n) : (idx += 1) {
+		const name: []const u8 = if (filter_array) |fa| blk: {
+			if (fa[idx] != .name) return PdfError.InvalidPdf;
+			break :blk fa[idx].name;
+		} else single_filter.?;
+
+		const parms: ?[]const DictEntry = if (parms_array) |pa| blk: {
+			if (idx >= pa.len) break :blk null;
+			break :blk if (pa[idx] == .dict) pa[idx].dict else null;
+		} else single_parms;
+
+		const next = try applyOneFilter(allocator, current, name, parms);
+		if (owns_current) allocator.free(current);
+		current = next;
+		owns_current = true;
+	}
+
+	if (!owns_current) return allocator.dupe(u8, current) catch return PdfError.OutOfMemory;
+	return current;
 }
 
 /// Reverse PNG prediction on decompressed data.
@@ -1773,5 +1876,56 @@ test "FlateDecode stream decompression" {
 	const stream = (try ctx.getStream(1)).?;
 	defer testing.allocator.free(stream);
 
+	try testing.expectEqualStrings(expected_text, stream);
+}
+
+test "filter chain ASCII85Decode then FlateDecode" {
+	// Real-world case (Soulsnatching.pdf): content streams use a /Filter ARRAY
+	// [/ASCII85Decode /FlateDecode] — ASCII85 outer, Flate inner. Each filter must be
+	// applied in array order. ASCII85 of zlib("Hello PDF Stream") (round-trip verified).
+	const ascii85 = "Gb\"@rc,n(/#]Oc^#VIPu:!<b@/Rns2~>";
+	const expected_text = "Hello PDF Stream";
+
+	var body_buf = std.ArrayList(u8).empty;
+	defer body_buf.deinit(testing.allocator);
+	try body_buf.print(testing.allocator, "<< /Length {d} /Filter [/ASCII85Decode /FlateDecode] >>\nstream\n", .{ascii85.len});
+	try body_buf.appendSlice(testing.allocator, ascii85);
+	try body_buf.appendSlice(testing.allocator, "\nendstream");
+
+	const pdf = try buildMinimalPdf(testing.allocator, &.{
+		.{ .num = 1, .body = body_buf.items },
+	}, "<< /Size 2 >>");
+	defer testing.allocator.free(pdf);
+
+	var ctx = try PdfContext.init(testing.allocator, pdf);
+	defer ctx.deinit();
+
+	const stream = (try ctx.getStream(1)).?;
+	defer testing.allocator.free(stream);
+	try testing.expectEqualStrings(expected_text, stream);
+}
+
+test "ASCII85Decode single filter" {
+	// ASCII85 of "Hello, ASCII85!" (15 bytes). Tests the decoder in isolation.
+	// Computed + round-trip verified separately.
+	const ascii85 = "87cURD_*\"s;aX,J3&Mi~>";
+	const expected_text = "Hello, ASCII85!";
+
+	var body_buf = std.ArrayList(u8).empty;
+	defer body_buf.deinit(testing.allocator);
+	try body_buf.print(testing.allocator, "<< /Length {d} /Filter /ASCII85Decode >>\nstream\n", .{ascii85.len});
+	try body_buf.appendSlice(testing.allocator, ascii85);
+	try body_buf.appendSlice(testing.allocator, "\nendstream");
+
+	const pdf = try buildMinimalPdf(testing.allocator, &.{
+		.{ .num = 1, .body = body_buf.items },
+	}, "<< /Size 2 >>");
+	defer testing.allocator.free(pdf);
+
+	var ctx = try PdfContext.init(testing.allocator, pdf);
+	defer ctx.deinit();
+
+	const stream = (try ctx.getStream(1)).?;
+	defer testing.allocator.free(stream);
 	try testing.expectEqualStrings(expected_text, stream);
 }
