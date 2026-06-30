@@ -4396,6 +4396,12 @@ static int cmd_extract(const char* file_path, const char* format_override) {
 	const char* format = NULL;
 	const char* display_path = file_path;
 
+	/* Wire DOCSCAN_DEBUG -> core stderr tracing (see docscan_set_debug). */
+	{
+		const char* dbg = getenv("DOCSCAN_DEBUG");
+		if (dbg && (strcmp(dbg, "1") == 0 || strcasecmp(dbg, "true") == 0))
+			docscan_set_debug(1);
+	}
 	/* Read input */
 	if (strcmp(file_path, "-") == 0 || strcmp(file_path, "@stdin") == 0) {
 		data = read_stdin_all(&data_len);

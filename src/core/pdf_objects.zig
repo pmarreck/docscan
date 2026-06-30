@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const pdf_decryptor = @import("pdf_decryptor.zig");
+const dbg = @import("debug.zig");
 
 // ── Public Types ────────────────────────────────────────────────────
 
@@ -1151,6 +1152,7 @@ fn applyOneFilter(allocator: Allocator, data: []const u8, name: []const u8, parm
 	if (std.mem.eql(u8, name, "ASCIIHexDecode") or std.mem.eql(u8, name, "AHx")) {
 		return decodeAsciiHex(allocator, data);
 	}
+	dbg.trace("UNSUPPORTED stream filter '{s}' — stream left undecoded ({d} bytes)", .{ name, data.len });
 	return PdfError.UnsupportedFeature;
 }
 
@@ -1188,7 +1190,9 @@ fn decompressStream(allocator: Allocator, stream_data: []const u8, dict: []const
 			break :blk if (pa[idx] == .dict) pa[idx].dict else null;
 		} else single_parms;
 
+		const before = current.len;
 		const next = try applyOneFilter(allocator, current, name, parms);
+		dbg.trace("filter[{d}/{d}] {s}: {d}B -> {d}B", .{ idx + 1, n, name, before, next.len });
 		if (owns_current) allocator.free(current);
 		current = next;
 		owns_current = true;

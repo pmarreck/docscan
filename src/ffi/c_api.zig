@@ -395,6 +395,14 @@ export fn docscan_close(db: ?*DocscanDb) void {
 /// Parse a document from raw bytes.
 /// format: "md", "docx", "pdf", "doc", "rtf"
 /// Returns a JSON string (caller must free with docscan_free), or null on error.
+/// Enable/disable core debug tracing to stderr (nonzero = on). When on, the parser emits
+/// `[docscan] …` lines describing stream filters, per-page span counts, and the structure
+/// summary — for diagnosing "extracted nothing / wrong text" cases. The CLI wires this to
+/// the DOCSCAN_DEBUG env var. No-op effect in the wasm slice (tracing is comptime-elided).
+export fn docscan_set_debug(enabled: c_int) void {
+	core.debug.setEnabled(enabled != 0);
+}
+
 export fn docscan_parse(
 	data: ?[*]const u8,
 	len: usize,

@@ -17,6 +17,7 @@ const PdfValue = pdf_objects.PdfValue;
 const PdfError = pdf_objects.PdfError;
 const encoding = @import("encoding.zig");
 const wordfix = @import("wordfix.zig");
+const dbg = @import("debug.zig");
 
 /// ToUnicode CMap: maps glyph IDs (as u16) to Unicode text.
 /// Built from PDF font /ToUnicode streams.
@@ -509,6 +510,9 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 	}
 
 	try collectPageSpans(allocator, &ctx, pages_ref.obj, &spans, 1);
+	dbg.trace("PDF: collected {d} text spans across all pages", .{spans.items.len});
+	if (spans.items.len == 0)
+		dbg.trace("PDF: 0 spans — page content streams yielded no text (check filters/fonts above)", .{});
 
 	// Decode-both charset heuristic: stopgap-font spans were kept as RAW bytes;
 	// pick their encoding now (declared WinAnsi vs chardetz-detected, judged by
@@ -517,6 +521,11 @@ pub fn parse(allocator: Allocator, content: []const u8, path: []const u8) !Docum
 
 	// Infer structure from font sizes
 	const sections = try inferStructure(allocator, spans.items);
+	if (dbg.isEnabled()) {
+		var total_chars: usize = 0;
+		for (sections) |s| total_chars += s.content.len;
+		dbg.trace("PDF: built {d} sections, {d} content chars total", .{ sections.len, total_chars });
+	}
 	errdefer {
 		for (sections) |s| freeSectionContents(allocator, s);
 		if (sections.len > 0) allocator.free(sections);
@@ -570,7 +579,9 @@ fn collectPageSpans(allocator: Allocator, ctx: *PdfContext, obj_num: u64, spans:
 		}
 	} else if (type_name != null and std.mem.eql(u8, type_name.?, "Page")) {
 		// Single page — extract text from /Contents
+		const before = spans.items.len;
 		try extractPageText(allocator, ctx, obj.dict, spans, page_counter);
+		dbg.trace("page {d}: +{d} spans", .{ page_counter, spans.items.len - before });
 	}
 }
 

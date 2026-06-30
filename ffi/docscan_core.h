@@ -43,6 +43,10 @@ void docscan_close(docscan_db* db);
 
 /* ── Parsing ─────────────────────────────────────────────────────── */
 
+/* Enable (nonzero) / disable (0) core debug tracing to stderr. When on, the parser emits
+ * "[docscan] ..." diagnostic lines (stream filters, per-page span counts, structure
+ * summary) for analyzing extraction failures. The CLI wires this to DOCSCAN_DEBUG. */
+void docscan_set_debug(int enabled);
 /*
  * Parse a document from raw bytes.
  * format: "md", "docx", "pdf", "doc"
