@@ -1125,26 +1125,149 @@ fn decodeAsciiHex(allocator: Allocator, data: []const u8) PdfError![]const u8 {
 	return out.toOwnedSlice(allocator) catch return PdfError.OutOfMemory;
 }
 
+/// Decode LZWDecode stream data (PDF/TIFF variable-width LZW, MSB-first bit packing).
+/// Codes start at 9 bits and grow to 12; 256 = ClearTable, 257 = EndOfData. `early_change`
+/// (PDF DecodeParms /EarlyChange, default 1) bumps the code width one code earlier, which
+/// is the PDF default. Dictionary stored as prefix-code + suffix-byte chains (no per-entry
+/// string allocation). Capped at MAX_DECOMPRESSED_SIZE.
+fn decodeLzw(allocator: Allocator, data: []const u8, early_change: u1) PdfError![]const u8 {
+	const clear_code: u16 = 256;
+	const eod_code: u16 = 257;
+	const max_entries: usize = 4096;
+
+	var prefix: [max_entries]u16 = undefined; // 0xFFFF = root (no prefix)
+	var suffix: [max_entries]u8 = undefined;
+
+	var out = std.ArrayList(u8).empty;
+	errdefer out.deinit(allocator);
+
+	// MSB-first bit reader over `data`.
+	var bit_buf: u32 = 0;
+	var bit_cnt: u5 = 0;
+	var pos: usize = 0;
+	const readCode = struct {
+		fn next(d: []const u8, p: *usize, buf: *u32, cnt: *u5, width: u4) ?u16 {
+			while (cnt.* < width) {
+				if (p.* >= d.len) return null;
+				buf.* = (buf.* << 8) | d[p.*];
+				p.* += 1;
+				cnt.* += 8;
+			}
+			cnt.* -= width;
+			return @truncate((buf.* >> cnt.*) & ((@as(u32, 1) << width) - 1));
+		}
+	}.next;
+
+	var next_code: usize = 258;
+	var width: u4 = 9;
+	var prev: i32 = -1;
+
+	const resetTable = struct {
+		fn run(pfx: *[max_entries]u16, sfx: *[max_entries]u8) void {
+			var i: usize = 0;
+			while (i < 256) : (i += 1) {
+				pfx[i] = 0xFFFF;
+				sfx[i] = @truncate(i);
+			}
+		}
+	}.run;
+	resetTable(&prefix, &suffix);
+
+	// Emit a code's byte string and return its FIRST byte (root suffix). Walks the
+	// prefix chain into a reversed stack, then appends in order.
+	var stack: [max_entries]u8 = undefined;
+	const emit = struct {
+		fn run(code: u16, pfx: *const [max_entries]u16, sfx: *const [max_entries]u8, st: *[max_entries]u8, o: *std.ArrayList(u8), alloc: Allocator) PdfError!u8 {
+			var n: usize = 0;
+			var c = code;
+			while (true) {
+				if (n >= max_entries) return PdfError.DecompressionFailed; // corrupt cycle
+				st[n] = sfx[c];
+				n += 1;
+				if (pfx[c] == 0xFFFF) break;
+				c = pfx[c];
+			}
+			const first = st[n - 1];
+			var i = n;
+			while (i > 0) {
+				i -= 1;
+				try o.append(alloc, st[i]);
+			}
+			return first;
+		}
+	}.run;
+
+	while (true) {
+		const code = readCode(data, &pos, &bit_buf, &bit_cnt, width) orelse break;
+		if (code == eod_code) break;
+		if (code == clear_code) {
+			resetTable(&prefix, &suffix);
+			next_code = 258;
+			width = 9;
+			prev = -1;
+			continue;
+		}
+		if (out.items.len > MAX_DECOMPRESSED_SIZE) return PdfError.DecompressionFailed;
+
+		var first_byte: u8 = undefined;
+		if (prev < 0) {
+			// First code after start/clear: must be a literal already in the table.
+			if (code >= next_code) return PdfError.DecompressionFailed;
+			first_byte = try emit(code, &prefix, &suffix, &stack, &out, allocator);
+		} else {
+			if (code < next_code) {
+				first_byte = try emit(code, &prefix, &suffix, &stack, &out, allocator);
+			} else if (code == next_code) {
+				// KwKwK: string(prev) + firstByte(prev).
+				const pf = try emit(@intCast(prev), &prefix, &suffix, &stack, &out, allocator);
+				try out.append(allocator, pf);
+				first_byte = pf;
+			} else return PdfError.DecompressionFailed; // code out of range → corrupt
+			// Add new entry string(prev) + first_byte, then maybe grow the code width.
+			if (next_code < max_entries) {
+				prefix[next_code] = @intCast(prev);
+				suffix[next_code] = first_byte;
+				next_code += 1;
+				if (width < 12 and next_code == (@as(usize, 1) << width) - early_change) width += 1;
+			}
+		}
+		prev = code;
+	}
+	return out.toOwnedSlice(allocator) catch return PdfError.OutOfMemory;
+}
+
+/// Apply an optional PNG predictor (/DecodeParms /Predictor >= 10) to already-decompressed
+/// data, taking ownership of `data` and returning either it or a new buffer.
+fn maybePredictor(allocator: Allocator, data: []const u8, parms: ?[]const DictEntry) PdfError![]const u8 {
+	const p = parms orelse return data;
+	const predictor = getDictInt(p, "Predictor") orelse 1;
+	if (predictor < 10) return data;
+	const columns_val = getDictInt(p, "Columns") orelse 1;
+	const columns: usize = std.math.cast(usize, columns_val) orelse {
+		allocator.free(data);
+		return PdfError.InvalidPdf;
+	};
+	const result = applyPngUnpredict(allocator, data, columns) catch {
+		allocator.free(data);
+		return PdfError.DecompressionFailed;
+	};
+	allocator.free(data);
+	return result;
+}
+
 /// Apply a single named PDF stream filter (with its optional DecodeParms). Returns a
 /// freshly-allocated buffer the caller owns. Accepts the PDF inline abbreviations
-/// (Fl/A85/AHx). LZW and image filters (DCT/CCITT/RunLength) are unsupported.
+/// (Fl/A85/AHx/LZW). Image filters (DCT/CCITT/JBIG2/JPX) and RunLength are unsupported.
 fn applyOneFilter(allocator: Allocator, data: []const u8, name: []const u8, parms: ?[]const DictEntry) PdfError![]const u8 {
 	if (std.mem.eql(u8, name, "FlateDecode") or std.mem.eql(u8, name, "Fl")) {
 		const decompressed = try inflateZlib(allocator, data);
-		if (parms) |p| {
-			const predictor = getDictInt(p, "Predictor") orelse 1;
-			if (predictor >= 10) {
-				const columns_val = getDictInt(p, "Columns") orelse 1;
-				const columns: usize = std.math.cast(usize, columns_val) orelse return PdfError.InvalidPdf;
-				const result = applyPngUnpredict(allocator, decompressed, columns) catch {
-					allocator.free(decompressed);
-					return PdfError.DecompressionFailed;
-				};
-				allocator.free(decompressed);
-				return result;
-			}
-		}
-		return decompressed;
+		return maybePredictor(allocator, decompressed, parms);
+	}
+	if (std.mem.eql(u8, name, "LZWDecode") or std.mem.eql(u8, name, "LZW")) {
+		// /EarlyChange defaults to 1 (PDF/TIFF default).
+		const ec: u1 = if (parms) |p| (if ((getDictInt(p, "EarlyChange") orelse 1) == 0) 0 else 1) else 1;
+		const decompressed = try decodeLzw(allocator, data, ec);
+		return maybePredictor(allocator, decompressed, parms);
 	}
 	if (std.mem.eql(u8, name, "ASCII85Decode") or std.mem.eql(u8, name, "A85")) {
 		return decodeAscii85(allocator, data);
@@ -1932,4 +2055,61 @@ test "ASCII85Decode single filter" {
 	const stream = (try ctx.getStream(1)).?;
 	defer testing.allocator.free(stream);
 	try testing.expectEqualStrings(expected_text, stream);
+}
+
+
+test "LZWDecode (Adobe PDF spec example)" {
+	// Canonical worked example from the PDF spec (ISO 32000 §7.4.4.2), independently
+	// round-trip verified: this LZW stream decodes to "-----A---B". Exercises variable
+	// code width (9-bit start) and the default EarlyChange=1 behaviour.
+	const lzw = [_]u8{ 0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01 };
+	const expected_text = "-----A---B";
+
+	var body_buf = std.ArrayList(u8).empty;
+	defer body_buf.deinit(testing.allocator);
+	try body_buf.print(testing.allocator, "<< /Length {d} /Filter /LZWDecode >>\nstream\n", .{lzw.len});
+	try body_buf.appendSlice(testing.allocator, &lzw);
+	try body_buf.appendSlice(testing.allocator, "\nendstream");
+
+	const pdf = try buildMinimalPdf(testing.allocator, &.{
+		.{ .num = 1, .body = body_buf.items },
+	}, "<< /Size 2 >>");
+	defer testing.allocator.free(pdf);
+
+	var ctx = try PdfContext.init(testing.allocator, pdf);
+	defer ctx.deinit();
+
+	const stream = (try ctx.getStream(1)).?;
+	defer testing.allocator.free(stream);
+	try testing.expectEqualStrings(expected_text, stream);
+}
+
+
+test "LZWDecode round-trips a width-growth + KwKwK vector (qpdf-validated)" {
+	// Oracle-validated: lzw_encoded was produced by an independent encoder and qpdf (a
+	// mature third-party LZW implementation) confirmed it decodes to lzw_input. The vector
+	// crosses the 9->10-bit code-width boundary AND includes KwKwK runs — paths the 9-bit
+	// Adobe spec example never exercises. Decoding it proves the decoder's width-growth
+	// boundary (next_code == 2^width - 1 for EarlyChange=1) matches the canonical encoder
+	// (which bumps one entry later, at 2^width — the decoder lags by one dict entry).
+	const lzw_input = [_]u8{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,66,67,3,10,17,24,31,38,45,52,59,66,73,80,87,94,101,108,115,122,129,136,143,150,157,164,171,178,185,192,199,206,213,220,227,234,241,248,2,9,16,23,30,37,44,51,58,65,72,79,86,93,100,107,114,121,128,135,142,149,156,163,170,177,184,191,198,205,212,219,226,233,240,247,1,8,15,22,29,36,43,50,57,64,71,78,85,92,99,106,113,120,127,134,141,148,155,162,169,176,183,190,197,204,211,218,225,232,239,246,0,7,14,21,28,35,42,49,56,63,70,77,84,91,98,105,112,119,126,133,140,147,154,161,168,175,182,189,196,203,210,217,224,231,238,245,252,6,13,20,27,34,41,48,55,62,69,76,83,90,97,104,111,118,125,132,139,146,153,160,167,174,181,188,195,202,209,216,223,230,237,244,251,5,12,19,26,33,40,47,54,61,68,75,82,89,96,103,110,117,124,131};
+	const lzw_encoded = [_]u8{128,0,0,32,32,24,16,10,6,3,130,1,32,160,88,48,26,14,7,132,2,33,32,152,80,42,22,11,134,3,33,160,216,112,58,30,15,136,4,34,33,24,144,74,38,19,138,5,34,161,88,176,90,46,23,140,6,35,33,152,208,106,54,27,142,7,35,161,216,240,122,62,31,144,8,36,34,25,16,138,70,35,146,9,36,162,89,48,154,78,39,148,10,37,34,153,80,170,86,43,150,11,37,162,217,112,186,94,47,152,12,38,35,25,144,202,102,51,154,13,38,163,89,176,218,110,55,156,14,39,35,153,208,234,118,59,158,15,39,163,217,240,250,126,63,160,16,40,36,26,17,10,134,67,162,17,40,164,90,49,26,142,71,164,18,41,36,154,81,42,150,75,166,19,41,164,218,113,58,158,79,168,20,42,37,26,145,74,166,83,170,21,42,165,90,177,90,174,87,172,22,43,37,154,209,106,182,91,174,23,43,165,218,241,122,190,95,176,24,44,38,27,17,138,198,99,144,121,92,190,103,55,157,207,232,115,40,157,50,31,83,173,213,236,117,251,93,158,231,111,189,221,240,118,192,96,160,136,96,62,38,22,141,7,100,34,73,64,174,94,50,155,14,103,164,10,33,30,150,78,169,21,107,37,203,1,142,103,26,166,225,198,117,30,39,192,4,4,130,0,184,60,18,133,129,152,116,32,137,2,120,172,46,140,131,88,228,60,144,4,57,28,74,147,133,25,84,88,151,5,249,140,102,154,134,217,196,116,158,7,184,2,4,1,224,176,58,18,5,97,144,114,32,8,226,112,170,46,12,99,80,226,60,15,228,49,26,74,19,101,17,82,88,22,229,241,138,102,26,102,209,194,116,29,231,176,0,3,129,192,168,56,17,133,65,136,112,31,136,194,104,168,45,140,67,72,224,59,143,196,41,24,73,147,69,9,80,87,150,197,233,136,101,154,70,201,192,115,157,199,169,248,3,1,160,160,54,17,5,33,128,110,31,8,162,96,166,45,12,35,64,222,59,15,164,33,22,73,19,37,1,78,87,22,165,225,134,101,26,38,193,190,115,29,167,161,246,2,129,128,152,52,16,133,1,120,108,30,136,130,88,164,44,140,3,56,220,58,143,132,26,2};
+
+	var body_buf = std.ArrayList(u8).empty;
+	defer body_buf.deinit(testing.allocator);
+	try body_buf.print(testing.allocator, "<< /Length {d} /Filter /LZWDecode >>\nstream\n", .{lzw_encoded.len});
+	try body_buf.appendSlice(testing.allocator, &lzw_encoded);
+	try body_buf.appendSlice(testing.allocator, "\nendstream");
+
+	const pdf = try buildMinimalPdf(testing.allocator, &.{
+		.{ .num = 1, .body = body_buf.items },
+	}, "<< /Size 2 >>");
+	defer testing.allocator.free(pdf);
+
+	var ctx = try PdfContext.init(testing.allocator, pdf);
+	defer ctx.deinit();
+
+	const stream = (try ctx.getStream(1)).?;
+	defer testing.allocator.free(stream);
+	try testing.expectEqualSlices(u8, &lzw_input, stream);
 }
