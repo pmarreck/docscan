@@ -22,6 +22,17 @@
 #include <netinet/in.h>
 #include <signal.h>
 
+/* Write the whole buffer, retrying short writes; a client that hung up early is
+ * not the mock's concern, so errors just end the response. */
+static void write_all(int fd, const char* p, size_t n) {
+	while (n > 0) {
+		ssize_t w = write(fd, p, n);
+		if (w <= 0) return;
+		p += w;
+		n -= (size_t)w;
+	}
+}
+
 /* Count top-level strings in the "input":[...] array of an OpenAI embeddings
  * request body. docscan only ever sends a flat array of strings, so counting
  * string literals at array depth handles it (respecting JSON escapes). */
@@ -140,7 +151,7 @@ int main(int argc, char** argv) {
 				"Content-Type: application/json\r\n"
 				"Content-Length: %zu\r\n"
 				"Connection: close\r\n\r\n%s", strlen(msg), msg);
-			(void)write(cl, resp, (size_t)rl);
+			write_all(cl, resp, (size_t)rl);
 			close(cl);
 			continue;
 		}
@@ -164,8 +175,8 @@ int main(int argc, char** argv) {
 			"Content-Type: application/json\r\n"
 			"Content-Length: %zu\r\n"
 			"Connection: close\r\n\r\n", off);
-		(void)write(cl, resp, (size_t)rl);
-		(void)write(cl, body, off);
+		write_all(cl, resp, (size_t)rl);
+		write_all(cl, body, off);
 		free(body);
 		close(cl);
 	}

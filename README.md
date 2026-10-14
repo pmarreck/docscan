@@ -54,6 +54,19 @@ cat file.md | docscan extract --format md -
 echo "kn own" | docscan normalize
 ```
 
+### Excluding files with `.docscanignore`
+
+When `docscan index` (or `update`, or the MCP `docscan_index` tool) walks a directory, it reads a `.docscanignore` file at the root of that directory if one exists. The syntax follows `.gitignore`: one glob per line, `#` comments, `!` to re-include, a trailing `/` to match directories only and a leading `/` to anchor a pattern to the root. Patterns are matched against paths relative to the root, and an ignored directory is not descended into.
+
+```gitignore
+*.txt
+!keep.txt
+drafts/
+/build/
+```
+
+Only the root file is read; `.docscanignore` files in subdirectories are not consulted. Hidden entries and common build or dependency directories (`node_modules`, `.git`, `zig-out` and so on) are skipped regardless.
+
 ## Embedding backends
 
 docscan supports both Ollama and OpenAI-compatible embedding servers (oMLX, LM Studio, vLLM, etc.).

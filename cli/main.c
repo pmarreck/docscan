@@ -1115,8 +1115,23 @@ static void file_list_free(file_list* fl) {
 	fl->count = 0;
 }
 
-/* Recursively collect supported files from a directory. */
-static void walk_dir(const char* dir_path, file_list* fl) {
+/* Build "rel/name" (or "name" at the walk root) for .docscanignore matching.
+ * Ignore patterns always use "/" separators, independent of the host OS. */
+static void join_rel(char* out, size_t out_len, const char* rel, const char* name) {
+	if (rel[0] == '\0') snprintf(out, out_len, "%s", name);
+	else snprintf(out, out_len, "%s/%s", rel, name);
+}
+
+/* True when the root .docscanignore excludes this root-relative path. */
+static int ignored_by(const docscan_ignore* ig, const char* rel_path, int is_dir) {
+	if (!ig) return 0;
+	return docscan_ignore_matches(ig, (const uint8_t*)rel_path, strlen(rel_path), is_dir) == 1;
+}
+
+/* Recursively collect supported files from a directory. `rel` is the path
+ * relative to the walk root and `ig` the root's .docscanignore (may be NULL).
+ * An ignored directory is not descended into, matching git semantics. */
+static void walk_dir(const char* dir_path, const char* rel, const docscan_ignore* ig, file_list* fl) {
 #ifdef _WIN32
 	char search_path[MAX_PATH_LEN];
 	snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
@@ -1132,6 +1147,8 @@ static void walk_dir(const char* dir_path, file_list* fl) {
 
 		char full_path[MAX_PATH_LEN];
 		snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, name);
+		char rel_path[MAX_PATH_LEN];
+		join_rel(rel_path, sizeof(rel_path), rel, name);
 
 		if (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
 			/* Skip common noise directories */
@@ -1141,9 +1158,10 @@ static void walk_dir(const char* dir_path, file_list* fl) {
 			if (strcmp(name, ".jj") == 0) continue;
 			if (strcmp(name, "zig-cache") == 0) continue;
 			if (strcmp(name, "zig-out") == 0) continue;
-			walk_dir(full_path, fl);
+			if (ignored_by(ig, rel_path, 1)) continue;
+			walk_dir(full_path, rel_path, ig, fl);
 		} else {
-			if (format_for_ext(full_path) != NULL) {
+			if (format_for_ext(full_path) != NULL && !ignored_by(ig, rel_path, 0)) {
 				file_list_add(fl, full_path);
 			}
 		}
@@ -1160,6 +1178,8 @@ static void walk_dir(const char* dir_path, file_list* fl) {
 
 		char full_path[MAX_PATH_LEN];
 		snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+		char rel_path[MAX_PATH_LEN];
+		join_rel(rel_path, sizeof(rel_path), rel, ent->d_name);
 
 		struct stat st;
 		if (stat(full_path, &st) != 0) continue;
@@ -1172,15 +1192,37 @@ static void walk_dir(const char* dir_path, file_list* fl) {
 			if (strcmp(ent->d_name, ".jj") == 0) continue;
 			if (strcmp(ent->d_name, "zig-cache") == 0) continue;
 			if (strcmp(ent->d_name, "zig-out") == 0) continue;
-			walk_dir(full_path, fl);
+			if (ignored_by(ig, rel_path, 1)) continue;
+			walk_dir(full_path, rel_path, ig, fl);
 		} else if (S_ISREG(st.st_mode)) {
-			if (format_for_ext(full_path) != NULL) {
+			if (format_for_ext(full_path) != NULL && !ignored_by(ig, rel_path, 0)) {
 				file_list_add(fl, full_path);
 			}
 		}
 	}
 	closedir(d);
 #endif
+}
+
+/* Load <root>/.docscanignore into a matcher. Returns NULL when the file is
+ * absent; warns (and returns NULL) when it exists but cannot be read. */
+static docscan_ignore* load_root_ignore(const char* root) {
+	char ig_path[MAX_PATH_LEN];
+	snprintf(ig_path, sizeof(ig_path), "%s/.docscanignore", root);
+	struct stat st;
+	if (stat(ig_path, &st) != 0 || !S_ISREG(st.st_mode)) return NULL;
+	size_t len = 0;
+	uint8_t* buf = NULL;
+	if (st.st_size > 0) {
+		buf = read_file(ig_path, &len);
+		if (!buf) {
+			warn_msg("cannot read %s; indexing without ignore patterns", ig_path);
+			return NULL;
+		}
+	}
+	docscan_ignore* ig = docscan_ignore_new(buf, len);
+	free(buf);
+	return ig;
 }
 
 /* Collect files: if path is a directory, walk it; if a file, add it directly. */
@@ -1191,7 +1233,9 @@ static void collect_files(const char* path, file_list* fl) {
 		return;
 	}
 	if (S_ISDIR(st.st_mode)) {
-		walk_dir(path, fl);
+		docscan_ignore* ig = load_root_ignore(path);
+		walk_dir(path, "", ig, fl);
+		docscan_ignore_free(ig);
 	} else if (S_ISREG(st.st_mode)) {
 		if (format_for_ext(path) != NULL) {
 			file_list_add(fl, path);

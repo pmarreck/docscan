@@ -21,7 +21,10 @@ if [ ! -f "$BINARY" ]; then
 	exit 1
 fi
 
-trap 'rm -rf "$TEST_DIR"' EXIT
+# Embeddings go to a local mock so results never depend on the host's servers.
+source "$SCRIPT_DIR/../lib/mock-embed.bash"
+mock_embed_start "$TEST_DIR" || exit 1
+trap 'mock_embed_stop; rm -rf "$TEST_DIR"' EXIT
 
 # ---------- Create test fixtures ----------
 
@@ -36,7 +39,7 @@ The party shall indemnify and hold harmless.
 MDEOF
 
 # Pre-index the test document via the CLI so we have data to work with.
-"$BINARY" index "$TEST_DIR/test.md" --db "$TEST_DB" >/dev/null 2>&1
+"$BINARY" index "$TEST_DIR/test.md" --db "$TEST_DB" "${MOCK_EMBED_FLAGS[@]}" >/dev/null 2>&1
 
 # ---------- Helper: send MCP request(s) and capture response(s) ----------
 

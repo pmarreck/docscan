@@ -29,7 +29,10 @@ if [ ! -f "$BINARY" ]; then
 	exit 1
 fi
 
-trap 'rm -rf "$TEST_DIR"' EXIT
+# Embeddings go to a local mock so results never depend on the host's servers.
+source "$SCRIPT_DIR/../lib/mock-embed.bash"
+mock_embed_start "$TEST_DIR" || exit 1
+trap 'mock_embed_stop; rm -rf "$TEST_DIR"' EXIT
 
 # ---------- Create test fixtures ----------
 
@@ -106,7 +109,7 @@ fi
 # 4. index with a single .md file succeeds
 # ──────────────────────────────────────────────
 out="" ; err="" ; rc=""
-capture "$BINARY" index --db "$DB" "$TEST_DIR/contract.md"
+capture "$BINARY" index --db "$DB" "${MOCK_EMBED_FLAGS[@]}" "$TEST_DIR/contract.md"
 if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
 	pass "index single .md file succeeds"
 else
@@ -117,7 +120,7 @@ fi
 # 5. index with a directory succeeds
 # ──────────────────────────────────────────────
 out="" ; err="" ; rc=""
-capture "$BINARY" index --db "$DB" "$TEST_DIR/subdir"
+capture "$BINARY" index --db "$DB" "${MOCK_EMBED_FLAGS[@]}" "$TEST_DIR/subdir"
 if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
 	pass "index directory succeeds"
 else
@@ -313,12 +316,12 @@ fi
 CFG_TEST_DIR2="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cfg-test2-XXXXXX")"
 echo "# Config persist test" > "$CFG_TEST_DIR2/doc.md"
 out="" ; err="" ; rc=""
-capture "$BINARY" index "$CFG_TEST_DIR2" --embedding-api openai --embedding-url http://localhost:8000 --model bge-m3-mlx
+capture "$BINARY" index "$CFG_TEST_DIR2" --embedding-api openai --embedding-url "$MOCK_EMBED_URL" --model bge-m3-mlx
 if [ "$rc" -eq 0 ]; then
 	ini_content=""
 	ini_content=$(cat "$CFG_TEST_DIR2/.docscan/config.ini" 2>/dev/null)
 	if echo "$ini_content" | grep -q "api = openai" && \
-	   echo "$ini_content" | grep -qE "url = http://(localhost|127\.0\.0\.1):8000" && \
+	   echo "$ini_content" | grep -qF "url = $MOCK_EMBED_URL" && \
 	   echo "$ini_content" | grep -q "model = bge-m3-mlx"; then		pass "config.ini persists CLI flags (embedding-api, url, model)"
 	else
 		fail "config.ini persists CLI flags" "ini contents don't match expected values"
@@ -1116,6 +1119,49 @@ mv "$ENV_TEST_DIR4" "$ENV_TEST_DIR5" "$ENV_TEST_DIR6" "$ENV_TEST_DIR7" "$TEST_DI
 mv "$ENV_TEST_DIR" "$ENV_TEST_DIR2" "$ENV_TEST_DIR3" "$EMPTY_XDG" "$TEST_DIR/" 2>/dev/null || true
 unset XDG_CONFIG_HOME
 
+# ──────────────────────────────────────────────
+# 79. index honors the root .docscanignore (globs, negation, dir-only, anchored)
+# Classifier over the whole fixture set: each file gets its own walk root holding
+# the same .docscanignore, so every path is judged independently (no offsetting
+# errors hidden in a total). Embeddings point at a refused port: the walker's
+# "Found"/"No supported files" verdict is the contract, not the embedding server.
+# ──────────────────────────────────────────────
+IGN_RULES='# drafts and scratch text are not indexed
+*.txt
+!keep.txt
+drafts/
+/build/'
+ign_bad=""
+ign_n=0
+while read -r ign_rel ign_expect; do
+	ign_n=$((ign_n + 1))
+	ign_root="$TEST_DIR/ignore root $ign_n"
+	mkdir -p "$ign_root/$(dirname "$ign_rel")"
+	printf '%s\n' "$IGN_RULES" > "$ign_root/.docscanignore"
+	printf '# %s\n\nIgnore fixture.\n' "$ign_rel" > "$ign_root/$ign_rel"
+	out="" ; err="" ; rc=""
+	capture "$BINARY" index --db "$ign_root.db" --embedding-url http://127.0.0.1:9 "$ign_root"
+	if echo "$err" | grep -q "Found 1 supported file"; then ign_got=kept
+	elif echo "$out" | grep -q "No supported files found"; then ign_got=ignored
+	else ign_got="error(rc=$rc)"
+	fi
+	[ "$ign_got" = "$ign_expect" ] || ign_bad="$ign_bad $ign_rel:expected=$ign_expect,got=$ign_got"
+done << 'CASES'
+keep.md kept
+keep.txt kept
+notes.txt ignored
+sub/notes.txt ignored
+drafts/plan.md ignored
+sub/drafts/x.md ignored
+build/out.md ignored
+sub/build/kept.md kept
+sub/deep.md kept
+CASES
+if [ -z "$ign_bad" ]; then
+	pass "index honors root .docscanignore over a 9-path fixture set"
+else
+	fail "index honors root .docscanignore" "misclassified:$ign_bad"
+fi
 # ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────

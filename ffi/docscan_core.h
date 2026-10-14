@@ -137,6 +137,24 @@ unsigned char* docscan_preprocess_page(const unsigned char* pixels,
                                         uint32_t channels, size_t* out_len);
 void docscan_free_bytes(unsigned char* ptr, size_t len);
 
+/* ── Ignore patterns (.docscanignore) ────────────────────────────── */
+
+typedef struct DocscanIgnore docscan_ignore;
+
+/* Build a gitignore-style matcher from a length-delimited UTF-8 buffer
+ * (globs, "!" negation, trailing "/" dir-only, leading "/" anchored to the root).
+ * content may be NULL only when len is 0. Returns NULL on error.
+ * The buffer is copied; the caller may free it after this returns. */
+docscan_ignore* docscan_ignore_new(const uint8_t* content, size_t len);
+
+/* Classify a root-relative, "/"-separated path of len bytes.
+ * Returns 1 = ignored, 0 = kept, -1 = invalid arguments. */
+int docscan_ignore_matches(const docscan_ignore* ig, const uint8_t* path,
+                           size_t len, int is_dir);
+
+/* Free a matcher (NULL-safe). */
+void docscan_ignore_free(docscan_ignore* ig);
+
 /* ── Memory ──────────────────────────────────────────────────────── */
 
 /* Free any string returned by docscan_* functions (NULL-safe). */

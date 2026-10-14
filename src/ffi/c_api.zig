@@ -917,6 +917,40 @@ export fn docscan_free_bytes(ptr: ?[*]u8, len: usize) void {
 	}
 }
 
+/// Opaque ignore-pattern set for C callers; wraps core.ignore.IgnoreList.
+pub const DocscanIgnore = core.ignore.IgnoreList;
+
+/// Build a gitignore-style matcher (.docscanignore semantics: globs, `!` negation,
+/// trailing-`/` dir-only, leading-`/` anchoring) from a length-delimited UTF-8 buffer.
+/// NULL with len 0 means "no patterns". Returns NULL on NULL-with-length or OOM.
+export fn docscan_ignore_new(content: ?[*]const u8, len: usize) ?*DocscanIgnore {
+	const bytes: []const u8 = if (content) |c| c[0..len] else if (len == 0) "" else return null;
+	const ig = gpa.create(DocscanIgnore) catch return null;
+	ig.* = DocscanIgnore.init(gpa);
+	ig.loadFromString(bytes) catch {
+		ig.deinit();
+		gpa.destroy(ig);
+		return null;
+	};
+	return ig;
+}
+
+/// Classify one root-relative path (`/`-separated, length-delimited).
+/// Returns 1 = ignored, 0 = kept, -1 = invalid arguments.
+export fn docscan_ignore_matches(ig: ?*const DocscanIgnore, path: ?[*]const u8, len: usize, is_dir: c_int) c_int {
+	const list = ig orelse return -1;
+	const p = path orelse return -1;
+	return @intFromBool(list.isIgnoredEx(p[0..len], is_dir != 0));
+}
+
+/// Free a matcher from docscan_ignore_new (NULL-safe).
+export fn docscan_ignore_free(ig: ?*DocscanIgnore) void {
+	if (ig) |list| {
+		list.deinit();
+		gpa.destroy(list);
+	}
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1155,4 +1189,41 @@ test "docscan_free — null is safe" {
 
 test "docscan_close — null is safe" {
 	docscan_close(null); // should not crash
+}
+
+test "docscan_ignore — classifies a path set through the C ABI" {
+	const content = "# comment\n*.txt\n!keep.txt\ndrafts/\n/build\n";
+	const ig = docscan_ignore_new(content.ptr, content.len) orelse return error.TestUnexpectedResult;
+	defer docscan_ignore_free(ig);
+
+	const Case = struct { path: []const u8, is_dir: c_int, ignored: c_int };
+	const cases = [_]Case{
+		.{ .path = "notes.txt", .is_dir = 0, .ignored = 1 },
+		.{ .path = "sub/notes.txt", .is_dir = 0, .ignored = 1 },
+		.{ .path = "keep.txt", .is_dir = 0, .ignored = 0 },
+		.{ .path = "contract.md", .is_dir = 0, .ignored = 0 },
+		.{ .path = "drafts", .is_dir = 1, .ignored = 1 },
+		.{ .path = "drafts/plan.md", .is_dir = 0, .ignored = 1 },
+		.{ .path = "drafts", .is_dir = 0, .ignored = 0 },
+		.{ .path = "build", .is_dir = 1, .ignored = 1 },
+		.{ .path = "src/build", .is_dir = 1, .ignored = 0 },
+		.{ .path = "report.pdf", .is_dir = 0, .ignored = 0 },
+	};
+	for (cases) |c| {
+		const got = docscan_ignore_matches(ig, c.path.ptr, c.path.len, c.is_dir);
+		if (got != c.ignored) {
+			std.debug.print("path={s} is_dir={d} expected={d} got={d}\n", .{ c.path, c.is_dir, c.ignored, got });
+			return error.TestUnexpectedResult;
+		}
+	}
+}
+
+test "docscan_ignore — empty and NULL inputs" {
+	const empty = docscan_ignore_new(null, 0) orelse return error.TestUnexpectedResult;
+	defer docscan_ignore_free(empty);
+	try testing.expectEqual(@as(c_int, 0), docscan_ignore_matches(empty, "a.md", 4, 0));
+	try testing.expectEqual(@as(c_int, -1), docscan_ignore_matches(null, "a.md", 4, 0));
+	try testing.expectEqual(@as(c_int, -1), docscan_ignore_matches(empty, null, 4, 0));
+	try testing.expect(docscan_ignore_new(null, 3) == null);
+	docscan_ignore_free(null);
 }

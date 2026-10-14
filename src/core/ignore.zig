@@ -134,11 +134,12 @@ pub const IgnoreList = struct {
 	}
 };
 
-/// Check if `path` starts with `dir_prefix/` or equals `dir_prefix`.
+/// Check if the file `path` lies strictly inside `dir_prefix/`. A file whose
+/// whole path equals the prefix is not inside it: per gitignore, `name/` only
+/// matches directories, never a file called `name`.
 fn pathHasPrefix(path: []const u8, dir_prefix: []const u8) bool {
-	if (path.len < dir_prefix.len) return false;
+	if (path.len <= dir_prefix.len) return false;
 	if (!globMatch(dir_prefix, path[0..dir_prefix.len])) return false;
-	if (path.len == dir_prefix.len) return true;
 	return path[dir_prefix.len] == '/';
 }
 
@@ -532,6 +533,29 @@ test "loadFromString with carriage returns" {
 	try std.testing.expectEqual(true, ig.isIgnored("test.log"));
 	try std.testing.expectEqual(true, ig.isIgnored("test.tmp"));
 	try std.testing.expectEqual(false, ig.isIgnored("test.txt"));
+}
+
+test "dir-only pattern never matches a file of the same name (gitignore semantics)" {
+	var ig = IgnoreList.init(std.testing.allocator);
+	defer ig.deinit();
+	try ig.loadFromString("drafts/\n/build/\n");
+
+	const Case = struct { path: []const u8, is_dir: bool, ignored: bool };
+	const cases = [_]Case{
+		.{ .path = "drafts", .is_dir = false, .ignored = false },
+		.{ .path = "sub/drafts", .is_dir = false, .ignored = false },
+		.{ .path = "build", .is_dir = false, .ignored = false },
+		.{ .path = "drafts", .is_dir = true, .ignored = true },
+		.{ .path = "sub/drafts", .is_dir = true, .ignored = true },
+		.{ .path = "drafts/a.md", .is_dir = false, .ignored = true },
+		.{ .path = "sub/drafts/a.md", .is_dir = false, .ignored = true },
+		.{ .path = "build/a.md", .is_dir = false, .ignored = true },
+		.{ .path = "sub/build/a.md", .is_dir = false, .ignored = false },
+		.{ .path = "draftsman.md", .is_dir = false, .ignored = false },
+	};
+	for (cases) |c| {
+		try std.testing.expectEqual(c.ignored, ig.isIgnoredEx(c.path, c.is_dir));
+	}
 }
 
 test "default ignore patterns parse without error" {
