@@ -15,17 +15,12 @@ Original task breakdown: `docs/superpowers/plans/2026-04-08-docscan-implementati
 - [ ] Benchmark suite behind `./bm` (Task 16; use the performance-profiling skill)
 - [ ] Integration tests that need a running Ollama (Task 15)
 
-## Awaiting owner decision
-
-- [ ] OCR for image-only scans: Tesseract-FFI native fallback vs ocrs-WASM evaluation (walking decision docscan-ocr-direction) (context: docs/plan_context/ocr.md)
-- [ ] incitez citation-extraction integration into the chunker/index (walking decision docscan-incitez-integration) (context: docs/plan_context/citation_pipeline.md)
-
 ## Deferred
 
 - [ ] Citation pipeline Phase 2: offset map + `docscan_extract_structured`, md/txt first; waits for a consumer to ask (context: docs/plan_context/citation_pipeline.md)
 - [ ] Grammar/POS averaged-perceptron tagger for residual ambiguous joins and party attribution (context: docs/plan_context/pdf_quality.md)
 - [ ] Figure/diagram region detection for dense 2-column STEM layouts (context: docs/plan_context/pdf_quality.md)
-- [ ] OCR quality ideas: consensus OCR and lexicon-constrained OCR (context: docs/plan_context/ocr.md)
+- [ ] Integrate ocrz (the separate Zig OCR project) as the fallback for image-only PDF pages once it is usable (context: docs/plan_context/ocr.md)
 - [ ] Windows directory walking (currently POSIX-only)
 - [ ] i18n translations (groundwork laid: --lang, DOCSCAN_LANG)
 - [ ] Legal embedding model research/fine-tuning
@@ -38,8 +33,8 @@ Original task breakdown: `docs/superpowers/plans/2026-04-08-docscan-implementati
 
 ## Recently completed
 
+- [x] Owner decisions 2026-10-20: docscan stays a document-to-plaintext parser independent of incitez (citation integration declined); OCR moves to a new Zig project, ocrz (done 2026-10-20 15:55 EDT)
 - [x] `.docscanignore` wired into the CLI/MCP directory walker via new length-delimited FFI (`docscan_ignore_new`/`_matches`/`_free`); CLI and MCP suites made hermetic with a shared mock embedding server (done 2026-10-14 18:10 EDT)
 - [x] PLAN.md migrated to one-line items; prose moved to docs/plan_context/ and docs/PLAN_LOG.md (done 2026-10-14 14:45 EDT)
 - [x] Verified already done in code and retired: PDF `/PageLabels` + CLI `--logical`/`--physical` (519e7ff), ligature normalization for doc/rtf/epub via `wordfix.applySections` (done 2026-10-14 14:45 EDT)
-- [x] CTM (q/Q/cm) applied to PDF text positions (done 2026-06-16 EST)
 - [x] Borderline line-break hyphen + LuraDocument empty-extract fix (done 2026-06-16 EST)

@@ -20,3 +20,7 @@ hard-stop signal; incitez_web composes the map for source-highlighting. Marker c
 agreed with incitez (2026-06-14): wraps→space, lone \n = boundary, no \n runs/trailing.
 
 - [ ] **Phase 2 — offset map + `docscan_extract_structured`** (emitted↔original): sorted `{emitted_off, original_off}` breakpoint array (piecewise-1:1, binary-search to map back); new export returns `[u32 text_len][text][u32 n][n×{emitted,original}]` in one buffer. md/txt exact byte-to-byte first; pdf/docx pending an incitez_web highlight-needs convo ("original bytes" into a binary PDF isn't directly a highlight position).
+
+## Decision 2026-10-20 (owner, walking brief docscan-incitez-integration rev 2)
+
+Declined. Verbatim: "docscan project should remain independent from the incitez legal work. docscan is document-to-plaintext parsing. incitez is citation extraction." The incitez integration item above is retired; docscan does not depend on incitez or store citations.

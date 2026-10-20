@@ -87,3 +87,7 @@ citation "surpass" is live across formats; incitez_web consumes it.
       - [x] **(6) Ligature recovery for broken ToUnicode** (2026-06-15 EST): SCOTUS Century fonts map the fi/fl/ffi glyphs to a lone "f"/"ff" in ToUnicode ("defines"→"defnes"). Two-pass override (poppler-style, in overrideLigatureDifferences): pass-1 trusts /Encoding /Differences glyph NAMES (Custom fonts, any code); pass-2 repairs Adobe StandardEncoding ligature POSITIONS (174=fi,175=fl,…) still holding a lone-f stub (Builtin fonts — the real SCOTUS case, NO /Differences). Both paths have hermetic tests; pass-2's proven non-vacuous by neutering (exactly one test fails → reverts to "defnes"). Validated on legal-scotus-303-creative (fi/fl/ffi words all correct, zero stubs).
       - [x] **Corpus committed** (2026-06-15 EST): incitez_web-donated layout-diverse legal fixtures (8 SCOTUS slip ops + OSG/circuit/district briefs) committed to tests/corpus/ (jj snapshot.max-new-file-size raised to 16MiB); run-corpus 27/27.
 - [x] Committed `docs/superpowers/plans/2026-04-15-libvips-ocr-preprocessing.md` (libvips OCR-preprocessing plan) (2026-06-15 EST).
+
+## Retired 2026-10-20
+
+- [x] [Recently completed] CTM (q/Q/cm) applied to PDF text positions (done 2026-06-16 EST)
