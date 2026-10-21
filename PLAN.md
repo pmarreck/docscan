@@ -15,6 +15,7 @@ Original task breakdown: `docs/superpowers/plans/2026-04-08-docscan-implementati
 - [ ] Benchmark suite behind `./bm` (Task 16; use the performance-profiling skill)
 - [ ] Integration tests that need a running Ollama (Task 15)
 
+- [ ] Bump the chardetz pin from c7d1779 to ffefc74: `detect()` now returns `error{OutOfMemory}![:0]const u8`, so `detectEncoding` in src/core/encoding.zig needs `catch return null`; refresh the package hash with `zig fetch --save`
 ## Deferred
 
 - [ ] Citation pipeline Phase 2: offset map + `docscan_extract_structured`, md/txt first; waits for a consumer to ask (context: docs/plan_context/citation_pipeline.md)
