@@ -8,3 +8,7 @@ Moved verbatim from PLAN.md on 2026-10-14 when the plan was reduced to one-line 
 ## Decision 2026-10-20 (owner, walking brief docscan-ocr-direction rev 2)
 
 Verbatim: "start a new OCR project to beat Tesseract, in Zig… call it… ocrz, and kick it off, Opus 5.5". OCR (including the consensus and lexicon-constrained ideas above) is developed in the separate ocrz project. docscan's remaining OCR work is to call ocrz for image-only pages once it is usable; the Tesseract-FFI and ocrs-WASM options are not pursued here.
+
+## 2026-10-21: ocrz page-level C API exists
+
+ocrz now exports `ocrz_read_page` in `include/ocrz.h`: grayscale pixels (width, height, stride) in, UTF-8 text with one line per detected text line out, caller frees. Models load separately via `ocrz_model_load`. The API is pre-1.0 and may change. Reported accuracy is not yet competitive (newspaper lines 17.9% CER against 7.3% for Tesseract's best model; a clean book page about 14% CER), so the docscan integration item stays deferred until ocrz reports usable accuracy.
