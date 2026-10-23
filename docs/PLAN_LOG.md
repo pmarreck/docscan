@@ -91,3 +91,10 @@ citation "surpass" is live across formats; incitez_web consumes it.
 ## Retired 2026-10-20
 
 - [x] [Recently completed] CTM (q/Q/cm) applied to PDF text positions (done 2026-06-16 EST)
+
+## Retired 2026-10-23
+
+- [x] [Recently completed] `.docscanignore` wired into the CLI/MCP directory walker via new length-delimited FFI (`docscan_ignore_new`/`_matches`/`_free`); CLI and MCP suites made hermetic with a shared mock embedding server (done 2026-10-14 18:10 EDT)
+- [x] [Recently completed] PLAN.md migrated to one-line items; prose moved to docs/plan_context/ and docs/PLAN_LOG.md (done 2026-10-14 14:45 EDT)
+- [x] [Recently completed] Verified already done in code and retired: PDF `/PageLabels` + CLI `--logical`/`--physical` (519e7ff), ligature normalization for doc/rtf/epub via `wordfix.applySections` (done 2026-10-14 14:45 EDT)
+- [x] [Recently completed] Borderline line-break hyphen + LuraDocument empty-extract fix (done 2026-06-16 EST)
