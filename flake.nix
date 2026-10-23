@@ -46,7 +46,7 @@
 				# build.zig.zon (URL deps for sqlite_vec, chardetz). This is the
 				# only step with network access; the consumer builds offline.
 				# To recompute: set zigDepsHash = ""; nix build; copy printed hash.
-				zigDepsHash = "sha256-rpVo7KSy7JDIhpgL+30U3e5lyYx5o5Uc1bKeviGPoBw=";
+				zigDepsHash = "sha256-5z/cverKXSv9AcU5o0Vo0Y4CB1SZC9V9a5t4XiZQsAY=";
 
 				zigDeps = pkgs.stdenv.mkDerivation {
 					pname = "docscan-zig-deps";

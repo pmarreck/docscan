@@ -137,7 +137,7 @@ printf '# Default Dir Doc\n\nContent indexed via cwd default.\n' > "$NOPATH_DIR/
 NOPATH_DB="$NOPATH_DIR/idx.db"
 _prev_cwd="$PWD"
 cd "$NOPATH_DIR"
-capture "$BINARY" index --db "$NOPATH_DB"
+capture "$BINARY" index --db "$NOPATH_DB" "${MOCK_EMBED_FLAGS[@]}"
 cd "$_prev_cwd"
 if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
 	pass "index with no path defaults to current directory"
@@ -250,7 +250,7 @@ fi
 # ──────────────────────────────────────────────
 SPACED_DB="$TEST_DIR/spaced test.db"
 out="" ; err="" ; rc=""
-capture "$BINARY" index --db "$SPACED_DB" "$TEST_DIR/path with spaces"
+capture "$BINARY" index --db "$SPACED_DB" "$TEST_DIR/path with spaces" "${MOCK_EMBED_FLAGS[@]}"
 if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
 	pass "paths with spaces work for index"
 else
@@ -283,7 +283,7 @@ fi
 # 18. Unsupported file extension is handled gracefully
 # ──────────────────────────────────────────────
 out="" ; err="" ; rc=""
-capture "$BINARY" index --db "$TEST_DIR/unsupported.db" "$TEST_DIR/file.xyz"
+capture "$BINARY" index --db "$TEST_DIR/unsupported.db" "$TEST_DIR/file.xyz" "${MOCK_EMBED_FLAGS[@]}"
 # Should not crash — may exit 0 with a warning or exit non-zero with a message
 if [ "$rc" -le 1 ]; then
 	# Check it gave some feedback about "unsupported" or "no supported"
@@ -303,7 +303,7 @@ fi
 CFG_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cfg-test-XXXXXX")"
 echo "# Config test" > "$CFG_TEST_DIR/doc.md"
 out="" ; err="" ; rc=""
-capture "$BINARY" index "$CFG_TEST_DIR"
+capture "$BINARY" index "$CFG_TEST_DIR" "${MOCK_EMBED_FLAGS[@]}"
 if [ "$rc" -eq 0 ] && [ -f "$CFG_TEST_DIR/.docscan/config.ini" ]; then
 	pass "config.ini is created on index"
 else
@@ -405,7 +405,7 @@ rm -rf "$CFG_TEST_DIR" "$CFG_TEST_DIR2"
 CFG_DEBUG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docscan-cfgdbg-XXXXXX")"
 echo "# Debug test" > "$CFG_DEBUG_DIR/doc.md"
 out="" ; err="" ; rc=""
-capture "$BINARY" index "$CFG_DEBUG_DIR" --embedding-api openai --embedding-url http://localhost:8000 --model bge-m3-mlx
+capture "$BINARY" index "$CFG_DEBUG_DIR" --embedding-api openai --embedding-url "$MOCK_EMBED_URL" --model bge-m3-mlx
 if [ "$rc" -eq 0 ]; then
 	out="" ; err="" ; rc=""
 	capture "$BINARY" config debug --db "$CFG_DEBUG_DIR/.docscan/index.db" --no-color
@@ -939,7 +939,7 @@ api_key = ${DOCSCAN_TEST_EXPAND_KEY}
 FIXTURE
 echo "# doc" > "$ENV_TEST_DIR/doc.md"
 out="" ; err="" ; rc=""
-capture "$BINARY" index "$ENV_TEST_DIR"
+capture "$BINARY" index "$ENV_TEST_DIR" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 DOCSCAN_TEST_EXPAND_KEY="sk-secret-from-env-42" \
 	capture "$BINARY" config --db "$ENV_TEST_DIR/.docscan/index.db" embedding.api_key
@@ -955,7 +955,7 @@ fi
 # Re-indexing triggers save_config; the resolved secret must NOT be persisted.
 out="" ; err="" ; rc=""
 DOCSCAN_TEST_EXPAND_KEY="sk-secret-from-env-42" \
-	capture "$BINARY" index "$ENV_TEST_DIR"
+	capture "$BINARY" index "$ENV_TEST_DIR" "${MOCK_EMBED_FLAGS[@]}"
 ini_after=$(cat "$ENV_TEST_DIR/.docscan/config.ini")
 if echo "$ini_after" | grep -qF 'api_key = ${DOCSCAN_TEST_EXPAND_KEY}' && \
    ! echo "$ini_after" | grep -q 'sk-secret-from-env-42'; then
@@ -975,7 +975,7 @@ api_key = $DOCSCAN_TEST_EXPAND_KEY2
 FIXTURE
 echo "# doc" > "$ENV_TEST_DIR2/doc.md"
 out="" ; err="" ; rc=""
-capture "$BINARY" index "$ENV_TEST_DIR2"
+capture "$BINARY" index "$ENV_TEST_DIR2" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 DOCSCAN_TEST_EXPAND_KEY2="brace-less-secret" \
 	capture "$BINARY" config --db "$ENV_TEST_DIR2/.docscan/index.db" embedding.api_key
@@ -996,7 +996,7 @@ api_key = ${DOCSCAN_DEFINITELY_NOT_SET_VAR_XYZ}
 FIXTURE
 echo "# doc" > "$ENV_TEST_DIR3/doc.md"
 out="" ; err="" ; rc=""
-capture "$BINARY" index "$ENV_TEST_DIR3"
+capture "$BINARY" index "$ENV_TEST_DIR3" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 unset DOCSCAN_DEFINITELY_NOT_SET_VAR_XYZ
 capture "$BINARY" config --db "$ENV_TEST_DIR3/.docscan/index.db" embedding.api_key
@@ -1018,7 +1018,7 @@ FIXTURE
 echo "# doc" > "$ENV_TEST_DIR4/doc.md"
 out="" ; err="" ; rc=""
 unset DOCSCAN_TEST_UNSET_VAR
-capture "$BINARY" index "$ENV_TEST_DIR4"
+capture "$BINARY" index "$ENV_TEST_DIR4" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 capture "$BINARY" config --db "$ENV_TEST_DIR4/.docscan/index.db" embedding.api_key
 if [ "$rc" -eq 0 ] && [ "$out" = "fallback-value" ]; then
@@ -1051,7 +1051,7 @@ FIXTURE
 echo "# doc" > "$ENV_TEST_DIR5/doc.md"
 out="" ; err="" ; rc=""
 unset DOCSCAN_A_XYZ DOCSCAN_B_XYZ DOCSCAN_C_XYZ
-capture "$BINARY" index "$ENV_TEST_DIR5"
+capture "$BINARY" index "$ENV_TEST_DIR5" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 capture "$BINARY" config --db "$ENV_TEST_DIR5/.docscan/index.db" embedding.api_key
 if [ "$rc" -eq 0 ] && [ "$out" = "bottom-default" ]; then
@@ -1083,7 +1083,7 @@ api_key = ${DOCSCAN_TEST_EMPTY_VAR-should-not-see-this}
 FIXTURE
 echo "# doc" > "$ENV_TEST_DIR6/doc.md"
 out="" ; err="" ; rc=""
-DOCSCAN_TEST_EMPTY_VAR="" capture "$BINARY" index "$ENV_TEST_DIR6"
+DOCSCAN_TEST_EMPTY_VAR="" capture "$BINARY" index "$ENV_TEST_DIR6" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 # With the colon-less form, empty string is "set" and should NOT trigger fallback.
 DOCSCAN_TEST_EMPTY_VAR="" \
@@ -1105,7 +1105,7 @@ api_key = ${DOCSCAN_TEST_EMPTY_VAR2:-fallback-when-empty}
 FIXTURE
 echo "# doc" > "$ENV_TEST_DIR7/doc.md"
 out="" ; err="" ; rc=""
-DOCSCAN_TEST_EMPTY_VAR2="" capture "$BINARY" index "$ENV_TEST_DIR7"
+DOCSCAN_TEST_EMPTY_VAR2="" capture "$BINARY" index "$ENV_TEST_DIR7" "${MOCK_EMBED_FLAGS[@]}"
 out="" ; err="" ; rc=""
 DOCSCAN_TEST_EMPTY_VAR2="" \
 	capture "$BINARY" config --db "$ENV_TEST_DIR7/.docscan/index.db" embedding.api_key

@@ -17,6 +17,7 @@ run_suite() {
 	else
 		printf '\033[31mFAIL\033[0m %s\n' "$name" >&2
 		failed=$((failed + 1))
+		return 1
 	fi
 }
 
@@ -26,24 +27,42 @@ run_suite "embed-util" tests/unit/run-embed-util
 # Zig unit tests via Nix (sandboxed)
 run_suite "unit" nix build ".#checks.$(nix eval --impure --raw --expr 'builtins.currentSystem').test" --print-build-logs
 
+# Static guard: black-box index/update calls must target the mock or a dead port
+run_suite "hermetic" tests/lib/check-hermetic-index tests/cli/test-cli tests/mcp/test-mcp
+
+# The black-box suites run zig-out/bin/docscan, so rebuild it from the current
+# tree first. A failed build skips them (counted as failed) instead of letting
+# them pass or fail against a stale binary.
+build_ok=1
+run_suite "build" ./build || build_ok=0
+
+run_binary_suite() {
+	if [ "$build_ok" -eq 1 ]; then
+		run_suite "$@"
+	else
+		printf '\033[31mSKIP\033[0m %s (build failed)\n' "$1" >&2
+		failed=$((failed + 1))
+	fi
+}
+
 # CLI tests (when they exist)
 if [ -x tests/cli/test-cli ]; then
-	run_suite "cli" nix develop -c tests/cli/test-cli
+	run_binary_suite "cli" nix develop -c tests/cli/test-cli
 fi
 
 # MCP tests (when they exist)
 if [ -x tests/mcp/test-mcp ]; then
-	run_suite "mcp" nix develop -c tests/mcp/test-mcp
+	run_binary_suite "mcp" nix develop -c tests/mcp/test-mcp
 fi
 
 # Integration tests (require Ollama — skips gracefully if unavailable)
 if [ -x tests/integration/test-integration ]; then
-	run_suite "integration" nix develop -c tests/integration/test-integration
+	run_binary_suite "integration" nix develop -c tests/integration/test-integration
 fi
 
 # Embedding-failure integration tests (mock server — no Ollama needed)
 if [ -x tests/integration/test-embed-failures ]; then
-	run_suite "embed-failures" nix develop -c tests/integration/test-embed-failures
+	run_binary_suite "embed-failures" nix develop -c tests/integration/test-embed-failures
 fi
 
 if [ "$failed" -eq 0 ]; then

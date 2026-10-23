@@ -18,11 +18,11 @@ const codepages = @import("codepages.zig");
 /// Detect the character encoding of a byte buffer using chardetz.
 /// Returns the charset name (e.g. "WINDOWS-1252", "KOI8-R", "UTF-8") or null if
 /// detection is inconclusive (empty input or no confident match). The name is a
-/// static string owned by chardetz; the allocator is taken for API parity with
-/// chardetz.detect (the current detection path is allocation-free).
+/// static string owned by chardetz. chardetz allocates scratch buffers while
+/// detecting; running out of memory is treated as an inconclusive result.
 pub fn detectEncoding(allocator: Allocator, data: []const u8) ?[]const u8 {
     if (data.len == 0) return null;
-    const name = chardetz.detect(allocator, data);
+    const name = chardetz.detect(allocator, data) catch return null;
     if (name.len == 0) return null;
     return name;
 }
@@ -486,6 +486,14 @@ test "encoding: detectEncoding is callable and stable on ASCII" {
 
 test "encoding: detectEncoding returns null for empty input" {
     try testing.expectEqual(@as(?[]const u8, null), detectEncoding(testing.allocator, ""));
+}
+
+test "encoding: detectEncoding treats allocation failure as inconclusive" {
+    // KOI8-R Cyrillic: detectable with memory, null when the first allocation fails.
+    const koi8 = "\xf0\xd2\xc9\xd7\xc5\xd4, \xcd\xc9\xd2! \xf0\xd2\xc9\xd7\xc5\xd4, \xcd\xc9\xd2! \xf0\xd2\xc9\xd7\xc5\xd4, \xcd\xc9\xd2!";
+    try testing.expect(detectEncoding(testing.allocator, koi8) != null);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectEqual(@as(?[]const u8, null), detectEncoding(failing.allocator(), koi8));
 }
 
 test "encoding: toUtf8 transcodes KOI8-R Cyrillic" {

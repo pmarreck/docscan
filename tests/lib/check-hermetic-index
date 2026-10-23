@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Guard: every `docscan index`/`update` call in the black-box suites must name its
+# embedding server, either the hermetic mock (MOCK_EMBED_*) or a deliberately dead
+# port (127.0.0.1:9). Anything else falls back to the default Ollama/oMLX URL and
+# makes the result depend on whatever server the host happens to run.
+# Usage: check-hermetic-index FILE...   (exit 1 and list offending lines)
+set -u
+
+if [ "$#" -eq 0 ]; then
+	echo "usage: check-hermetic-index FILE..." >&2
+	exit 2
+fi
+
+bad=0
+for f in "$@"; do
+	while IFS= read -r hit; do
+		case "$hit" in
+			*MOCK_EMBED_*|*127.0.0.1:9\ *|*127.0.0.1:9\"*) ;;
+			*)
+				printf '%s:%s\n' "$f" "$hit"
+				bad=$((bad + 1))
+				;;
+		esac
+	done < <(grep -n '"\$BINARY" \(index\|update\)\b' "$f")
+done
+
+if [ "$bad" -gt 0 ]; then
+	printf '%d index/update call(s) may contact a host embedding server\n' "$bad"
+	exit 1
+fi

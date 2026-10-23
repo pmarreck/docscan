@@ -16,8 +16,8 @@
             .hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0CTyBADFzDhhNOTSAUplRsfH1qs-DqwP6FwrZ641",
         },
         .chardetz = .{
-            .url = "git+https://github.com/pmarreck/chardetz#c7d1779b68fd99e6ded5ab19319e7af628f79b9a",
-            .hash = "chardetz-0.1.0-I0bi5_TFCQDDHlTmn5ausJ8WqDYd9sH1fsAfLLNhCK0d",
+            .url = "git+https://github.com/pmarreck/chardetz#ffefc741f1457873d8dac316506c687645830103",
+            .hash = "chardetz-0.2.0-I0bi56bVCgBK6f__nJJfMg-Wh9nHubGuJn_QH70xgHh4",
         },
     },
     .fingerprint = 0x20526b286e1fcb24,
