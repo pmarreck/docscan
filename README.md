@@ -131,9 +131,11 @@ Requires [Nix](https://nixos.org/download) with flakes enabled.
 ./build              # Release build via nix build
 ./build --debug      # Debug build
 ./build --test       # Build + run tests
-./test               # Run all test suites (unit + CLI + MCP)
+./test               # Run all test suites (unit + CLI + MCP + integration)
 ./build_all          # Cross-compile for 5 targets
 ```
+
+The integration suite needs a real local embedding server. It uses oMLX (OpenAI-compatible, `http://127.0.0.1:8000`) if that reports an embedding model, otherwise Ollama (`http://127.0.0.1:11434`). Set `OMLX_API_KEY` if your oMLX requires one, or pin a server with `DOCSCAN_INTEG_API`, `DOCSCAN_INTEG_URL` and `DOCSCAN_INTEG_MODEL` (all three together). With no usable server the suite reports INCOMPLETE and `./test` fails; the CLI and MCP suites use a local mock server and need nothing.
 
 ## Cross-platform targets
 

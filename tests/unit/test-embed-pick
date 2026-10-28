@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Classifier-over-set test for real_embed_pick_model (tests/lib/real-embed.bash):
+# given the model names a server reports, choose an embedding model or nothing.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lib/real-embed.bash"
+
+errors=0
+tests=0
+check() { # <description> <expected> <names, one per line>
+	local got
+	got="$(printf '%s' "$3" | real_embed_pick_model)"
+	((tests++))
+	if [ "$got" = "$2" ]; then
+		printf '  \033[32mPASS\033[0m: %s\n' "$1"
+	else
+		((errors++))
+		printf '  \033[31mFAIL\033[0m: %s — expected "%s", got "%s"\n' "$1" "$2" "$got"
+	fi
+}
+
+# Each name alone: is it recognized as an embedding model?
+for name in nomic-embed-text:latest bge-m3 bge-m3-mlx-fp16 jina-code-embeddings:1.5b \
+	mxbai-embed-large snowflake-arctic-embed:l Qwen3-Embedding-0.6B-4bit multilingual-e5-large \
+	gte-base; do
+	check "recognizes $name" "$name" "$name"
+done
+for name in qwen3:8b gemma4:12b granite3.3:latest muse-glimmer-30b-heretic:IQ2_M llama3.2 \
+	bge-reranker-v2-m3 Qwen3-Reranker-0.6B; do
+	check "rejects $name" "" "$name"
+done
+
+# Preference among several embedding models: bge-m3 first, then nomic-embed-text,
+# then the first other embedding model in server order.
+check "prefers bge-m3 over others" "bge-m3-mlx-fp16" $'qwen3:8b\njina-code-embeddings:1.5b\nnomic-embed-text\nbge-m3-mlx-fp16'
+check "prefers nomic-embed-text when no bge-m3" "nomic-embed-text:latest" $'jina-code-embeddings:1.5b\nnomic-embed-text:latest'
+check "falls back to first embedding model" "jina-code-embeddings:1.5b" $'qwen3:8b\njina-code-embeddings:1.5b\nmxbai-embed-large'
+check "empty list picks nothing" "" ""
+
+printf '%d tests, %d passed, %d failed\n' "$tests" "$((tests - errors))" "$errors"
+[ "$errors" -eq 0 ]

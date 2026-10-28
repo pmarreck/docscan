@@ -28,7 +28,7 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 - [x] [Completed] Phase-2 embedding hang fixed: http_post had a connect timeout but no read timeout, so a server that accepts then stalls blocked read() forever. Added SO_RCVTIMEO/SO_SNDTIMEO (read bounded by DOCSCAN_HTTP_READ_TIMEOUT_SECS, default 120s) — a stalled connection now times out -> retry -> defer. Reproduced via a stalling mock (TDD: hang->recover), locked in as integration Test D (2026-06-02 EST)
 - [x] [Completed] OLE2 DIFAT chain followed (ole2.zig): files >109 FAT sectors (>~7MB legacy Office/.doc) no longer silently misparse. Loop-guarded against malformed/cyclic chains (CorruptFAT). 2 new tests (2026-06-03 EST)
 - [x] [Completed] Factored duplicated readU16/readU32 (ole2/zip/parser_doc) into shared src/core/endian.zig (2026-06-03 EST)
-- [x] [Completed] Chunker oversized-chunk fix (root cause of HTTP 400 "input exceeds 8192 tokens"): oversized boundary-less content and single oversized paragraphs are now force-split to an embed-safe byte budget (max_chunk_tokens / tokens_per_byte, default 6000B) instead of being emitted whole up to the 256KB SQLite ceiling. 2 new tests; verified 100KB blob -> 17 chunks max 6000B (2026-06-03 EST)
+- [x] [Completed] Chunker oversize-chunk fix (root cause of HTTP 400 "input exceeds 8192 tokens"): oversize boundary-less content and single oversize paragraphs are now force-split to an embed-safe byte budget (max_chunk_tokens / tokens_per_byte, default 6000B) instead of being emitted whole up to the 256KB SQLite ceiling. 2 new tests; verified 100KB blob -> 17 chunks max 6000B (2026-06-03 EST)
 - [x] [Deferred] DIFAT chain support in OLE2 (>7MB .doc files) (2026-06-03 EST)
 - [x] [Known Limitations] Xref stream support in PDF parser (2026-04-08 EST)
 - [x] [Known Limitations] CIDFont/ToUnicode mapping in PDF (2026-04-08 EST)
@@ -98,3 +98,8 @@ citation "surpass" is live across formats; incitez_web consumes it.
 - [x] [Recently completed] PLAN.md migrated to one-line items; prose moved to docs/plan_context/ and docs/PLAN_LOG.md (done 2026-10-14 14:45 EDT)
 - [x] [Recently completed] Verified already done in code and retired: PDF `/PageLabels` + CLI `--logical`/`--physical` (519e7ff), ligature normalization for doc/rtf/epub via `wordfix.applySections` (done 2026-10-14 14:45 EDT)
 - [x] [Recently completed] Borderline line-break hyphen + LuraDocument empty-extract fix (done 2026-06-16 EST)
+
+## Retired 2026-10-28
+
+- [x] [Recently completed] `./test` should build the binary (or fail on a stale `zig-out/bin/docscan`) before CLI/MCP suites run (done 2026-10-23 11:50 EDT, 7b0b6ca)
+- [x] [Recently completed] Owner decisions 2026-10-20: docscan stays a document-to-plaintext parser independent of incitez (citation integration declined); OCR moves to a new Zig project, ocrz (done 2026-10-20 15:55 EDT)

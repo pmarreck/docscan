@@ -8,18 +8,31 @@ cd "$SCRIPT_DIR" || exit 1
 
 failed=0
 
+# Exit 77 means a suite could not run its required checks (e.g. no embedding
+# server). That is reported as INCOMPLETE and still counts as a failure.
+INCOMPLETE_RC=77
+
 run_suite() {
-	local name="$1"
+	local name="$1" rc
 	shift
 	printf 'Running %s tests...\n' "$name"
-	if "$@"; then
+	"$@"
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
 		printf '\033[32mPASS\033[0m %s\n' "$name"
+		return 0
+	fi
+	if [ "$rc" -eq "$INCOMPLETE_RC" ]; then
+		printf '\033[33mINCOMPLETE\033[0m %s\n' "$name" >&2
 	else
 		printf '\033[31mFAIL\033[0m %s\n' "$name" >&2
-		failed=$((failed + 1))
-		return 1
 	fi
+	failed=$((failed + 1))
+	return 1
 }
+
+# Classifier test for the integration suite's embedding-model picker
+run_suite "embed-pick" tests/unit/test-embed-pick
 
 # Pure-C unit tests for embedding-failure helpers (no nix needed)
 run_suite "embed-util" tests/unit/run-embed-util
@@ -55,7 +68,7 @@ if [ -x tests/mcp/test-mcp ]; then
 	run_binary_suite "mcp" nix develop -c tests/mcp/test-mcp
 fi
 
-# Integration tests (require Ollama — skips gracefully if unavailable)
+# Integration tests against a real oMLX or Ollama embedding server (INCOMPLETE if none)
 if [ -x tests/integration/test-integration ]; then
 	run_binary_suite "integration" nix develop -c tests/integration/test-integration
 fi

@@ -5,12 +5,13 @@ Original task breakdown: `docs/superpowers/plans/2026-04-08-docscan-implementati
 
 ## Next (authorized, unblocked)
 
+- [ ] Conform the build/output layout to the cross-platform-project-build-arch convention (context: docs/plan_context/build_layout.md)
+- [ ] Commit the AGENTS.md/CLAUDE.md relative symlinks (currently gitignored, contrary to the fleet rule for relative brief links)
 - [ ] Logical pages: DOCX `<w:pgNumType w:start>` support (context: docs/plan_context/logical_page_numbers.md)
 - [ ] Logical pages: DOC `pgn_start` (SEPX via plcfSed) support (context: docs/plan_context/logical_page_numbers.md)
 - [ ] Logical pages: RTF `\pgnstart` support (context: docs/plan_context/logical_page_numbers.md)
 - [ ] `docscan_list_documents` FFI function
 - [ ] Benchmark suite behind `./bm` (Task 16; use the performance-profiling skill)
-- [ ] Integration tests that need a running Ollama (Task 15)
 
 ## Deferred
 
@@ -30,8 +31,8 @@ Original task breakdown: `docs/superpowers/plans/2026-04-08-docscan-implementati
 
 ## Recently completed
 
-- [x] `./test` should build the binary (or fail on a stale `zig-out/bin/docscan`) before CLI/MCP suites run (done 2026-10-23 11:50 EDT, 7b0b6ca)
+- [x] Integration suite must run against a real embedding server (oMLX or Ollama) and report INCOMPLETE, not pass, when none is available (done 2026-10-28 10:30 EDT)
+- [x] Search ranking: --similar is pure vector-distance order; hybrid heading boost cut to 0.0025/level and equal scores share a rank, so headings only break ties (done 2026-10-28 10:30 EDT)
 - [x] Remaining tests/cli/test-cli index calls that do not target the mock (13 call sites) may contact the host embedding server; route them to the mock (done 2026-10-23 11:50 EDT, 7b0b6ca)
 - [x] Make tests/integration/test-embed-failures use tests/lib/mock-embed.bash instead of its own copy of the start/stop logic (done 2026-10-23 11:50 EDT, 7b0b6ca)
 - [x] Bump the chardetz pin from c7d1779 to ffefc74: `detect()` now returns `error{OutOfMemory}![:0]const u8`, so `detectEncoding` in src/core/encoding.zig needs `catch return null`; refresh the package hash with `zig fetch --save` (done 2026-10-23 11:50 EDT, 7b0b6ca)
-- [x] Owner decisions 2026-10-20: docscan stays a document-to-plaintext parser independent of incitez (citation integration declined); OCR moves to a new Zig project, ocrz (done 2026-10-20 15:55 EDT)

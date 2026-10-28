@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Integration test suite for docscan — requires Ollama running with nomic-embed-text.
+# Integration test suite for docscan against a real embedding server (oMLX or Ollama;
+# see tests/lib/real-embed.bash for selection and overrides).
 # Run via: nix develop -c tests/integration/test-integration
 #   or via the master test runner: ./test
 set -u
@@ -29,20 +30,17 @@ if [ ! -f "$BINARY" ]; then
 	exit 1
 fi
 
-# Check Ollama is running and nomic-embed-text is available
-if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-	echo "SKIP: Ollama not running on localhost:11434"
-	exit 0
+# Needs a real embedding server. Without one the suite is INCOMPLETE (exit 77),
+# which ./test counts as a failure rather than a silent pass.
+source "$SCRIPT_DIR/../lib/real-embed.bash"
+if ! real_embed_select; then
+	echo "INCOMPLETE: $REAL_EMBED_REASON" >&2
+	echo "  Start oMLX or Ollama with an embedding model, or set DOCSCAN_INTEG_API/URL/MODEL." >&2
+	exit 77
 fi
-
-if ! curl -s http://localhost:11434/api/tags | grep -q "nomic-embed-text"; then
-	echo "SKIP: nomic-embed-text model not available in Ollama"
-	exit 0
-fi
-
 trap 'rm -rf "$TEST_DIR"' EXIT
 
-echo "=== docscan Integration Tests (Ollama required) ==="
+echo "=== docscan Integration Tests ($REAL_EMBED_DESC) ==="
 
 # ---------- Create test corpus ----------
 
@@ -124,7 +122,7 @@ FIXTURE
 local out err rc 2>/dev/null || true
 out="" ; err="" ; rc=""
 echo "  Indexing corpus with embeddings (this may take a moment)..."
-capture "$BINARY" index --db "$DB" --model nomic-embed-text "$TEST_DIR/corpus"
+capture "$BINARY" index --db "$DB" "${REAL_EMBED_FLAGS[@]}" "$TEST_DIR/corpus"
 if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Indexing complete"; then
 	pass "full index with embeddings succeeds"
 else
@@ -172,22 +170,28 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# 2. Hybrid search — semantic match
+# 2. Search ranks the semantically matching document first
+# Vector-only (--similar) queries share no key words with their target sections,
+# and each targets a different document, so a constant or random ranking cannot
+# pass all three. The hybrid query checks the fused ranking too.
 # ──────────────────────────────────────────────
-out="" ; err="" ; rc=""
-echo "  Running hybrid search (embedding query may take a few seconds)..."
-capture "$BINARY" search --db "$DB" --model nomic-embed-text "liability protection"
-if [ "$rc" -eq 0 ]; then
-	# "liability protection" should semantically match the contract's indemnification/liability section
-	combined="$out$err"
-	if echo "$combined" | grep -qi "indemnif\|liability\|contract\|harmless\|damages"; then
-		pass "hybrid search finds semantically related content ('liability protection' -> indemnification)"
+echo "  Running semantic searches (embedding queries may take a few seconds)..."
+check_top() { # <expected file> <label> <search args...>
+	local want="$1" label="$2" got=""
+	shift 2
+	out="" ; err="" ; rc=""
+	capture "$BINARY" search --db "$DB" "${REAL_EMBED_FLAGS[@]}" --json "$@"
+	[ "$rc" -eq 0 ] && got="$(printf '%s' "$out" | jq -r '.[0].document_path // empty' | xargs -r basename)"
+	if [ "$got" = "$want" ]; then
+		pass "$label -> $want"
 	else
-		fail "hybrid search finds semantically related content" "no relevant terms in output: '$out'"
+		fail "$label" "expected top result $want, got '${got}' (rc=$rc, err='$err')"
 	fi
-else
-	fail "hybrid search finds semantically related content" "rc=$rc, err='$err'"
-fi
+}
+check_top contract.md "hybrid: 'liability protection'" "liability protection"
+check_top contract.md "similar: 'who pays if something goes wrong'" --similar "who pays if something goes wrong"
+check_top privacy.md "similar: 'how long do you keep my information'" --similar "how long do you keep my information"
+check_top readme.md "similar: 'shipping the app to production servers'" --similar "shipping the app to production servers"
 
 # ──────────────────────────────────────────────
 # 3. Exact search still works alongside embeddings
@@ -230,7 +234,7 @@ sleep 1
 
 out="" ; err="" ; rc=""
 echo "  Running update after modifying a file..."
-capture "$BINARY" update --db "$DB" --model nomic-embed-text "$TEST_DIR/corpus"
+capture "$BINARY" update --db "$DB" "${REAL_EMBED_FLAGS[@]}" "$TEST_DIR/corpus"
 if [ "$rc" -eq 0 ]; then
 	pass "update command succeeds after file modification"
 else
@@ -267,7 +271,7 @@ FIXTURE
 
 out="" ; err="" ; rc=""
 echo "  Indexing additional file..."
-capture "$BINARY" update --db "$DB" --model nomic-embed-text "$TEST_DIR/corpus"
+capture "$BINARY" update --db "$DB" "${REAL_EMBED_FLAGS[@]}" "$TEST_DIR/corpus"
 if [ "$rc" -eq 0 ]; then
 	pass "update picks up new file"
 else
