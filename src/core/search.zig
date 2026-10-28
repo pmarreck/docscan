@@ -30,7 +30,11 @@ pub const SearchOptions = struct {
 	/// Heading boost per level: higher-level headings get a score multiplier.
 	/// Level 1 (h1) gets boost = 1.0 + (6 - 1) * this value.
 	/// Level 0 (body text) and level 6+ get no boost (multiplier = 1.0).
-	heading_boost_per_level: f32 = 0.05,
+	/// The default keeps the h1 multiplier (1.0125) below the ratio between the
+	/// first two RRF rank scores ((k+2)/(k+1) = 62/61 at k = 60), so a heading
+	/// breaks ties and near-ties without overturning a clearly better match.
+	/// Not applied in `similar` mode, which is pure vector-distance order.
+	heading_boost_per_level: f32 = 0.0025,
 	/// If set, only include results from documents with this format (e.g., "pdf").
 	format_filter: ?[]const u8 = null,
 };
@@ -79,24 +83,30 @@ pub fn search(
 	var chunk_map = std.AutoHashMap(i64, ChunkScores).init(allocator);
 	defer chunk_map.deinit();
 
+	// Ranks use standard competition ranking: equal raw scores share a rank, so
+	// exact ties stay ties for the heading boost to break.
 	if (vector_results) |vr| {
-		for (vr, 1..) |result, rank| {
+		var rank: u32 = 0;
+		for (vr, 0..) |result, i| {
+			if (i == 0 or result.distance != vr[i - 1].distance) rank = @intCast(i + 1);
 			const entry = try chunk_map.getOrPut(result.chunk_id);
 			if (!entry.found_existing) {
 				entry.value_ptr.* = ChunkScores{};
 			}
-			entry.value_ptr.vector_rank = @intCast(rank);
+			entry.value_ptr.vector_rank = rank;
 			entry.value_ptr.vector_distance = result.distance;
 		}
 	}
 
 	if (fts_results) |fr| {
-		for (fr, 1..) |result, rank| {
+		var rank: u32 = 0;
+		for (fr, 0..) |result, i| {
+			if (i == 0 or result.rank != fr[i - 1].rank) rank = @intCast(i + 1);
 			const entry = try chunk_map.getOrPut(result.chunk_id);
 			if (!entry.found_existing) {
 				entry.value_ptr.* = ChunkScores{};
 			}
-			entry.value_ptr.lexical_rank = @intCast(rank);
+			entry.value_ptr.lexical_rank = rank;
 			entry.value_ptr.lexical_score = result.rank;
 		}
 	}
@@ -118,7 +128,7 @@ pub fn search(
 		}
 
 		// Apply heading-level boost: higher-level headings get a mild score multiplier.
-		if (options.heading_boost_per_level > 0.0) {
+		if (options.mode != .similar and options.heading_boost_per_level > 0.0) {
 			const heading_level = try storage.getChunkHeadingLevel(db, entry.key_ptr.*);
 			const boost = computeHeadingBoost(heading_level, options.heading_boost_per_level);
 			fused *= boost;
@@ -135,7 +145,8 @@ pub fn search(
 	// Sort by fused score descending.
 	std.mem.sort(ScoredCandidate, candidates.items, {}, struct {
 		fn lessThan(_: void, a: ScoredCandidate, b: ScoredCandidate) bool {
-			return a.fused_score > b.fused_score; // descending
+			if (a.fused_score != b.fused_score) return a.fused_score > b.fused_score; // descending
+			return a.chunk_id < b.chunk_id; // deterministic order for exact ties
 		}
 	}.lessThan);
 
@@ -618,6 +629,98 @@ test "heading boost — boost_per_level=0 does not modify scores" {
 	// heading_level=0 (body text) gets boost=1.0 regardless of boost_per_level,
 	// so both scores should be identical.
 	try testing.expectApproxEqAbs(results_off[0].score, results_on[0].score, 1e-6);
+}
+
+/// Helper: one document holding a body chunk and an H1 chunk with the given embeddings,
+/// inserted in the requested order. Tests identify the chunks by heading.
+fn insertBodyAndH1(db: *storage.Db, body_emb: []const f32, h1_emb: []const f32, h1_first: bool) !void {
+	const doc_id = try storage.insertDocument(db, "/docs/rank.md", "md", "Rank Test", "hash_rank", null);
+	const body = document.Chunk{
+		.document_path = "/docs/rank.md",
+		.section_path = "Rank Test > Retention",
+		.heading = "Retention",
+		.text = "personal data is retained for thirty six months",
+		.start_byte = 0,
+		.end_byte = 47,
+		.chunk_index = 0,
+		.heading_level = 0,
+	};
+	const h1 = document.Chunk{
+		.document_path = "/docs/rank.md",
+		.section_path = "Rank Test",
+		.heading = "Rank Test",
+		.text = "rank test title",
+		.start_byte = 47,
+		.end_byte = 62,
+		.chunk_index = 1,
+		.heading_level = 1,
+	};
+	const order = if (h1_first) [_]document.Chunk{ h1, body } else [_]document.Chunk{ body, h1 };
+	for (order) |chunk| {
+		const id = try storage.insertChunk(db, doc_id, chunk);
+		try storage.insertEmbedding(db, id, if (chunk.heading_level == 1) h1_emb else body_emb);
+	}
+}
+
+test "similar mode orders by vector distance, ignoring heading level" {
+	var db = try openTestDb();
+	defer storage.closeDb(&db);
+	// Body chunk is much closer to the query than the H1 title chunk.
+	try insertBodyAndH1(&db, &[_]f32{ 0.9, 0.1, 0.0, 0.0 }, &[_]f32{ 0.5, 0.5, 0.0, 0.0 }, true);
+
+	const query_emb = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+	const results = try search(testing.allocator, &db, "zzz", &query_emb, .{ .mode = .similar });
+	defer freeResults(testing.allocator, results);
+
+	try testing.expectEqual(@as(usize, 2), results.len);
+	try testing.expectEqualStrings("Retention", results[0].heading.?);
+	try testing.expect(results[0].vector_score < results[1].vector_score);
+}
+
+test "similar mode applies no heading boost to an exact distance tie" {
+	var db = try openTestDb();
+	defer storage.closeDb(&db);
+	try insertBodyAndH1(&db, &[_]f32{ 1.0, 0.0, 0.0, 0.0 }, &[_]f32{ 1.0, 0.0, 0.0, 0.0 }, false);
+
+	const query_emb = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+	const results = try search(testing.allocator, &db, "zzz", &query_emb, .{ .mode = .similar });
+	defer freeResults(testing.allocator, results);
+
+	try testing.expectEqual(@as(usize, 2), results.len);
+	try testing.expectEqual(results[0].score, results[1].score);
+}
+
+test "hybrid default heading boost cannot overturn the top vector rank" {
+	var db = try openTestDb();
+	defer storage.closeDb(&db);
+	try insertBodyAndH1(&db, &[_]f32{ 0.9, 0.1, 0.0, 0.0 }, &[_]f32{ 0.5, 0.5, 0.0, 0.0 }, true);
+
+	// Query text matches nothing lexically, so ranking comes from vectors plus boost.
+	const query_emb = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+	const results = try search(testing.allocator, &db, "zzz", &query_emb, .{ .mode = .hybrid });
+	defer freeResults(testing.allocator, results);
+
+	try testing.expectEqual(@as(usize, 2), results.len);
+	try testing.expectEqualStrings("Retention", results[0].heading.?);
+}
+
+test "hybrid default heading boost breaks an exact distance tie" {
+	// Identical embeddings: equal distances must share a rank, so the H1 boost decides
+	// whichever chunk the vector index returns first. Both insertion orders are run so
+	// that one of them returns the H1 chunk second.
+	for ([_]bool{ false, true }) |h1_first| {
+		var db = try openTestDb();
+		defer storage.closeDb(&db);
+		try insertBodyAndH1(&db, &[_]f32{ 1.0, 0.0, 0.0, 0.0 }, &[_]f32{ 1.0, 0.0, 0.0, 0.0 }, h1_first);
+
+		const query_emb = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+		const results = try search(testing.allocator, &db, "zzz", &query_emb, .{ .mode = .hybrid });
+		defer freeResults(testing.allocator, results);
+
+		try testing.expectEqual(@as(usize, 2), results.len);
+		try testing.expectEqualStrings("Rank Test", results[0].heading.?);
+		try testing.expect(results[0].score > results[1].score);
+	}
 }
 
 test "computeHeadingBoost — values" {
