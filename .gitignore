@@ -19,3 +19,6 @@ tests/corpus/legal-brann-appellate-brief.pdf
 
 # Reproducible dev corpus (rebuild via tools/fetch-corpus.sh)
 tests/corpus/fetched/
+
+# session handoff docs (skill: handoff)
+HANDOFF*
